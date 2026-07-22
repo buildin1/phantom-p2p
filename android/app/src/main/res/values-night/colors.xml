@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Desktop concept dark theme: blue glass panels, cool text, subtle green live status -->
+    <color name="appBg">#090D15</color>
+    <color name="surface">#D11A2234</color>
+    <color name="surfaceSoft">#DF141C2C</color>
+    <color name="surfaceStrong">#E1202B42</color>
+    <color name="textMain">#E7EEFC</color>
+    <color name="textMuted">#9AA9C7</color>
+    <color name="hairline">#36546C98</color>
+
+    <color name="colorPrimary">#4D89FF</color>
+    <color name="colorPrimaryDark">#3C6FD8</color>
+    <color name="colorPrimaryVariant">#3C6FD8</color>
+    <color name="primarySoft">#1D2E57</color>
+    <color name="colorOnPrimary">#F7FAFF</color>
+
+    <color name="colorBlue">#5CC3FF</color>
+    <color name="blueSoft">#1A23395A</color>
+
+    <color name="colorAmber">#F2A94A</color>
+    <color name="amberSoft">#26281911</color>
+
+    <color name="colorDanger">#EF6D80</color>
+    <color name="dangerSoft">#262F1821</color>
+
+    <color name="colorOk">#18B499</color>
+    <color name="okSoft">#26203C39</color>
+
+    <color name="brandMark">#172236</color>
+    <color name="brandText">#A6CBFF</color>
+    <color name="heroBorder">#38546C98</color>
+    <color name="heroStart">#D1263450</color>
+    <color name="heroEnd">#DF17233A</color>
+    <color name="codeBoxBg">#B9141B2A</color>
+    <color name="sectionTitle">#B8C8E6</color>
+
+    <color name="segmentTrack">#A31C2740</color>
+    <color name="segmentActive">#F52D3C61</color>
+    <color name="segmentText">#8EA0C7</color>
+    <color name="segmentTextActive">#E7EEFC</color>
+
+    <color name="navBg">#9C182233</color>
+    <color name="navSelected">#4D89FF</color>
+    <color name="navUnselected">#97A7C9</color>
+    <color name="navIndicator">#1F3259</color>
+
+    <color name="topBarBg">#93192434</color>
+    <color name="topBarText">#E7EEFC</color>
+
+    <color name="pillOkBg">#1D163A38</color>
+    <color name="pillOfflineBg">#1D223149</color>
+    <color name="pillOkText">#4EE0BF</color>
+    <color name="pillOfflineText">#A7B5D3</color>
+</resources>

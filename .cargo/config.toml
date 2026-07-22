@@ -1,0 +1,7 @@
+[build]
+# 编译输出放在项目目录下的 target/，构建前由 build-macos.sh 自动清理 ._* 文件
+target-dir = "target"
+
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+ar = "x86_64-w64-mingw32-ar"
