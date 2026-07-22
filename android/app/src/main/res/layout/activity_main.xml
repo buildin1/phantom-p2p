@@ -1,0 +1,261 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/rootLayout"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="@drawable/bg_app_backdrop"
+    android:fitsSystemWindows="false">
+
+    <!-- Top App Bar: marginTop overridden in code = statusBarHeight + 8dp -->
+    <LinearLayout
+        android:id="@+id/topBar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:minHeight="58dp"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:layout_marginStart="12dp"
+        android:layout_marginTop="8dp"
+        android:layout_marginEnd="12dp"
+        android:paddingStart="16dp"
+        android:paddingEnd="16dp"
+        android:paddingTop="8dp"
+        android:paddingBottom="8dp"
+        android:elevation="8dp"
+        android:background="@drawable/bg_topbar_shell">
+
+        <FrameLayout
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:background="@drawable/bg_brand_mark">
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="center"
+                android:text="P2P"
+                android:textColor="@color/brandText"
+                android:textSize="10sp"
+                android:textStyle="bold" />
+        </FrameLayout>
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="12dp"
+            android:orientation="vertical">
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/app_name"
+                android:textColor="@color/topBarText"
+                android:textSize="18sp"
+                android:textStyle="bold" />
+            <TextView
+                android:id="@+id/tvTopSubtitle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/status_offline"
+                android:textColor="@color/textMuted"
+                android:textSize="12sp"
+                android:layout_marginTop="1dp" />
+        </LinearLayout>
+
+    </LinearLayout>
+
+    <!-- Fragment Container fills remaining height -->
+    <FrameLayout
+        android:id="@+id/fragmentContainer"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_marginTop="4dp"
+        android:layout_weight="1" />
+
+    <!-- Bottom Nav Shell: marginBottom set in code = navBarHeight + 12dp -->
+    <FrameLayout
+        android:id="@+id/bottomNavShell"
+        android:layout_width="match_parent"
+        android:layout_height="72dp"
+        android:layout_marginStart="12dp"
+        android:layout_marginTop="4dp"
+        android:layout_marginEnd="12dp"
+        android:layout_marginBottom="12dp"
+        android:background="@drawable/bg_bottom_nav_shell"
+        android:elevation="10dp">
+
+        <LinearLayout
+            android:id="@+id/bottomNav"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:baselineAligned="false"
+            android:gravity="center"
+            android:orientation="horizontal"
+            android:paddingStart="8dp"
+            android:paddingTop="4dp"
+            android:paddingEnd="8dp"
+            android:paddingBottom="4dp">
+
+            <LinearLayout
+                android:id="@+id/navRoomItem"
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_weight="1"
+                android:background="@drawable/bg_bottom_nav_item"
+                android:clickable="true"
+                android:focusable="true"
+                android:foreground="?attr/selectableItemBackgroundBorderless"
+                android:gravity="center"
+                android:minWidth="0dp"
+                android:orientation="vertical"
+                android:paddingStart="6dp"
+                android:paddingTop="6dp"
+                android:paddingEnd="6dp"
+                android:paddingBottom="4dp">
+
+                <ImageView
+                    android:id="@+id/navRoomIcon"
+                    android:layout_width="24dp"
+                    android:layout_height="24dp"
+                    android:contentDescription="@null"
+                    android:duplicateParentState="true"
+                    android:src="@drawable/ic_nav_room"
+                    android:tint="@color/bottom_nav_color" />
+
+                <TextView
+                    android:id="@+id/navRoomLabel"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:duplicateParentState="true"
+                    android:includeFontPadding="false"
+                    android:text="@string/nav_room"
+                    android:textColor="@color/bottom_nav_color"
+                    android:textSize="12sp"
+                    android:textStyle="bold" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:id="@+id/navConnectItem"
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_weight="1"
+                android:background="@drawable/bg_bottom_nav_item"
+                android:clickable="true"
+                android:focusable="true"
+                android:foreground="?attr/selectableItemBackgroundBorderless"
+                android:gravity="center"
+                android:minWidth="0dp"
+                android:orientation="vertical"
+                android:paddingStart="6dp"
+                android:paddingTop="6dp"
+                android:paddingEnd="6dp"
+                android:paddingBottom="4dp">
+
+                <ImageView
+                    android:id="@+id/navConnectIcon"
+                    android:layout_width="24dp"
+                    android:layout_height="24dp"
+                    android:contentDescription="@null"
+                    android:duplicateParentState="true"
+                    android:src="@drawable/ic_nav_connect"
+                    android:tint="@color/bottom_nav_color" />
+
+                <TextView
+                    android:id="@+id/navConnectLabel"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:duplicateParentState="true"
+                    android:includeFontPadding="false"
+                    android:text="@string/nav_connect"
+                    android:textColor="@color/bottom_nav_color"
+                    android:textSize="12sp"
+                    android:textStyle="bold" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:id="@+id/navDiagItem"
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_weight="1"
+                android:background="@drawable/bg_bottom_nav_item"
+                android:clickable="true"
+                android:focusable="true"
+                android:foreground="?attr/selectableItemBackgroundBorderless"
+                android:gravity="center"
+                android:minWidth="0dp"
+                android:orientation="vertical"
+                android:paddingStart="6dp"
+                android:paddingTop="6dp"
+                android:paddingEnd="6dp"
+                android:paddingBottom="4dp">
+
+                <ImageView
+                    android:id="@+id/navDiagIcon"
+                    android:layout_width="24dp"
+                    android:layout_height="24dp"
+                    android:contentDescription="@null"
+                    android:duplicateParentState="true"
+                    android:src="@drawable/ic_nav_diag"
+                    android:tint="@color/bottom_nav_color" />
+
+                <TextView
+                    android:id="@+id/navDiagLabel"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:duplicateParentState="true"
+                    android:includeFontPadding="false"
+                    android:text="@string/nav_diag"
+                    android:textColor="@color/bottom_nav_color"
+                    android:textSize="12sp"
+                    android:textStyle="bold" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:id="@+id/navSettingsItem"
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_weight="1"
+                android:background="@drawable/bg_bottom_nav_item"
+                android:clickable="true"
+                android:focusable="true"
+                android:foreground="?attr/selectableItemBackgroundBorderless"
+                android:gravity="center"
+                android:minWidth="0dp"
+                android:orientation="vertical"
+                android:paddingStart="6dp"
+                android:paddingTop="6dp"
+                android:paddingEnd="6dp"
+                android:paddingBottom="4dp">
+
+                <ImageView
+                    android:id="@+id/navSettingsIcon"
+                    android:layout_width="24dp"
+                    android:layout_height="24dp"
+                    android:contentDescription="@null"
+                    android:duplicateParentState="true"
+                    android:src="@drawable/ic_nav_settings"
+                    android:tint="@color/bottom_nav_color" />
+
+                <TextView
+                    android:id="@+id/navSettingsLabel"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:duplicateParentState="true"
+                    android:includeFontPadding="false"
+                    android:text="@string/nav_settings"
+                    android:textColor="@color/bottom_nav_color"
+                    android:textSize="12sp"
+                    android:textStyle="bold" />
+            </LinearLayout>
+
+        </LinearLayout>
+
+    </FrameLayout>
+
+</LinearLayout>
+

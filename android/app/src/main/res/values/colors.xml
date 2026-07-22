@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Desktop concept light theme: airy blue glass, not the older teal mobile palette -->
+    <color name="appBg">#EDF2FF</color>
+    <color name="surface">#BDFFFFFF</color>
+    <color name="surfaceSoft">#D9F5F8FF</color>
+    <color name="surfaceStrong">#E6FFFFFF</color>
+    <color name="textMain">#1D2741</color>
+    <color name="textMuted">#5F7093</color>
+    <color name="hairline">#38677EAD</color>
+
+    <color name="colorPrimary">#2E6FFF</color>
+    <color name="colorPrimaryDark">#2359D6</color>
+    <color name="colorPrimaryVariant">#2359D6</color>
+    <color name="primarySoft">#DCE7FF</color>
+    <color name="colorOnPrimary">#FFFFFF</color>
+
+    <color name="colorBlue">#2EA8FF</color>
+    <color name="blueSoft">#DDEEFF</color>
+
+    <color name="colorAmber">#E89A3E</color>
+    <color name="amberSoft">#FFF1DE</color>
+
+    <color name="colorDanger">#DE5B72</color>
+    <color name="dangerSoft">#FFE3EA</color>
+
+    <color name="colorOk">#0EA286</color>
+    <color name="okSoft">#DBF5EF</color>
+
+    <color name="brandMark">#E4ECFF</color>
+    <color name="brandText">#2E6FFF</color>
+    <color name="heroBorder">#52677EAD</color>
+    <color name="heroStart">#D6FFFFFF</color>
+    <color name="heroEnd">#D1F2F8FF</color>
+    <color name="codeBoxBg">#F7FAFF</color>
+    <color name="sectionTitle">#4D5D7E</color>
+
+    <color name="segmentTrack">#D6E0F7</color>
+    <color name="segmentActive">#FFFFFFFF</color>
+    <color name="segmentText">#6B7CA0</color>
+    <color name="segmentTextActive">#1D2741</color>
+
+    <color name="navBg">#D9FFFFFF</color>
+    <color name="navSelected">#2E6FFF</color>
+    <color name="navUnselected">#7F91B4</color>
+    <color name="navIndicator">#DCE7FF</color>
+
+    <color name="topBarBg">#CCFFFFFF</color>
+    <color name="topBarText">#1D2741</color>
+
+    <color name="pillOkBg">#DDF6F0</color>
+    <color name="pillOfflineBg">#E8EEFA</color>
+    <color name="pillOkText">#0EA286</color>
+    <color name="pillOfflineText">#6A7A9A</color>
+</resources>

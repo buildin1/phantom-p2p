@@ -1,0 +1,29 @@
+[package]
+name = "phantom-core"
+version = "2.7.5"
+edition = "2021"
+
+[lib]
+name = "phantom_core"
+
+[dependencies]
+phantom-protocol = { path = "../protocol" }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+rand = "0.8"
+local-ip-address = "0.6"
+igd-next = "0.15"
+tracing = "0.1"
+ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
+dirs = "6.0.0"
+quinn = "0.11.9"
+rcgen = "0.14.7"
+rustls = { version = "0.23.36", features = ["ring"] }
+toml = "0.8"
+ipnetwork = "0.20"
+socket2 = { version = "0.5", features = ["all"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

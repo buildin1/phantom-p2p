@@ -1,0 +1,48 @@
+use clap::Parser;
+use std::net::SocketAddr;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+mod runtime;
+mod web_server;
+
+#[derive(Parser, Debug)]
+#[command(name = "phantom-p2p")]
+#[command(about = "PhantomP2P Linux Headless client with WebUI")]
+struct Args {
+    /// Local management listener. The same port is also opened on the Host virtual IP.
+    #[arg(long, default_value = "127.0.0.1:9080")]
+    bind: SocketAddr,
+
+    /// Signaling WebSocket URL (developer mode may override the built-in endpoint).
+    #[arg(long, default_value = "ws://qx.coreyuan.cn:10112")]
+    signal: String,
+
+    /// Do not create a Host room automatically after authentication.
+    #[arg(long)]
+    no_auto_room: bool,
+
+    #[arg(short, long)]
+    verbose: bool,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+    let filter = if args.verbose {
+        "phantom_p2p_web=debug,phantom_core=debug"
+    } else {
+        "info"
+    };
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::new(filter))
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
+    println!("PhantomP2P Linux Headless {}", env!("CARGO_PKG_VERSION"));
+    println!("Linux TUN requires root or CAP_NET_ADMIN.");
+
+    let runtime = runtime::HeadlessRuntime::new(args.bind.port())?;
+    let signal_url = phantom_core::config::runtime_signal_server(&args.signal);
+    runtime.start(signal_url, !args.no_auto_room).await;
+    web_server::start_web_server(args.bind, runtime).await
+}

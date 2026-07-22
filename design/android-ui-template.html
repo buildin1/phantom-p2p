@@ -1,0 +1,1130 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>幻梦P2P Android UI Template</title>
+    <link rel="icon" href="data:," />
+    <style>
+      :root {
+        color-scheme: light;
+        --app-bg: #f6f8fb;
+        --surface: #ffffff;
+        --surface-soft: #edf3f7;
+        --surface-strong: #e7eef3;
+        --text: #172026;
+        --muted: #65737c;
+        --hairline: #dce4ea;
+        --primary: #136c66;
+        --primary-soft: #d9f0ec;
+        --blue: #2869d8;
+        --blue-soft: #e2ecff;
+        --amber: #946100;
+        --amber-soft: #fff0c7;
+        --danger: #ba2737;
+        --danger-soft: #ffe1e6;
+        --ok: #148348;
+        --ok-soft: #dff4e8;
+        --shadow: 0 28px 70px rgba(23, 32, 38, 0.18);
+        --radius: 8px;
+        --phone-w: 390px;
+        --phone-h: 844px;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        background:
+          linear-gradient(120deg, rgba(19, 108, 102, 0.08), transparent 38%),
+          linear-gradient(300deg, rgba(40, 105, 216, 0.08), transparent 34%),
+          #e8edf2;
+        color: var(--text);
+        font-family:
+          ui-sans-serif,
+          system-ui,
+          -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          sans-serif;
+        letter-spacing: 0;
+      }
+
+      button,
+      input {
+        font: inherit;
+      }
+
+      .device {
+        width: min(var(--phone-w), 100vw);
+        height: min(var(--phone-h), 100vh);
+        padding: 10px;
+        border-radius: 28px;
+        background: #11181d;
+        box-shadow: var(--shadow);
+      }
+
+      .app {
+        position: relative;
+        height: 100%;
+        overflow: hidden;
+        border-radius: 20px;
+        background: var(--app-bg);
+      }
+
+      .status-bar {
+        height: 30px;
+        padding: 8px 18px 0;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        font-size: 12px;
+        font-weight: 650;
+        color: #263238;
+      }
+
+      .system-icons {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .signal {
+        display: inline-flex;
+        align-items: flex-end;
+        gap: 2px;
+        height: 10px;
+      }
+
+      .signal span {
+        display: block;
+        width: 3px;
+        border-radius: 2px;
+        background: #263238;
+      }
+
+      .signal span:nth-child(1) {
+        height: 4px;
+      }
+
+      .signal span:nth-child(2) {
+        height: 7px;
+      }
+
+      .signal span:nth-child(3) {
+        height: 10px;
+      }
+
+      .battery {
+        position: relative;
+        width: 21px;
+        height: 10px;
+        border: 1.6px solid #263238;
+        border-radius: 3px;
+      }
+
+      .battery::before {
+        content: "";
+        position: absolute;
+        right: -3.8px;
+        top: 2.2px;
+        width: 2.2px;
+        height: 4px;
+        border-radius: 0 2px 2px 0;
+        background: #263238;
+      }
+
+      .battery::after {
+        content: "";
+        position: absolute;
+        left: 2px;
+        top: 2px;
+        width: 13px;
+        height: 4px;
+        border-radius: 2px;
+        background: var(--ok);
+      }
+
+      .top-app-bar {
+        height: 58px;
+        padding: 8px 16px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+
+      .brand-mark {
+        width: 34px;
+        height: 34px;
+        display: grid;
+        place-items: center;
+        border-radius: 8px;
+        background: #102a2a;
+        color: #e6fffa;
+      }
+
+      .brand-mark svg,
+      .icon-btn svg,
+      .nav-item svg,
+      .button svg,
+      .metric-icon svg,
+      .row-icon svg {
+        width: 20px;
+        height: 20px;
+        stroke: currentColor;
+        stroke-width: 2;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        fill: none;
+      }
+
+      .title-group {
+        min-width: 0;
+        flex: 1;
+      }
+
+      .app-title {
+        margin: 0;
+        font-size: 18px;
+        line-height: 22px;
+        font-weight: 760;
+      }
+
+      .app-subtitle {
+        margin-top: 2px;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 16px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .top-actions {
+        display: flex;
+        gap: 6px;
+      }
+
+      .icon-btn {
+        width: 38px;
+        height: 38px;
+        border: 0;
+        border-radius: 8px;
+        display: grid;
+        place-items: center;
+        background: transparent;
+        color: #27343b;
+      }
+
+      .icon-btn:active,
+      .nav-item:active,
+      .button:active {
+        transform: scale(0.98);
+      }
+
+      main {
+        height: calc(100% - 30px - 58px - 76px);
+        overflow: hidden;
+      }
+
+      .screen {
+        display: none;
+        height: 100%;
+        overflow: auto;
+        padding: 4px 16px 18px;
+        scrollbar-width: none;
+      }
+
+      .screen::-webkit-scrollbar {
+        display: none;
+      }
+
+      .screen.active {
+        display: block;
+      }
+
+      .section {
+        margin-top: 14px;
+      }
+
+      .section-title {
+        margin: 0 0 8px;
+        font-size: 13px;
+        line-height: 18px;
+        font-weight: 760;
+        color: #314149;
+      }
+
+      .panel {
+        border: 1px solid var(--hairline);
+        border-radius: var(--radius);
+        background: var(--surface);
+      }
+
+      .hero-panel {
+        min-height: 132px;
+        padding: 16px;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        border: 1px solid #cfe4df;
+        border-radius: var(--radius);
+        background:
+          linear-gradient(140deg, #e9f8f3 0%, #ffffff 48%, #eef4ff 100%);
+      }
+
+      .hero-top {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 12px;
+      }
+
+      .eyebrow {
+        margin: 0 0 4px;
+        color: var(--primary);
+        font-size: 12px;
+        font-weight: 760;
+      }
+
+      .hero-title {
+        margin: 0;
+        font-size: 26px;
+        line-height: 31px;
+        font-weight: 820;
+      }
+
+      .hero-meta {
+        margin-top: 5px;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 18px;
+      }
+
+      .status-pill {
+        flex: 0 0 auto;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        min-height: 28px;
+        padding: 5px 8px;
+        border-radius: 999px;
+        background: var(--ok-soft);
+        color: var(--ok);
+        font-size: 12px;
+        font-weight: 760;
+      }
+
+      .dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: currentColor;
+      }
+
+      .hero-actions {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+      }
+
+      .button {
+        min-height: 46px;
+        border: 0;
+        border-radius: var(--radius);
+        padding: 0 14px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        font-weight: 760;
+        color: #fff;
+        background: var(--primary);
+      }
+
+      .button.secondary {
+        color: #173238;
+        background: #eef4f4;
+        border: 1px solid #d2dfdf;
+      }
+
+      .button.tonal {
+        color: var(--blue);
+        background: var(--blue-soft);
+      }
+
+      .segmented {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 3px;
+        padding: 3px;
+        border-radius: var(--radius);
+        background: var(--surface-strong);
+      }
+
+      .segment {
+        height: 36px;
+        border: 0;
+        border-radius: 6px;
+        background: transparent;
+        color: var(--muted);
+        font-size: 13px;
+        font-weight: 760;
+      }
+
+      .segment.active {
+        background: var(--surface);
+        color: var(--primary);
+        box-shadow: 0 1px 4px rgba(23, 32, 38, 0.12);
+      }
+
+      .code-panel {
+        padding: 14px;
+      }
+
+      .code-line {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .room-code {
+        font-variant-numeric: tabular-nums;
+        letter-spacing: 3px;
+        font-size: 28px;
+        line-height: 34px;
+        font-weight: 820;
+      }
+
+      .qr {
+        width: 58px;
+        height: 58px;
+        border-radius: 6px;
+        background:
+          linear-gradient(90deg, #172026 50%, transparent 50%) 0 0 / 14px 14px,
+          linear-gradient(#172026 50%, transparent 50%) 0 0 / 14px 14px,
+          #fff;
+        border: 6px solid #fff;
+        box-shadow: inset 0 0 0 1px var(--hairline);
+      }
+
+      .mini-actions {
+        display: flex;
+        gap: 8px;
+        margin-top: 12px;
+      }
+
+      .mini-actions .button {
+        flex: 1;
+        min-height: 40px;
+        font-size: 13px;
+      }
+
+      .join-panel {
+        padding: 14px;
+      }
+
+      .code-input {
+        display: grid;
+        grid-template-columns: repeat(6, 1fr);
+        gap: 7px;
+        margin-bottom: 12px;
+      }
+
+      .code-box {
+        height: 46px;
+        border: 1px solid var(--hairline);
+        border-radius: 8px;
+        display: grid;
+        place-items: center;
+        background: #fbfdff;
+        font-size: 18px;
+        font-weight: 820;
+        color: #25343b;
+      }
+
+      .mode-row,
+      .list-row {
+        min-height: 58px;
+        padding: 10px 14px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        border-top: 1px solid var(--hairline);
+      }
+
+      .mode-row:first-child,
+      .list-row:first-child {
+        border-top: 0;
+      }
+
+      .row-icon,
+      .metric-icon {
+        width: 36px;
+        height: 36px;
+        border-radius: 8px;
+        display: grid;
+        place-items: center;
+        flex: 0 0 auto;
+      }
+
+      .row-icon.primary,
+      .metric-icon.primary {
+        color: var(--primary);
+        background: var(--primary-soft);
+      }
+
+      .row-icon.blue,
+      .metric-icon.blue {
+        color: var(--blue);
+        background: var(--blue-soft);
+      }
+
+      .row-icon.amber,
+      .metric-icon.amber {
+        color: var(--amber);
+        background: var(--amber-soft);
+      }
+
+      .row-icon.danger,
+      .metric-icon.danger {
+        color: var(--danger);
+        background: var(--danger-soft);
+      }
+
+      .row-main {
+        min-width: 0;
+        flex: 1;
+      }
+
+      .row-title {
+        margin: 0;
+        font-size: 14px;
+        line-height: 18px;
+        font-weight: 760;
+      }
+
+      .row-subtitle {
+        margin-top: 3px;
+        font-size: 12px;
+        line-height: 16px;
+        color: var(--muted);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .switch {
+        width: 44px;
+        height: 26px;
+        padding: 3px;
+        border-radius: 999px;
+        background: var(--primary);
+      }
+
+      .switch::after {
+        content: "";
+        display: block;
+        width: 20px;
+        height: 20px;
+        margin-left: auto;
+        border-radius: 50%;
+        background: #fff;
+        box-shadow: 0 1px 3px rgba(23, 32, 38, 0.26);
+      }
+
+      .connection-card {
+        padding: 16px;
+        display: grid;
+        gap: 14px;
+      }
+
+      .signal-map {
+        height: 124px;
+        position: relative;
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        align-items: center;
+        gap: 16px;
+      }
+
+      .device-node {
+        min-width: 0;
+        padding: 12px 10px;
+        border: 1px solid var(--hairline);
+        border-radius: 8px;
+        background: #fbfdff;
+        text-align: center;
+      }
+
+      .device-node strong {
+        display: block;
+        margin-top: 6px;
+        font-size: 13px;
+      }
+
+      .device-node span {
+        display: block;
+        margin-top: 2px;
+        font-size: 11px;
+        color: var(--muted);
+      }
+
+      .link-line {
+        position: absolute;
+        left: 38%;
+        right: 38%;
+        top: 50%;
+        height: 2px;
+        background: var(--primary);
+      }
+
+      .link-line::before,
+      .link-line::after {
+        content: "";
+        position: absolute;
+        top: -3px;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--primary);
+      }
+
+      .link-line::before {
+        left: -2px;
+      }
+
+      .link-line::after {
+        right: -2px;
+      }
+
+      .latency {
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        transform: translate(-50%, -50%);
+        padding: 4px 7px;
+        border-radius: 999px;
+        border: 1px solid #c9dedb;
+        background: var(--primary-soft);
+        color: var(--primary);
+        font-size: 12px;
+        font-weight: 820;
+      }
+
+      .metrics {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 8px;
+      }
+
+      .metric {
+        min-width: 0;
+        padding: 10px;
+        border-radius: 8px;
+        background: var(--surface-soft);
+      }
+
+      .metric-label {
+        color: var(--muted);
+        font-size: 11px;
+        line-height: 14px;
+      }
+
+      .metric-value {
+        margin-top: 4px;
+        font-size: 17px;
+        line-height: 22px;
+        font-weight: 820;
+      }
+
+      .throughput {
+        height: 76px;
+        display: flex;
+        align-items: end;
+        gap: 5px;
+        padding: 12px;
+        border-radius: 8px;
+        background: #f8fbfd;
+        border: 1px solid var(--hairline);
+      }
+
+      .bar {
+        flex: 1;
+        min-width: 0;
+        border-radius: 4px 4px 0 0;
+        background: linear-gradient(180deg, var(--primary), #81beb4);
+      }
+
+      .log-list {
+        padding: 8px 0;
+      }
+
+      .log-item {
+        display: grid;
+        grid-template-columns: 52px 1fr;
+        gap: 8px;
+        padding: 8px 14px;
+        font-size: 12px;
+        line-height: 17px;
+      }
+
+      .log-time {
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+
+      .log-text {
+        min-width: 0;
+        color: #2d3c43;
+      }
+
+      .bottom-nav {
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        height: 76px;
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 2px;
+        padding: 7px 10px 10px;
+        border-top: 1px solid var(--hairline);
+        background: rgba(255, 255, 255, 0.94);
+        backdrop-filter: blur(18px);
+      }
+
+      .nav-item {
+        border: 0;
+        border-radius: 8px;
+        display: grid;
+        place-items: center;
+        align-content: center;
+        gap: 3px;
+        background: transparent;
+        color: var(--muted);
+        font-size: 11px;
+        font-weight: 720;
+      }
+
+      .nav-item svg {
+        width: 21px;
+        height: 21px;
+      }
+
+      .nav-item.active {
+        color: var(--primary);
+        background: var(--primary-soft);
+      }
+
+      .sheet {
+        margin-top: 12px;
+        display: grid;
+        gap: 10px;
+      }
+
+      .protocol-row {
+        display: grid;
+        grid-template-columns: 1fr 124px;
+        align-items: center;
+        gap: 12px;
+        padding: 14px;
+      }
+
+      .app-list-logo {
+        width: 36px;
+        height: 36px;
+        border-radius: 8px;
+        display: grid;
+        place-items: center;
+        background: #202a32;
+        color: #fff;
+        font-weight: 820;
+      }
+
+      @media (max-width: 430px), (max-height: 880px) {
+        body {
+          display: block;
+          background: var(--app-bg);
+        }
+
+        .device {
+          width: 100vw;
+          height: 100vh;
+          padding: 0;
+          border-radius: 0;
+          box-shadow: none;
+          background: transparent;
+        }
+
+        .app {
+          border-radius: 0;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="device">
+      <div class="app">
+        <div class="status-bar">
+          <span>11:30</span>
+          <div class="system-icons" aria-hidden="true">
+            <span class="signal"><span></span><span></span><span></span></span>
+            <span>5G</span>
+            <span class="battery"></span>
+          </div>
+        </div>
+
+        <header class="top-app-bar">
+          <div class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <path d="M6 12a6 6 0 0 1 12 0" />
+              <path d="M9 12a3 3 0 0 1 6 0" />
+              <path d="M12 12v5" />
+              <path d="M8 19h8" />
+            </svg>
+          </div>
+          <div class="title-group">
+            <h1 class="app-title">幻梦P2P</h1>
+            <div class="app-subtitle" id="screenSubtitle">房间已就绪</div>
+          </div>
+          <div class="top-actions">
+            <button class="icon-btn" type="button" aria-label="通知">
+              <svg viewBox="0 0 24 24">
+                <path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 7h18s-3 0-3-7" />
+                <path d="M10 19a2 2 0 0 0 4 0" />
+              </svg>
+            </button>
+          </div>
+        </header>
+
+        <main>
+          <section class="screen active" data-screen="room">
+            <div class="hero-panel">
+              <div class="hero-top">
+                <div>
+                  <p class="eyebrow">手机游戏模式</p>
+                  <h2 class="hero-title">等待联机</h2>
+                  <div class="hero-meta">VPN 已授权 · UDP 优先</div>
+                </div>
+                <div class="status-pill"><span class="dot"></span>在线</div>
+              </div>
+              <div class="hero-actions">
+                <button class="button" type="button">
+                  <svg viewBox="0 0 24 24"><path d="M12 5v14" /><path d="M5 12h14" /></svg>
+                  创建房间
+                </button>
+                <button class="button secondary" type="button">
+                  <svg viewBox="0 0 24 24"><path d="M15 3h6v6" /><path d="M10 14 21 3" /><path d="M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5" /></svg>
+                  加入房间
+                </button>
+              </div>
+            </div>
+
+            <div class="section">
+              <h3 class="section-title">房间码</h3>
+              <div class="panel code-panel">
+                <div class="code-line">
+                  <div>
+                    <div class="room-code">A7K9M2</div>
+                    <div class="row-subtitle">Android 房主 · Windows 可加入</div>
+                  </div>
+                  <div class="qr" aria-hidden="true"></div>
+                </div>
+                <div class="mini-actions">
+                  <button class="button tonal" type="button">
+                    <svg viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
+                    复制
+                  </button>
+                  <button class="button secondary" type="button">
+                    <svg viewBox="0 0 24 24"><path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8" /><path d="M16 6 12 2 8 6" /><path d="M12 2v13" /></svg>
+                    分享
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div class="section">
+              <h3 class="section-title">加入房间</h3>
+              <div class="panel join-panel">
+                <div class="code-input" aria-label="房间码输入">
+                  <div class="code-box">B</div>
+                  <div class="code-box">3</div>
+                  <div class="code-box">Q</div>
+                  <div class="code-box">8</div>
+                  <div class="code-box">N</div>
+                  <div class="code-box">6</div>
+                </div>
+                <div class="hero-actions">
+                  <button class="button" type="button">
+                    <svg viewBox="0 0 24 24"><path d="M5 12h14" /><path d="m12 5 7 7-7 7" /></svg>
+                    连接
+                  </button>
+                  <button class="button secondary" type="button">
+                    <svg viewBox="0 0 24 24"><path d="M4 4h6v6H4z" /><path d="M14 4h6v6h-6z" /><path d="M4 14h6v6H4z" /><path d="M14 14h2v2h-2z" /><path d="M18 14h2v6h-6v-2" /></svg>
+                    扫码
+                  </button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="screen" data-screen="connect">
+            <div class="connection-card panel">
+              <div class="hero-top">
+                <div>
+                  <p class="eyebrow">P2P 直连</p>
+                  <h2 class="hero-title">26 ms</h2>
+                  <div class="hero-meta">A7K9M2 · UDP</div>
+                </div>
+                <div class="status-pill"><span class="dot"></span>稳定</div>
+              </div>
+
+              <div class="signal-map">
+                <div class="link-line"></div>
+                <div class="latency">26 ms</div>
+                <div class="device-node">
+                  <div class="row-icon primary" style="margin:0 auto;">
+                    <svg viewBox="0 0 24 24"><rect x="7" y="2" width="10" height="20" rx="2" /><path d="M11 18h2" /></svg>
+                  </div>
+                  <strong>Android</strong>
+                  <span>房主</span>
+                </div>
+                <div class="device-node">
+                  <div class="row-icon blue" style="margin:0 auto;">
+                    <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2" /><path d="M8 20h8" /><path d="M12 16v4" /></svg>
+                  </div>
+                  <strong>Windows</strong>
+                  <span>玩家</span>
+                </div>
+              </div>
+
+              <div class="metrics">
+                <div class="metric">
+                  <div class="metric-label">上行</div>
+                  <div class="metric-value">1.8M</div>
+                </div>
+                <div class="metric">
+                  <div class="metric-label">下行</div>
+                  <div class="metric-value">2.4M</div>
+                </div>
+                <div class="metric">
+                  <div class="metric-label">运行</div>
+                  <div class="metric-value">18m</div>
+                </div>
+              </div>
+
+              <div class="throughput" aria-label="吞吐图">
+                <div class="bar" style="height:34%"></div>
+                <div class="bar" style="height:58%"></div>
+                <div class="bar" style="height:42%"></div>
+                <div class="bar" style="height:76%"></div>
+                <div class="bar" style="height:51%"></div>
+                <div class="bar" style="height:68%"></div>
+                <div class="bar" style="height:84%"></div>
+                <div class="bar" style="height:61%"></div>
+                <div class="bar" style="height:47%"></div>
+                <div class="bar" style="height:70%"></div>
+                <div class="bar" style="height:55%"></div>
+                <div class="bar" style="height:62%"></div>
+              </div>
+
+              <button class="button secondary" type="button">
+                <svg viewBox="0 0 24 24"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>
+                断开连接
+              </button>
+            </div>
+
+            <div class="section">
+              <h3 class="section-title">玩家</h3>
+              <div class="panel">
+                <div class="list-row">
+                  <div class="row-icon blue">
+                    <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2" /><path d="M8 20h8" /><path d="M12 16v4" /></svg>
+                  </div>
+                  <div class="row-main">
+                    <p class="row-title">Windows · s_000214</p>
+                    <div class="row-subtitle">P2P 直连 · 26 ms</div>
+                  </div>
+                  <div class="status-pill"><span class="dot"></span>已连</div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="screen" data-screen="diag">
+            <div class="section" style="margin-top:0;">
+              <h3 class="section-title">网络</h3>
+              <div class="panel">
+                <div class="list-row">
+                  <div class="row-icon primary">
+                    <svg viewBox="0 0 24 24"><path d="M4.9 19.1C1 15.2 1 8.8 4.9 4.9" /><path d="M7.8 16.2a6 6 0 0 1 0-8.5" /><path d="M10.6 13.4a2 2 0 0 1 0-2.8" /><path d="M13.4 10.6a2 2 0 0 1 0 2.8" /><path d="M16.2 7.8a6 6 0 0 1 0 8.5" /><path d="M19.1 4.9c3.9 3.9 3.9 10.2 0 14.1" /></svg>
+                  </div>
+                  <div class="row-main">
+                    <p class="row-title">NAT 类型</p>
+                    <div class="row-subtitle">Port Restricted Cone</div>
+                  </div>
+                </div>
+                <div class="list-row">
+                  <div class="row-icon blue">
+                    <svg viewBox="0 0 24 24"><path d="M12 20h9" /><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" /></svg>
+                  </div>
+                  <div class="row-main">
+                    <p class="row-title">ICE 候选</p>
+                    <div class="row-subtitle">Host 2 · Srflx 4 · IPv6 0</div>
+                  </div>
+                </div>
+                <div class="list-row">
+                  <div class="row-icon amber">
+                    <svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 0 1 16 0" /><path d="M12 4v8l4 2" /><path d="M4 20h16" /></svg>
+                  </div>
+                  <div class="row-main">
+                    <p class="row-title">中继</p>
+                    <div class="row-subtitle">已预分配 · qx.coreyuan.cn:10990</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="section">
+              <h3 class="section-title">日志</h3>
+              <div class="panel log-list">
+                <div class="log-item">
+                  <div class="log-time">11:22</div>
+                  <div class="log-text">信令已连接，session s_000318</div>
+                </div>
+                <div class="log-item">
+                  <div class="log-time">11:22</div>
+                  <div class="log-text">收到 PeerCandidates，开始连通性检测</div>
+                </div>
+                <div class="log-item">
+                  <div class="log-time">11:22</div>
+                  <div class="log-text">P2P 直连成功，延迟 26 ms</div>
+                </div>
+                <div class="log-item">
+                  <div class="log-time">11:23</div>
+                  <div class="log-text">UDP 隧道已就绪</div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="screen" data-screen="settings">
+            <div class="section" style="margin-top:0;">
+              <h3 class="section-title">手机游戏模式</h3>
+              <div class="panel">
+                <div class="list-row">
+                  <div class="app-list-logo">MC</div>
+                  <div class="row-main">
+                    <p class="row-title">Minecraft</p>
+                    <div class="row-subtitle">仅转发选中游戏</div>
+                  </div>
+                  <div class="switch" aria-hidden="true"></div>
+                </div>
+                <div class="list-row">
+                  <div class="row-icon primary">
+                    <svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10" /></svg>
+                  </div>
+                  <div class="row-main">
+                    <p class="row-title">VPN 权限</p>
+                    <div class="row-subtitle">已授权</div>
+                  </div>
+                  <div class="status-pill"><span class="dot"></span>可用</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="section">
+              <h3 class="section-title">联机</h3>
+              <div class="panel">
+                <div class="protocol-row">
+                  <div>
+                    <p class="row-title">默认协议</p>
+                    <div class="row-subtitle">按游戏类型选择</div>
+                  </div>
+                  <div class="segmented">
+                    <button class="segment" type="button">TCP</button>
+                    <button class="segment active" type="button">UDP</button>
+                  </div>
+                </div>
+                <div class="list-row">
+                  <div class="row-icon amber">
+                    <svg viewBox="0 0 24 24"><path d="M12 2v6" /><path d="m16.2 7.8 4.2-4.2" /><path d="M18 12h6" /><path d="m16.2 16.2 4.2 4.2" /><path d="M12 18v6" /><path d="m7.8 16.2-4.2 4.2" /><path d="M6 12H0" /><path d="m7.8 7.8-4.2-4.2" /></svg>
+                  </div>
+                  <div class="row-main">
+                    <p class="row-title">自动中继</p>
+                    <div class="row-subtitle">直连失败后切换</div>
+                  </div>
+                  <div class="switch" aria-hidden="true"></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="section">
+              <h3 class="section-title">开发</h3>
+              <div class="panel">
+                <div class="list-row">
+                  <div class="row-icon blue">
+                    <svg viewBox="0 0 24 24"><path d="M4 17 10 11 4 5" /><path d="M12 19h8" /></svg>
+                  </div>
+                  <div class="row-main">
+                    <p class="row-title">诊断包</p>
+                    <div class="row-subtitle">最近 20 分钟</div>
+                  </div>
+                  <button class="icon-btn" type="button" aria-label="导出诊断包">
+                    <svg viewBox="0 0 24 24"><path d="M12 3v12" /><path d="m7 10 5 5 5-5" /><path d="M5 21h14" /></svg>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </section>
+        </main>
+
+        <nav class="bottom-nav" aria-label="底部导航">
+          <button class="nav-item active" type="button" data-target="room">
+            <svg viewBox="0 0 24 24"><path d="M3 9.5 12 3l9 6.5V21H3Z" /><path d="M9 21v-7h6v7" /></svg>
+            房间
+          </button>
+          <button class="nav-item" type="button" data-target="connect">
+            <svg viewBox="0 0 24 24"><path d="M8 17a5 5 0 0 1 8 0" /><path d="M5 13a10 10 0 0 1 14 0" /><path d="M2 9a15 15 0 0 1 20 0" /><path d="M12 21h.01" /></svg>
+            连接
+          </button>
+          <button class="nav-item" type="button" data-target="diag">
+            <svg viewBox="0 0 24 24"><path d="M3 3v18h18" /><path d="m7 15 4-4 3 3 5-7" /></svg>
+            诊断
+          </button>
+          <button class="nav-item" type="button" data-target="settings">
+            <svg viewBox="0 0 24 24"><path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6V22a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.6-1H2a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1A2 2 0 1 1 6.1 3.2l.1.1a1.7 1.7 0 0 0 1.9.3h.1a1.7 1.7 0 0 0 1-1.6V2a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.6h.1a1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9v.1a1.7 1.7 0 0 0 1.6 1H22a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.6 1Z" /></svg>
+            设置
+          </button>
+        </nav>
+      </div>
+    </div>
+
+    <script>
+      const subtitles = {
+        room: "房间已就绪",
+        connect: "P2P 直连中",
+        diag: "网络诊断",
+        settings: "应用设置",
+      };
+
+      document.querySelectorAll(".nav-item").forEach((button) => {
+        button.addEventListener("click", () => {
+          const target = button.dataset.target;
+          document.querySelectorAll(".nav-item").forEach((item) => item.classList.remove("active"));
+          document.querySelectorAll(".screen").forEach((screen) => screen.classList.remove("active"));
+          button.classList.add("active");
+          document.querySelector(`.screen[data-screen="${target}"]`).classList.add("active");
+          document.querySelector("#screenSubtitle").textContent = subtitles[target] || "";
+        });
+      });
+    </script>
+  </body>
+</html>

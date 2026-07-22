@@ -1,0 +1,26 @@
+[package]
+name = "phantom-p2p-web"
+version = "2.7.5"
+edition = "2021"
+
+[[bin]]
+name = "phantom-p2p-web"
+path = "src/main.rs"
+
+[dependencies]
+# Headless runtime
+phantom-core = { path = "../crates/core" }
+phantom-protocol = { path = "../crates/protocol" }
+
+# Web 服务器
+axum = { version = "0.7", features = ["ws"] }
+futures-util = "0.3"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+quinn = "0.11.9"
+
+# 其他依赖
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }

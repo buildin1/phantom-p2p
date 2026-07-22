@@ -1,0 +1,44 @@
+[package]
+name = "phantom-p2p"
+version = "2.7.5"
+description = "幻梦P2P - 游戏联机隧道"
+edition = "2021"
+
+[lib]
+name = "phantom_p2p_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+phantom-protocol = { path = "../crates/protocol" }
+phantom-core = { path = "../crates/core" }
+tauri = { version = "2", features = ["custom-protocol"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+rand = "0.8"
+igd-next = "0.15"
+local-ip-address = "0.6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
+dirs = "6.0.0"
+quinn = "0.11.9"
+rcgen = "0.14.7"
+rustls = { version = "0.23.36", features = ["ring"] }
+toml = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Threading", "Win32_UI_Shell", "Win32_Foundation"] }
+
+# Web 服务器依赖（可选）
+axum = { version = "0.7", features = ["ws"], optional = true }
+
+[features]
+default = []
+web-server = ["axum"]
