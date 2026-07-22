@@ -110,7 +110,7 @@ impl PlatformTun {
             if self.closed.load(Ordering::Relaxed) {
                 return Err(TunError::ReadFailed("device is closed".into()));
             }
-            let guard = self
+            let mut guard = self
                 .fd
                 .readable()
                 .await
@@ -142,7 +142,7 @@ impl PlatformTun {
             if self.closed.load(Ordering::Relaxed) {
                 return Err(TunError::WriteFailed("device is closed".into()));
             }
-            let guard = self
+            let mut guard = self
                 .fd
                 .writable()
                 .await
