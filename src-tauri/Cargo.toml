@@ -1,6 +1,6 @@
 [package]
 name = "phantom-p2p"
-version = "2.7.5"
+version = "2.7.6"
 description = "幻梦P2P - 游戏联机隧道"
 edition = "2021"
 

@@ -1,6 +1,7 @@
 package com.buildin1.phantom_p2p.data
 
 import android.content.Context
+import com.buildin1.phantom_p2p.PhantomVpnService
 
 class NativePacketBridge private constructor(
     private val handle: Long,
@@ -8,11 +9,21 @@ class NativePacketBridge private constructor(
     private val onLog: (String) -> Unit
 ) {
     fun writePacket(packet: ByteArray) = nativeWritePacket(handle, packet)
-    fun close() = nativeCloseBridge(handle)
+    fun close() {
+        nativeCloseBridge(handle)
+        service = null
+    }
 
     fun isReady() = handle != 0L
 
     fun onNativeIpPacket(packet: ByteArray) = onPacket(packet)
+
+    /** Called from Rust before the QUIC socket is used by the VPN data plane. */
+    fun onProtectSocket(fd: Int): Boolean {
+        return runCatching { NativePacketBridge.service?.protect(fd) ?: false }
+            .onFailure { onLog("protect VPN socket failed: ${it.message}") }
+            .getOrDefault(false)
+    }
 
     private external fun nativeWritePacket(handle: Long, packet: ByteArray)
     private external fun nativeCloseBridge(handle: Long)
@@ -20,6 +31,9 @@ class NativePacketBridge private constructor(
     private external fun nativeStartPacketStream(handle: Long): Boolean
 
     companion object {
+        @Volatile
+        private var service: PhantomVpnService? = null
+
         init { runCatching { System.loadLibrary("phantom_mobile") } }
 
         fun create(
@@ -32,6 +46,7 @@ class NativePacketBridge private constructor(
             onPacket: (ByteArray) -> Unit,
             onLog: (String) -> Unit
         ): NativePacketBridge? {
+            service = context as? PhantomVpnService
             val bridge = NativePacketBridge(0L, onPacket, onLog)
             val handle = runCatching {
                 bridge.nativeCreateBridge(mode, endpoint, relayToken, localPort, isGuest)

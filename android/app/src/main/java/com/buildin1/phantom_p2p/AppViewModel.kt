@@ -224,7 +224,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
     }
 
     fun toggleFixedHostIp() {
-        if (_state.value?.roomCode != null || _state.value?.fixedIpBusy == true) return
+        if (_state.value?.fixedIpBusy == true) return
         if (!isSignalAuthenticated()) {
             ensureConnected()
             return
@@ -265,8 +265,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
 
     /** Activity 收到 VPN 授权拒绝后调用 —— 不保活但仍允许操作（用户自担风险） */
     fun onVpnDenied() {
-        pendingVpnAction?.invoke()
         pendingVpnAction = null
+        updateState { it.copy(isJoining = false, connectionMode = "VPN 未授权") }
+        addLog("用户拒绝 VPN 权限，房间操作未执行", "WARN", "vpn")
         _vpnPermissionNeeded.postValue(null)
     }
 
@@ -374,7 +375,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
             )
         }
         configureVpnOverlay(virtualIp, subnet, virtualIp, isGuest = false)
-        signalManager?.hostReady()
+        viewModelScope.launch {
+            if (awaitVpnOverlayReady()) {
+                signalManager?.hostReady()
+            } else {
+                addLog("Android VPN TUN 建立失败，未宣布 HostReady", "ERROR", "vpn")
+                signalManager?.closeRoom()
+            }
+        }
         addLog("房间已创建: $roomCode", "INFO", "host")
     }
 
@@ -393,7 +401,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
         }
         configureVpnOverlay(virtualIp, subnet, hostVirtualIp, isGuest = true)
         addLog("加入成功，Host 虚拟地址 $hostVirtualIp", "INFO", "guest")
-        startIceNegotiation(reuseExisting = false)
+        viewModelScope.launch {
+            if (awaitVpnOverlayReady()) startIceNegotiation(reuseExisting = false)
+            else addLog("Android VPN TUN 建立失败，未开始打洞", "ERROR", "vpn")
+        }
     }
 
     override fun onJoinFailed(reason: String) {
@@ -588,6 +599,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
         val app = getApplication<Application>()
         if (VpnService.prepare(app) != null) return
         PhantomVpnService.configureOverlay(app, localIp, subnet, hostIp, isGuest)
+    }
+
+    private suspend fun awaitVpnOverlayReady(): Boolean {
+        val app = getApplication<Application>()
+        repeat(30) {
+            if (PhantomVpnService.isOverlayReady(app)) return true
+            delay(100)
+        }
+        return false
     }
 
     /** 房间关闭时停止 VPN 前台服务（进程可被系统回收） */
