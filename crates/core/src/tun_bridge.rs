@@ -379,7 +379,17 @@ fn same_prefix24(ip: Ipv4Addr, network: Ipv4Addr) -> bool {
 }
 
 fn adapter_name(ip: Ipv4Addr) -> String {
-    format!("PhantomP2P-{}", ip.to_string().replace('.', "-"))
+    // Linux IFNAMSIZ limits interface names to 15 characters. Keep all four
+    // octets so simultaneous rooms cannot collide while staying portable.
+    #[cfg(target_os = "linux")]
+    {
+        let [a, b, c, d] = ip.octets();
+        return format!("pp2-{}-{}-{}-{}", a, b, c, d);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        format!("PhantomP2P-{}", ip.to_string().replace('.', "-"))
+    }
 }
 
 #[cfg(test)]
@@ -388,14 +398,26 @@ mod tests {
 
     #[test]
     fn adapter_name_is_unique_per_virtual_ip() {
-        assert_eq!(
-            adapter_name(Ipv4Addr::new(172, 16, 1, 1)),
-            "PhantomP2P-172-16-1-1"
-        );
-        assert_eq!(
-            adapter_name(Ipv4Addr::new(172, 16, 1, 2)),
-            "PhantomP2P-172-16-1-2"
-        );
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(adapter_name(Ipv4Addr::new(172, 16, 1, 1)), "pp2-172-16-1-1");
+            assert!(adapter_name(Ipv4Addr::new(172, 16, 1, 1)).len() <= 15);
+            assert_ne!(
+                adapter_name(Ipv4Addr::new(172, 16, 1, 1)),
+                adapter_name(Ipv4Addr::new(172, 16, 1, 2))
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(
+                adapter_name(Ipv4Addr::new(172, 16, 1, 1)),
+                "PhantomP2P-172-16-1-1"
+            );
+            assert_eq!(
+                adapter_name(Ipv4Addr::new(172, 16, 1, 2)),
+                "PhantomP2P-172-16-1-2"
+            );
+        }
     }
 
     #[test]

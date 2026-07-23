@@ -229,6 +229,7 @@ impl HeadlessRuntime {
                         println!();
                     }
                     Err(error) => {
+                        tracing::error!("[TUN] Host device initialization failed: {}", error);
                         self.emit("tun:failed", error.to_string());
                         let _ = self.signal.send(ClientMessage::CloseRoom).await;
                     }
