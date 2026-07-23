@@ -51,6 +51,7 @@ sealed class ClientMessage {
     object GetFixedHostIp : ClientMessage()
 
     data class IceCandidates(
+        @JsonProperty("target_peer_session_id") val targetPeerSessionId: String? = null,
         @JsonProperty("candidates") val candidates: List<IceCandidate>,
         @JsonProperty("ufrag") val ufrag: String,
         @JsonProperty("pwd") val pwd: String,

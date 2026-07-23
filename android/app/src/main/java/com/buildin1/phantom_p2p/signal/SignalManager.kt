@@ -120,7 +120,7 @@ class SignalManager(
     fun getFixedHostIp() = send(ClientMessage.GetFixedHostIp)
 
     fun sendIceCandidates(candidates: List<IceCandidate>, ufrag: String, pwd: String, natType: String) {
-        send(ClientMessage.IceCandidates(candidates, ufrag, pwd, natType))
+        send(ClientMessage.IceCandidates(null, candidates, ufrag, pwd, natType))
     }
 
     fun requestRelay() {

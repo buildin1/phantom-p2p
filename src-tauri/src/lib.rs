@@ -28,6 +28,11 @@ struct SignalState {
     client: Arc<signal::client::SignalClient>,
 }
 
+struct HostPeer {
+    socket: Arc<UdpSocket>,
+    endpoint: Option<quinn::Endpoint>,
+}
+
 /// 打洞状态（通过 Tauri State 管理）
 struct PunchState {
     /// 当前打洞用的 UDP socket（STUN 探测和打洞共用）
@@ -44,8 +49,11 @@ struct PunchState {
     conn_manager: tokio::sync::Mutex<Option<Arc<tunnel::TunnelConnManager>>>,
     /// ICE 打洞任务句柄（ICE 连通性检测中）
     ice_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    host_ice_tasks:
+        tokio::sync::Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>,
     /// Host 侧 QUIC Endpoint（多 guest 共享同一 endpoint，避免 reset 时销毁已建立连接）
     host_endpoint: tokio::sync::Mutex<Option<quinn::Endpoint>>,
+    host_peers: tokio::sync::Mutex<std::collections::HashMap<String, HostPeer>>,
     /// One long-lived Host relay connection serves every Guest in the room.
     relay_host_token: tokio::sync::Mutex<Option<String>>,
     relay_host_conn: tokio::sync::Mutex<Option<quinn::Connection>>,
@@ -149,6 +157,9 @@ async fn abort_punch_task(punch_state: &PunchState) {
     if let Some(handle) = punch_state.ice_task.lock().await.take() {
         handle.abort();
     }
+    for (_, handle) in std::mem::take(&mut *punch_state.host_ice_tasks.lock().await) {
+        handle.abort();
+    }
 }
 
 async fn reset_connection_runtime(punch_state: &PunchState) {
@@ -161,6 +172,11 @@ async fn reset_connection_runtime(punch_state: &PunchState) {
     }
     if let Some(ep) = punch_state.host_endpoint.lock().await.take() {
         ep.close(0u32.into(), b"");
+    }
+    for (_, peer) in std::mem::take(&mut *punch_state.host_peers.lock().await) {
+        if let Some(endpoint) = peer.endpoint {
+            endpoint.close(0u32.into(), b"room connection reset");
+        }
     }
     *punch_state.relay_host_token.lock().await = None;
     if let Some(conn) = punch_state.relay_host_conn.lock().await.take() {
@@ -396,6 +412,11 @@ async fn connect_signal(
                         if let Some(old) = ps.host_endpoint.lock().await.take() {
                             old.close(0u32.into(), b"Host address changed");
                         }
+                        for (_, peer) in std::mem::take(&mut *ps.host_peers.lock().await) {
+                            if let Some(endpoint) = peer.endpoint {
+                                endpoint.close(0u32.into(), b"Host address changed");
+                            }
+                        }
                         ps.tun_enabled.store(false, Ordering::Relaxed);
                         match tun_bridge::TunBridge::start_host(subnet, virtual_ip).await {
                             Ok(bridge) => {
@@ -441,6 +462,20 @@ async fn connect_signal(
                             host_virtual_ip
                         );
                     }
+                    ServerMessage::PeerLeft {
+                        peer_session_id, ..
+                    } => {
+                        let ps = app_for_task.state::<PunchState>();
+                        if let Some(task) = ps.host_ice_tasks.lock().await.remove(peer_session_id) {
+                            task.abort();
+                        }
+                        let removed_peer = { ps.host_peers.lock().await.remove(peer_session_id) };
+                        if let Some(peer) = removed_peer {
+                            if let Some(endpoint) = peer.endpoint {
+                                endpoint.close(0u32.into(), b"peer left");
+                            }
+                        }
+                    }
                     ServerMessage::RelayPreAllocated {
                         room_code,
                         relay_addr,
@@ -466,6 +501,7 @@ async fn connect_signal(
                     } => {
                         let app_for_ice = app_for_task.clone();
                         let peer_session_id = peer_session_id.clone();
+                        let task_peer_id = peer_session_id.clone();
                         let candidates = candidates.clone();
                         let peer_nat_type = peer_nat_type.clone();
                         let start_at_ms = *start_at_ms;
@@ -474,8 +510,16 @@ async fn connect_signal(
                         let ice_task = tokio::spawn(async move {
                             let ps = app_for_ice.state::<PunchState>();
 
-                            let sock = ps.socket.lock().await.clone();
                             let is_host = *ps.is_host.read().await;
+                            let sock = if is_host {
+                                ps.host_peers
+                                    .lock()
+                                    .await
+                                    .get(&peer_session_id)
+                                    .map(|peer| peer.socket.clone())
+                            } else {
+                                ps.socket.lock().await.clone()
+                            };
 
                             let Some(sock) = sock else {
                                 let _ = app_for_ice.emit(
@@ -518,31 +562,34 @@ async fn connect_signal(
 
                                 if is_host {
                                     // 多人模式：复用已有 QUIC Endpoint，避免每次新建
-                                    let mut ep_lock = ps.host_endpoint.lock().await;
-                                    let mut tunnel_ready = ep_lock.is_some();
-                                    if ep_lock.is_none() {
-                                        if let Ok(sock_std) = sock.try_clone() {
-                                            if let Ok(endpoint) =
-                                                tunnel::create_host_endpoint(sock_std)
+                                    let mut tunnel_ready = false;
+                                    if let Ok(sock_std) = sock.try_clone() {
+                                        if let Ok(endpoint) = tunnel::create_host_endpoint(sock_std)
+                                        {
+                                            let ep_for_task = endpoint.clone();
+                                            let sf = stats_for_ice.clone();
+                                            let peer_map = Arc::new(tokio::sync::Mutex::new(
+                                                std::collections::HashMap::from([(
+                                                    peer_socket_addr.to_string(),
+                                                    user_id.clone(),
+                                                )]),
+                                            ));
+                                            let tun = ps.tun_bridge.lock().await.clone();
+                                            tokio::spawn(async move {
+                                                let _ = tunnel::start_host_tunnel(
+                                                    ep_for_task,
+                                                    sf,
+                                                    peer_map,
+                                                    tun,
+                                                )
+                                                .await;
+                                            });
+                                            if let Some(peer) =
+                                                ps.host_peers.lock().await.get_mut(&peer_session_id)
                                             {
-                                                let ep_for_task = endpoint.clone();
-                                                let sf = stats_for_ice.clone();
-                                                let peer_map = Arc::new(tokio::sync::Mutex::new(
-                                                    std::collections::HashMap::new(),
-                                                ));
-                                                let tun = ps.tun_bridge.lock().await.clone();
-                                                tokio::spawn(async move {
-                                                    let _ = tunnel::start_host_tunnel(
-                                                        ep_for_task,
-                                                        sf,
-                                                        peer_map,
-                                                        tun,
-                                                    )
-                                                    .await;
-                                                });
-                                                *ep_lock = Some(endpoint);
-                                                tunnel_ready = true;
+                                                peer.endpoint = Some(endpoint);
                                             }
+                                            tunnel_ready = true;
                                         }
                                     }
                                     if tunnel_ready {
@@ -602,6 +649,15 @@ async fn connect_signal(
                                     }
                                 }
                             } else {
+                                if is_host {
+                                    if let Some(peer) =
+                                        ps.host_peers.lock().await.remove(&peer_session_id)
+                                    {
+                                        if let Some(endpoint) = peer.endpoint {
+                                            endpoint.close(0u32.into(), b"ICE failed");
+                                        }
+                                    }
+                                }
                                 let _ = app_for_ice.emit(
                                     "punch:phase",
                                     puncher::PunchPhase::Failed {
@@ -612,7 +668,14 @@ async fn connect_signal(
                         });
 
                         let ps = app_for_task.state::<PunchState>();
-                        *ps.ice_task.lock().await = Some(ice_task);
+                        if *ps.is_host.read().await {
+                            ps.host_ice_tasks
+                                .lock()
+                                .await
+                                .insert(task_peer_id, ice_task);
+                        } else {
+                            *ps.ice_task.lock().await = Some(ice_task);
+                        }
                     }
                     _ => {}
                 }
@@ -743,10 +806,43 @@ async fn start_punch(
     app: AppHandle,
     signal_state: tauri::State<'_, SignalState>,
     punch_state: tauri::State<'_, PunchState>,
-    _peer_session_id: Option<String>,
+    peer_session_id: Option<String>,
 ) -> Result<(), String> {
     let client = &signal_state.client;
     let is_dev = DEV_MODE.load(Ordering::Relaxed);
+
+    if *punch_state.is_host.read().await {
+        let peer_id = peer_session_id.ok_or("Host ICE requires peer_session_id")?;
+        if punch_state.host_peers.lock().await.contains_key(&peer_id) {
+            return Ok(());
+        }
+        let (sock, candidates) = tokio::task::spawn_blocking(|| {
+            let sock = network::bind_dual_stack_udp(0)
+                .map_err(|e| format!("per-peer ICE socket bind failed: {}", e))?;
+            let (candidates, _, _, _) = puncher::gather_ice_candidates(&sock);
+            Ok::<_, String>((Arc::new(sock), candidates))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        punch_state.host_peers.lock().await.insert(
+            peer_id.clone(),
+            HostPeer {
+                socket: sock,
+                endpoint: None,
+            },
+        );
+        client
+            .send(ClientMessage::IceCandidates {
+                target_peer_session_id: Some(peer_id),
+                candidates,
+                ufrag: String::new(),
+                pwd: String::new(),
+                nat_type: String::new(),
+            })
+            .await?;
+        let _ = app.emit("punch:phase", puncher::PunchPhase::WaitingPeer);
+        return Ok(());
+    }
 
     // ── Host 多人复用分支 ────────────────────────────────────────────
     // 若已经是 Host 且 socket/候选都已就绪，直接复用，避免 reset 摧毁已建立的连接
@@ -763,6 +859,7 @@ async fn start_punch(
                 }
                 client
                     .send(ClientMessage::IceCandidates {
+                        target_peer_session_id: None,
                         candidates: existing_candidates,
                         ufrag: String::new(),
                         pwd: String::new(),
@@ -811,6 +908,7 @@ async fn start_punch(
     // Step 2: 上报 IceCandidates
     client
         .send(ClientMessage::IceCandidates {
+            target_peer_session_id: None,
             candidates,
             ufrag: String::new(),
             pwd: String::new(),
@@ -1401,7 +1499,9 @@ pub fn run(dev_mode: bool) {
             relay_prealloc: tokio::sync::Mutex::new(None),
             conn_manager: tokio::sync::Mutex::new(None),
             ice_task: tokio::sync::Mutex::new(None),
+            host_ice_tasks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             host_endpoint: tokio::sync::Mutex::new(None),
+            host_peers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             relay_host_token: tokio::sync::Mutex::new(None),
             relay_host_conn: tokio::sync::Mutex::new(None),
             tun_bridge: tokio::sync::Mutex::new(None),

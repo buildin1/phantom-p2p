@@ -1,6 +1,6 @@
 [package]
 name = "phantom-server"
-version = "2.7.6"
+version = "2.7.7"
 edition = "2021"
 description = "幻梦P2P 信令+中继服务器"
 

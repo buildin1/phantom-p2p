@@ -122,6 +122,8 @@ pub enum ClientMessage {
     /// 上报 ICE 候选地址集合
     #[serde(rename = "ice_candidates")]
     IceCandidates {
+        #[serde(default)]
+        target_peer_session_id: Option<String>,
         candidates: Vec<IceCandidate>,
         ufrag: String,
         pwd: String,
@@ -284,6 +286,26 @@ mod tests {
         match decoded {
             ClientMessage::CreateRoom => {}
             _ => panic!("消息类型不匹配"),
+        }
+    }
+
+    #[test]
+    fn targeted_ice_candidates_roundtrip() {
+        let msg = ClientMessage::IceCandidates {
+            target_peer_session_id: Some("guest-42".to_string()),
+            candidates: Vec::new(),
+            ufrag: String::new(),
+            pwd: String::new(),
+            nat_type: "port_restricted_cone".to_string(),
+        };
+        let bytes = serialize(&msg).unwrap();
+        let decoded: ClientMessage = deserialize(&bytes).unwrap();
+        match decoded {
+            ClientMessage::IceCandidates {
+                target_peer_session_id,
+                ..
+            } => assert_eq!(target_peer_session_id.as_deref(), Some("guest-42")),
+            _ => panic!("unexpected message"),
         }
     }
 

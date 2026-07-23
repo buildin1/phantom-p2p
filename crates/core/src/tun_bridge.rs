@@ -305,11 +305,11 @@ async fn receive_frames(
             );
             continue;
         }
-        peers
-            .lock()
-            .await
-            .entry(source)
-            .or_insert_with(|| sender.clone());
+        // A virtual IP may be reused after a Guest reconnects or switches
+        // transport. Always let the newest authenticated stream own the route;
+        // retaining the first sender would black-hole replies into a closed
+        // QUIC connection.
+        peers.lock().await.insert(source, sender.clone());
         tun.write_packet(&packet).await.map_err(|e| {
             format!(
                 "Wintun write {} -> {} ({} bytes): {}",
