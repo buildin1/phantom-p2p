@@ -24,12 +24,10 @@ else
 fi
 VERSION="$(node "$PROJECT_ROOT/tools/version.mjs" current)"
 CLIENT_NAME="phantom-p2p-${VERSION}-linux-${RELEASE_ARCH}"
-SERVER_NAME="phantom-server-${VERSION}-linux-${RELEASE_ARCH}"
 CLIENT_ARCHIVE="${CLIENT_NAME}.tar.gz"
-SERVER_ARCHIVE="${SERVER_NAME}.tar.gz"
 
 rm -rf -- "$OUTPUT_DIR"
-mkdir -p -- "$OUTPUT_DIR/client" "$OUTPUT_DIR/server"
+mkdir -p -- "$OUTPUT_DIR/client"
 cd "$PROJECT_ROOT"
 
 printf '[1/5] Building shared WebUI...\n'
@@ -38,14 +36,8 @@ npm run build
 
 printf '[2/5] Building headless WebUI client...\n'
 cargo build --locked --release -p phantom-p2p-web
-[[ -x target/release/phantom-p2p-web ]] || die 'phantom-p2p-web binary was not produced'
-install -m 0755 target/release/phantom-p2p-web "$OUTPUT_DIR/client/$CLIENT_NAME"
-
-printf '[3/5] Building signaling/IPv4 relay server...\n'
-cargo build --locked --release -p phantom-server
-[[ -x target/release/phantom-server ]] || die 'phantom-server binary was not produced'
-install -m 0755 target/release/phantom-server "$OUTPUT_DIR/server/$SERVER_NAME"
-install -m 0644 server/config.toml "$OUTPUT_DIR/server/config.toml"
+[[ -x target/release/phantom-p2p ]] || die 'phantom-p2p binary was not produced'
+install -m 0755 target/release/phantom-p2p "$OUTPUT_DIR/client/$CLIENT_NAME"
 
 cat > "$OUTPUT_DIR/client/README-Linux.txt" <<EOF
 PhantomP2P ${VERSION} Linux headless WebUI client
@@ -62,26 +54,15 @@ the Host virtual IP after the TUN device is ready.
 Alternatively, run the client as root without setcap.
 EOF
 
-cat > "$OUTPUT_DIR/server/README-Linux.txt" <<EOF
-PhantomP2P ${VERSION} Linux signaling/IPv4 relay server
-
-Run:
-  ./${SERVER_NAME}
-
-Keep config.toml in the same directory as the server binary.
-EOF
-
-printf '[4/5] Verifying binaries...\n'
-file "$OUTPUT_DIR/client/$CLIENT_NAME" "$OUTPUT_DIR/server/$SERVER_NAME"
+printf '[3/4] Verifying binary...\n'
+file "$OUTPUT_DIR/client/$CLIENT_NAME"
 "$OUTPUT_DIR/client/$CLIENT_NAME" --help >/dev/null
-"$OUTPUT_DIR/server/$SERVER_NAME" --help >/dev/null 2>&1 || true
 
-printf '[5/5] Creating release archives...\n'
+printf '[4/4] Creating release archive...\n'
 tar -C "$OUTPUT_DIR/client" -czf "$OUTPUT_DIR/$CLIENT_ARCHIVE" "$CLIENT_NAME" README-Linux.txt
-tar -C "$OUTPUT_DIR/server" -czf "$OUTPUT_DIR/$SERVER_ARCHIVE" "$SERVER_NAME" config.toml README-Linux.txt
 (
     cd "$OUTPUT_DIR"
-    sha256sum "client/$CLIENT_NAME" "server/$SERVER_NAME" "$CLIENT_ARCHIVE" "$SERVER_ARCHIVE" > SHA256SUMS
+    sha256sum "client/$CLIENT_NAME" "$CLIENT_ARCHIVE" > SHA256SUMS
 )
 printf 'Build complete: %s\n' "$OUTPUT_DIR"
 find "$OUTPUT_DIR" -maxdepth 2 -type f -printf '  %P (%s bytes)\n' | sort
