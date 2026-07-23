@@ -387,33 +387,39 @@ async fn connect_signal(
                         *ps.subnet.write().await = subnet.clone();
                         *ps.virtual_ip.write().await = virtual_ip.clone();
                         *ps.host_virtual_ip.write().await = virtual_ip.clone();
-                        if ps.tun_bridge.lock().await.is_none() {
-                            match tun_bridge::TunBridge::start_host(subnet, virtual_ip).await {
-                                Ok(bridge) => {
-                                    *ps.tun_bridge.lock().await = Some(bridge);
-                                    ps.tun_enabled.store(true, Ordering::Relaxed);
-                                    let _ = app_for_task.emit(
-                                        "tun:ready",
-                                        serde_json::json!({
-                                            "my_ip": virtual_ip,
-                                            "host_ip": virtual_ip,
-                                            "subnet": subnet,
-                                        }),
+                        if let Some(old) = ps.tun_bridge.lock().await.take() {
+                            old.close().await;
+                        }
+                        if let Some(old) = ps.conn_manager.lock().await.take() {
+                            old.close().await;
+                        }
+                        if let Some(old) = ps.host_endpoint.lock().await.take() {
+                            old.close(0u32.into(), b"Host address changed");
+                        }
+                        ps.tun_enabled.store(false, Ordering::Relaxed);
+                        match tun_bridge::TunBridge::start_host(subnet, virtual_ip).await {
+                            Ok(bridge) => {
+                                *ps.tun_bridge.lock().await = Some(bridge);
+                                ps.tun_enabled.store(true, Ordering::Relaxed);
+                                let _ = app_for_task.emit(
+                                    "tun:ready",
+                                    serde_json::json!({
+                                        "my_ip": virtual_ip,
+                                        "host_ip": virtual_ip,
+                                        "subnet": subnet,
+                                    }),
+                                );
+                                if let Err(e) = client_clone.send(ClientMessage::HostReady).await {
+                                    tracing::error!(
+                                        "[TUN] failed to announce Host readiness: {}",
+                                        e
                                     );
-                                    if let Err(e) =
-                                        client_clone.send(ClientMessage::HostReady).await
-                                    {
-                                        tracing::error!(
-                                            "[TUN] failed to announce Host readiness: {}",
-                                            e
-                                        );
-                                    }
                                 }
-                                Err(e) => {
-                                    tracing::error!("[TUN] Host 虚拟网卡启动失败: {}", e);
-                                    let _ = app_for_task.emit("tun:failed", e.to_string());
-                                    let _ = client_clone.send(ClientMessage::CloseRoom).await;
-                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("[TUN] Host 虚拟网卡启动失败: {}", e);
+                                let _ = app_for_task.emit("tun:failed", e.to_string());
+                                let _ = client_clone.send(ClientMessage::CloseRoom).await;
                             }
                         }
                         tracing::info!("[信令] RoomCreated: subnet={}, ip={}", subnet, virtual_ip);

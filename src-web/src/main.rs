@@ -10,7 +10,7 @@ mod web_server;
 #[command(about = "PhantomP2P Linux Headless client with WebUI")]
 struct Args {
     /// Local management listener. The same port is also opened on the Host virtual IP.
-    #[arg(long, default_value = "127.0.0.1:9080")]
+    #[arg(long, default_value = "0.0.0.0:9080")]
     bind: SocketAddr,
 
     /// Signaling WebSocket URL (developer mode may override the built-in endpoint).

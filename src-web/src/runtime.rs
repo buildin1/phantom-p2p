@@ -203,6 +203,18 @@ impl HeadlessRuntime {
                 subnet,
                 virtual_ip,
             } => {
+                if let Some(old) = self.state.lock().await.tun_bridge.take() {
+                    old.close().await;
+                }
+                if let Some(old) = self.state.lock().await.conn_manager.take() {
+                    old.close().await;
+                }
+                if let Some(old) = self.state.lock().await.host_endpoint.take() {
+                    old.close(0u32.into(), b"Host address changed");
+                }
+                if let Some(old) = self.state.lock().await.relay_host_conn.take() {
+                    old.close(0u32.into(), b"Host address changed");
+                }
                 {
                     let mut state = self.state.lock().await;
                     state.room_code = Some(room_code.clone());
@@ -525,7 +537,15 @@ impl HeadlessRuntime {
             let connection =
                 tunnel::connect_relay_quic_guest(address, relay.token, self.stats.clone(), user)
                     .await?;
-            self.state.lock().await.conn_manager = Some(tunnel::TunnelConnManager::new(connection));
+            let existing = self.state.lock().await.conn_manager.clone();
+            if let Some(manager) = existing {
+                // Keep the transparent TUN and active application streams;
+                // TunnelConnManager switches new packets to the relay.
+                manager.upgrade(connection).await;
+            } else {
+                self.state.lock().await.conn_manager =
+                    Some(tunnel::TunnelConnManager::new(connection));
+            }
             self.start_guest_tun().await?;
         }
         self.emit("tunnel:started", "Relay");

@@ -42,6 +42,8 @@ class RoomFragment : Fragment() {
         binding.rowGamePort.visibility = View.GONE
         binding.rowMultiPort.visibility = View.GONE
         binding.advancedPanel.visibility = View.GONE
+        binding.inlineHostIpCard.visibility = View.GONE
+        binding.topHostIpCard.visibility = View.VISIBLE
         savedRoomCode.take(6).forEachIndexed { index, char -> codeBoxes[index].setText(char.toString()) }
     }
 
@@ -91,7 +93,7 @@ class RoomFragment : Fragment() {
             Toast.makeText(requireContext(), "房间码已复制", Toast.LENGTH_SHORT).show()
         }
         binding.btnCloseRoom.setOnClickListener { viewModel.closeRoom() }
-        binding.btnRequestFixedIp.setOnClickListener {
+        val fixedIpClick = View.OnClickListener {
             val fixedIp = viewModel.state.value?.fixedHostIp
             if (fixedIp == null) {
                 viewModel.toggleFixedHostIp()
@@ -104,6 +106,8 @@ class RoomFragment : Fragment() {
                     .show()
             }
         }
+        binding.btnRequestFixedIp.setOnClickListener(fixedIpClick)
+        binding.btnTopRequestFixedIp.setOnClickListener(fixedIpClick)
     }
 
     private fun observeState() {
@@ -124,20 +128,30 @@ class RoomFragment : Fragment() {
             binding.btnJoinRoom.isEnabled = !state.isJoining && !state.guestActive
             binding.tvRoomCode.text = state.roomCode ?: "------"
             binding.tvTransportBadge.text = state.connectionMode.ifBlank { "等待连接" }
+            val roomActive = state.roomCode != null
             binding.tvSectionMyRoom.visibility = if (state.hostActive) View.VISIBLE else View.GONE
             binding.cardMyRoom.visibility = if (state.hostActive) View.VISIBLE else View.GONE
+            // Once a room exists, the create/join entry cards must disappear.
+            (binding.btnCreateRoom.parent as? View)?.visibility = if (roomActive) View.GONE else View.VISIBLE
+            (binding.btnJoinRoom.parent?.parent as? View)?.visibility = if (roomActive) View.GONE else View.VISIBLE
             binding.btnRequestFixedIp.text = when {
                 state.fixedIpBusy -> "处理中…"
                 state.fixedHostIp != null -> "放弃固定 IP"
                 else -> "申请固定 IP"
             }
-            binding.btnRequestFixedIp.isEnabled = !state.fixedIpBusy && state.roomCode == null
-            binding.tvHostVirtualIp.text = state.fixedHostIp ?: state.virtualIp.ifBlank { "127.0.0.1" }
-            binding.tvHostIpMode.text = when {
+            binding.btnRequestFixedIp.isEnabled = !state.fixedIpBusy
+            binding.btnTopRequestFixedIp.text = binding.btnRequestFixedIp.text
+            binding.btnTopRequestFixedIp.isEnabled = !state.fixedIpBusy
+            val hostIp = state.fixedHostIp ?: state.virtualIp.ifBlank { "127.0.0.1" }
+            val ipMode = when {
                 state.fixedHostIp != null -> "固定 IP"
                 state.virtualIp.isNotBlank() -> "动态 IP"
                 else -> "未开房间"
             }
+            binding.tvHostVirtualIp.text = hostIp
+            binding.tvHostIpMode.text = ipMode
+            binding.tvTopHostVirtualIp.text = hostIp
+            binding.tvTopHostIpMode.text = ipMode
         }
     }
 

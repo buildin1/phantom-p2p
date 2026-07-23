@@ -179,6 +179,9 @@ class PhantomVpnService : VpnService() {
         vpnInterface?.close()
         vpnInterface = null
         persistRunningState(false)
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+            .putBoolean(KEY_OVERLAY_READY, false)
+            .apply()
         if (removeService) {
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
@@ -452,6 +455,9 @@ class PhantomVpnService : VpnService() {
         if (vpnInterface == null) {
             stopVpn(removeService = true)
         } else {
+            getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+                .putBoolean(KEY_OVERLAY_READY, true)
+                .apply()
             Log.i(TAG, "VPN TUN 已建立 local=$localIp peer=$peerIp")
             persistRunningState(true)
             refreshNotification()
@@ -592,6 +598,7 @@ class PhantomVpnService : VpnService() {
         private const val ACTION_CLEAR_BINDING = "com.buildin1.phantom_p2p.action.CLEAR_BINDING"
         private const val PREFS_NAME = "phantom_runtime"
         private const val KEY_VPN_RUNNING = "vpn_running"
+        private const val KEY_OVERLAY_READY = "overlay_ready"
         private const val KEY_DATA_MODE = "vpn_data_mode"
         private const val KEY_DATA_ENDPOINT = "vpn_data_endpoint"
         private const val KEY_TX_BYTES = "vpn_tx_bytes"
@@ -661,6 +668,10 @@ class PhantomVpnService : VpnService() {
         }
 
         fun configureOverlay(context: Context, localIp: String, subnet: String, peerIp: String, isGuest: Boolean) {
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY_OVERLAY_READY, false)
+                .apply()
             val intent = Intent(context, PhantomVpnService::class.java).apply {
                 action = ACTION_CONFIGURE_OVERLAY
                 putExtra(EXTRA_OVERLAY_LOCAL, localIp)
@@ -702,6 +713,10 @@ class PhantomVpnService : VpnService() {
             return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 .getBoolean(KEY_VPN_RUNNING, false)
         }
+
+        fun isOverlayReady(context: Context): Boolean = context
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_OVERLAY_READY, false)
 
         fun readRuntimeStats(context: Context): RuntimeStats {
             val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)

@@ -150,7 +150,10 @@ const MAX_ACTIVE_CONNECTIONS_PER_IP: u32 = 32;
 /// 会话心跳超时阈值（秒）
 /// PC 客户端每 15s 发一次应用层 Ping，Android 每 10s 发一次。
 /// 取 30s 给网络抖动留一个完整周期的冗余。
-const SESSION_HEARTBEAT_TIMEOUT_SECS: u64 = 30;
+// Clients ping every 10-15s. Keep three missed heartbeats before tearing down
+// a session so a sleeping Wi-Fi/mobile radio does not destroy a long-running
+// headless Host room.
+const SESSION_HEARTBEAT_TIMEOUT_SECS: u64 = 90;
 /// 会话超时扫描周期（秒）
 const SESSION_SWEEP_INTERVAL_SECS: u64 = 5;
 
@@ -581,17 +584,11 @@ async fn handle_get_fixed_host_ip(session_id: &str, state: &SharedState) {
 }
 
 async fn handle_request_fixed_host_ip(session_id: &str, state: &SharedState) {
-    let st = state.lock().await;
+    let mut st = state.lock().await;
     let Some(session) = st.sessions.get(session_id) else {
         return;
     };
-    if session.room_code.is_some() {
-        let _ = session.sender.send(ServerMessage::Error {
-            message: "Close the current room before changing the fixed Host IP".to_string(),
-        });
-        return;
-    }
-    let Some(user_id) = session.user_id.as_deref() else {
+    let Some(user_id) = session.user_id.clone() else {
         let _ = session.sender.send(ServerMessage::Error {
             message: "Authentication is required for a fixed Host IP".to_string(),
         });
@@ -603,14 +600,22 @@ async fn handle_request_fixed_host_ip(session_id: &str, state: &SharedState) {
         });
         return;
     };
-    match db.allocate_fixed_host_ip(user_id) {
+    match db.allocate_fixed_host_ip(&user_id) {
         Ok(virtual_ip) => {
-            let _ = db.log_event(user_id, None, "allocate_fixed_host_ip", Some(&virtual_ip));
+            let _ = db.log_event(&user_id, None, "allocate_fixed_host_ip", Some(&virtual_ip));
             info!("[fixed-ip] user {} allocated {}", user_id, virtual_ip);
-            let _ = session.sender.send(ServerMessage::FixedHostIpStatus {
-                enabled: true,
-                virtual_ip: Some(virtual_ip),
-            });
+            if let Err(error) = hot_reconfigure_host_ip(&mut st, session_id, &virtual_ip, &db) {
+                if let Some(session) = st.sessions.get(session_id) {
+                    let _ = session.sender.send(ServerMessage::Error { message: error });
+                }
+                return;
+            }
+            if let Some(session) = st.sessions.get(session_id) {
+                let _ = session.sender.send(ServerMessage::FixedHostIpStatus {
+                    enabled: true,
+                    virtual_ip: Some(virtual_ip),
+                });
+            }
         }
         Err(error) => {
             error!("[fixed-ip] allocation failed for {}: {}", user_id, error);
@@ -622,46 +627,124 @@ async fn handle_request_fixed_host_ip(session_id: &str, state: &SharedState) {
 }
 
 async fn handle_release_fixed_host_ip(session_id: &str, state: &SharedState) {
-    let st = state.lock().await;
-    let Some(session) = st.sessions.get(session_id) else {
-        return;
-    };
-    if session.room_code.is_some() {
-        let _ = session.sender.send(ServerMessage::Error {
-            message: "Close the current room before changing the fixed Host IP".to_string(),
-        });
-        return;
-    }
-    let Some(user_id) = session.user_id.as_deref() else {
-        let _ = session.sender.send(ServerMessage::Error {
-            message: "Authentication is required for a fixed Host IP".to_string(),
-        });
-        return;
+    let mut st = state.lock().await;
+    let (user_id, room_code, sender) = match st.sessions.get(session_id) {
+        Some(session) => match (session.user_id.clone(), session.room_code.clone()) {
+            (Some(user_id), room_code) => (user_id, room_code, session.sender.clone()),
+            (None, _) => {
+                let _ = session.sender.send(ServerMessage::Error {
+                    message: "Authentication is required for a fixed Host IP".to_string(),
+                });
+                return;
+            }
+        },
+        None => return,
     };
     let Some(db) = database::get_database() else {
-        let _ = session.sender.send(ServerMessage::Error {
+        let _ = sender.send(ServerMessage::Error {
             message: "Fixed Host IP database is unavailable".to_string(),
         });
         return;
     };
-    match db.release_fixed_host_ip(user_id) {
+    let dynamic_ip = room_code
+        .as_ref()
+        .and_then(|code| st.rooms.get(code).map(|room| format!("{}.1", room.subnet)));
+    if let Some(dynamic_ip) = dynamic_ip.as_deref() {
+        if let Err(error) = hot_reconfigure_host_ip(&mut st, session_id, dynamic_ip, &db) {
+            if let Some(session) = st.sessions.get(session_id) {
+                let _ = session.sender.send(ServerMessage::Error { message: error });
+            }
+            return;
+        }
+    }
+    match db.release_fixed_host_ip(&user_id) {
         Ok(released) => {
             if let Some(ip) = released.as_deref() {
-                let _ = db.log_event(user_id, None, "release_fixed_host_ip", Some(ip));
+                let _ = db.log_event(&user_id, None, "release_fixed_host_ip", Some(ip));
                 info!("[fixed-ip] user {} released {}", user_id, ip);
             }
-            let _ = session.sender.send(ServerMessage::FixedHostIpStatus {
+            let _ = sender.send(ServerMessage::FixedHostIpStatus {
                 enabled: false,
                 virtual_ip: None,
             });
         }
         Err(error) => {
             error!("[fixed-ip] release failed for {}: {}", user_id, error);
-            let _ = session.sender.send(ServerMessage::Error {
+            let _ = sender.send(ServerMessage::Error {
                 message: "Failed to release the fixed Host IP".to_string(),
             });
         }
     }
+}
+
+fn hot_reconfigure_host_ip(
+    st: &mut AppState,
+    session_id: &str,
+    new_host_ip: &str,
+    db: &database::Database,
+) -> Result<(), String> {
+    let Some(room_code) = st
+        .sessions
+        .get(session_id)
+        .and_then(|session| session.room_code.clone())
+    else {
+        return Ok(());
+    };
+    if !matches!(
+        st.sessions.get(session_id).and_then(|s| s.role.as_ref()),
+        Some(Role::Host)
+    ) {
+        return Err("Only a Host can change the active room address".to_string());
+    }
+    db.assign_peer_ip(&room_code, session_id, new_host_ip, "host")
+        .map_err(|error| format!("Failed to update the active Host address: {error}"))?;
+
+    let (subnet, guests) = {
+        let room = st
+            .rooms
+            .get_mut(&room_code)
+            .ok_or_else(|| "The active room no longer exists".to_string())?;
+        room.host_virtual_ip = new_host_ip.to_string();
+        room.state = RoomState::Created;
+        room.ice_candidate_cache.clear();
+        room.ice_auth_info.clear();
+        (
+            room.subnet.clone(),
+            room.guests.iter().cloned().collect::<Vec<_>>(),
+        )
+    };
+    if let Some(host) = st.sessions.get_mut(session_id) {
+        host.virtual_ip = Some(new_host_ip.to_string());
+        let _ = host.sender.send(ServerMessage::RoomCreated {
+            room_code: room_code.clone(),
+            subnet: subnet.clone(),
+            virtual_ip: new_host_ip.to_string(),
+        });
+        for (index, guest_id) in guests.iter().enumerate() {
+            let _ = host.sender.send(ServerMessage::PeerJoined {
+                peer_session_id: guest_id.clone(),
+                guest_count: index + 1,
+            });
+        }
+    }
+    for guest_id in guests {
+        if let Some(guest) = st.sessions.get(&guest_id) {
+            if let Some(virtual_ip) = guest.virtual_ip.clone() {
+                let _ = guest.sender.send(ServerMessage::JoinOk {
+                    room_code: room_code.clone(),
+                    host_session_id: session_id.to_string(),
+                    subnet: subnet.clone(),
+                    virtual_ip,
+                    host_virtual_ip: new_host_ip.to_string(),
+                });
+            }
+        }
+    }
+    info!(
+        "[fixed-ip] room {} retained its code and switched Host address to {}",
+        room_code, new_host_ip
+    );
+    Ok(())
 }
 
 async fn allocate_relay_slot(

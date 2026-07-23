@@ -275,10 +275,10 @@ impl Database {
             [room_code],
             |row| row.get(0),
         )?;
-        // For a dynamic Host, .1 is already occupied and the unique index
-        // advances the first Guest to .2. A fixed /32 Host lives outside this
-        // subnet, so its room may also use .1 for a Guest.
-        let first = 1;
+        // Reserve .1 for the Host address even while a Host temporarily uses
+        // a fixed address. This lets the same room switch back to dynamic
+        // mode without having to renumber an existing Guest.
+        let first = 2;
         for host in first..=254u16 {
             let ip = format!("{}.{}", subnet, host);
             if conn.execute(
@@ -403,14 +403,14 @@ mod room_peer_tests {
     }
 
     #[test]
-    fn fixed_host_room_can_assign_dot_one_to_guest() {
+    fn fixed_host_room_reserves_dot_one_for_hot_switching() {
         let db = memory_db();
         db.allocate_subnet("ROOM01").unwrap();
         db.assign_peer_ip("ROOM01", "host", "172.24.0.1", "host")
             .unwrap();
         assert_eq!(
             db.allocate_peer_ip("ROOM01", "guest", "guest").unwrap(),
-            "172.16.0.1"
+            "172.16.0.2"
         );
     }
 }
@@ -432,10 +432,8 @@ mod tests {
     fn allocates_unique_addresses_for_one_hundred_guests() {
         let db = memory_db();
         assert_eq!(db.allocate_subnet("ROOM01").unwrap(), "172.16.0");
-        assert_eq!(
-            db.allocate_peer_ip("ROOM01", "host", "host").unwrap(),
-            "172.16.0.1"
-        );
+        db.assign_peer_ip("ROOM01", "host", "172.16.0.1", "host")
+            .unwrap();
         let mut addresses = HashSet::new();
         for index in 0..100 {
             let ip = db

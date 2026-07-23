@@ -52,7 +52,10 @@ pub async fn start_web_server(
         let Some(ip) = *overlay_rx.borrow() else {
             continue;
         };
-        if bind_addr.ip() == IpAddr::V4(ip) {
+        if bind_addr.ip().is_unspecified() || bind_addr.ip() == IpAddr::V4(ip) {
+            if bind_addr.ip().is_unspecified() {
+                println!("Overlay WebUI:    http://{}:{}", ip, bind_addr.port());
+            }
             continue;
         }
         let overlay_addr = SocketAddr::new(IpAddr::V4(ip), bind_addr.port());
