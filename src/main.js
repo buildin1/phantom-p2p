@@ -276,17 +276,28 @@ function updateActionButtons() {
     copyCodeBtn.disabled = !(state.isHost && !!state.roomCode);
   }
 
-  const fixedIpInput = $("fixedHostIp");
-  if (fixedIpInput) fixedIpInput.value = state.fixedHostIp || "未申请";
+  const displayedHostIp = state.fixedHostIp || (state.isHost && state.virtualIp) || "127.0.0.1";
+  setText("hostPublicIp", displayedHostIp);
+  const hostIpMode = $("hostIpMode");
+  if (hostIpMode) {
+    hostIpMode.textContent = state.fixedHostIp
+      ? "固定 IP"
+      : state.isHost && state.virtualIp
+        ? "动态 IP"
+        : "未开房间";
+    hostIpMode.classList.toggle("fixed", !!state.fixedHostIp);
+  }
   const roomActive = !!state.roomCode;
   const requestFixedIpBtn = $("requestFixedIpBtn");
   if (requestFixedIpBtn) {
-    requestFixedIpBtn.disabled = roomActive || state.fixedIpBusy || !!state.fixedHostIp;
-  }
-  const releaseFixedIpBtn = $("releaseFixedIpBtn");
-  if (releaseFixedIpBtn) {
-    releaseFixedIpBtn.disabled = roomActive || state.fixedIpBusy || !state.fixedHostIp;
-    releaseFixedIpBtn.style.display = state.fixedHostIp ? "" : "none";
+    requestFixedIpBtn.textContent = state.fixedIpBusy
+      ? "处理中..."
+      : state.fixedHostIp
+        ? "放弃固定 IP"
+        : "申请固定 IP";
+    requestFixedIpBtn.disabled = roomActive || state.fixedIpBusy;
+    requestFixedIpBtn.classList.toggle("danger", !!state.fixedHostIp);
+    requestFixedIpBtn.classList.toggle("sub", !state.fixedHostIp);
   }
 
   const copyAddrBtn = $("copyAddrBtn");
@@ -1274,6 +1285,26 @@ function bindActions() {
   });
 
   $("requestFixedIpBtn")?.addEventListener("click", async () => {
+    if (state.fixedHostIp) {
+      const accepted = await confirmInApp({
+        title: "放弃固定 IP",
+        message: `放弃后，${state.fixedHostIp} 将被释放，后续创建房间会恢复使用动态 IP。`,
+        confirmText: "确认放弃"
+      });
+      if (!accepted) return;
+      state.fixedIpBusy = true;
+      refresh();
+      try {
+        await invoke("release_fixed_host_ip");
+      } catch (err) {
+        state.fixedIpBusy = false;
+        addLog(`放弃固定 IP 失败: ${err}`, "ERROR", "host");
+        toast(`放弃固定 IP 失败: ${err}`, "error", 2200);
+        refresh();
+      }
+      return;
+    }
+
     if (!(await ensureConnected())) return;
     state.fixedIpBusy = true;
     refresh();
@@ -1283,26 +1314,6 @@ function bindActions() {
       state.fixedIpBusy = false;
       addLog(`申请固定 IP 失败: ${err}`, "ERROR", "host");
       toast(`申请固定 IP 失败: ${err}`, "error", 2200);
-      refresh();
-    }
-  });
-
-  $("releaseFixedIpBtn")?.addEventListener("click", async () => {
-    if (!state.fixedHostIp) return;
-    const accepted = await confirmInApp({
-      title: "放弃固定 IP",
-      message: `放弃后，${state.fixedHostIp} 将被释放，后续创建房间会恢复使用动态 IP。`,
-      confirmText: "确认放弃"
-    });
-    if (!accepted) return;
-    state.fixedIpBusy = true;
-    refresh();
-    try {
-      await invoke("release_fixed_host_ip");
-    } catch (err) {
-      state.fixedIpBusy = false;
-      addLog(`放弃固定 IP 失败: ${err}`, "ERROR", "host");
-      toast(`放弃固定 IP 失败: ${err}`, "error", 2200);
       refresh();
     }
   });

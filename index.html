@@ -582,6 +582,7 @@
 
     #hostMainBtn,
     #copyCodeBtn,
+    #requestFixedIpBtn,
     #joinMainBtn,
     #copyAddrBtn {
       position: relative;
@@ -717,11 +718,47 @@
       box-shadow: 0 10px 20px rgba(239, 109, 128, 0.24);
     }
 
-    .fixed-ip-row {
-      display: grid;
-      grid-template-columns: minmax(220px, 1fr) auto;
-      gap: 10px;
-      align-items: end;
+    .public-ip-status {
+      min-height: 68px;
+      padding: 12px 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      border: 1px solid var(--line);
+      border-radius: var(--r-md);
+      background: rgba(255, 255, 255, 0.025);
+    }
+
+    .public-ip-status .k {
+      color: var(--text-soft);
+      font-size: 12px;
+      font-weight: 700;
+      margin-bottom: 4px;
+    }
+
+    .public-ip-value {
+      color: var(--text);
+      font-size: 20px;
+      font-weight: 850;
+      line-height: 1.15;
+    }
+
+    .ip-mode-tag {
+      flex: 0 0 auto;
+      padding: 5px 9px;
+      border: 1px solid var(--line-strong);
+      border-radius: 999px;
+      color: var(--text-soft);
+      background: rgba(255, 255, 255, 0.035);
+      font-size: 11px;
+      font-weight: 800;
+    }
+
+    .ip-mode-tag.fixed {
+      color: var(--success);
+      border-color: rgba(56, 211, 159, 0.36);
+      background: rgba(56, 211, 159, 0.09);
     }
 
     .host-command-actions {
@@ -733,6 +770,16 @@
       height: 38px;
       padding: 0 14px;
       white-space: nowrap;
+    }
+
+    .host-main-actions {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 124px));
+      justify-content: start;
+    }
+
+    .host-main-actions .btn {
+      width: 100%;
     }
 
     .modal-layer {
@@ -1451,13 +1498,12 @@
         grid-template-columns: 1fr;
       }
 
-      .fixed-ip-row {
-        grid-template-columns: 1fr;
+      .public-ip-status {
+        min-height: 64px;
       }
 
       .host-command-actions {
-        display: grid;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
+        grid-template-columns: 1fr;
       }
 
       .host-command-actions .btn {
@@ -1609,20 +1655,18 @@
               </div>
             </div>
 
-            <div class="fixed-ip-row" id="fixedHostIpControls">
-              <div class="field">
-                <label for="fixedHostIp">固定公网 IP</label>
-                <input class="input mono" id="fixedHostIp" value="未申请" readonly />
+            <div class="public-ip-status" id="fixedHostIpControls">
+              <div>
+                <div class="k">本机公网 IP</div>
+                <div class="public-ip-value mono" id="hostPublicIp">127.0.0.1</div>
               </div>
-              <div class="actions host-command-actions">
-                <button class="btn sub" id="requestFixedIpBtn">申请固定 IP</button>
-                <button class="btn danger" id="releaseFixedIpBtn">放弃固定 IP</button>
-              </div>
+              <span class="ip-mode-tag" id="hostIpMode">未开房间</span>
             </div>
 
-            <div class="actions host-command-actions">
+            <div class="actions host-command-actions host-main-actions">
               <button class="btn pri" id="hostMainBtn">创建房间</button>
               <button class="btn sub" id="copyCodeBtn">复制配对码</button>
+              <button class="btn sub" id="requestFixedIpBtn">申请固定 IP</button>
             </div>
 
             <div class="code-box">
