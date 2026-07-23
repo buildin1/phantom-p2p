@@ -23,6 +23,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import com.buildin1.phantom_p2p.data.NativePacketBridge
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -59,12 +60,25 @@ class PhantomVpnService : VpnService() {
     /** true = 本设备是 guest，TUN 地址 10.219.0.2；false = host，TUN 地址 10.219.0.1 */
     @Volatile
     private var isGuestRole: Boolean = false
+    @Volatile private var overlayLocalIp: String = "10.219.0.1"
+    @Volatile private var overlayPeerIp: String = "10.219.0.2"
+    @Volatile private var overlaySubnet: String = "10.219.0.0/24"
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.i(TAG, "onStartCommand action=${intent?.action ?: "null"} startId=$startId")
         runCatching {
             when (intent?.action) {
                 ACTION_STOP -> stopVpn(removeService = true)
+                ACTION_CONFIGURE_OVERLAY -> {
+                    val local = intent.getStringExtra(EXTRA_OVERLAY_LOCAL).orEmpty()
+                    val subnet = intent.getStringExtra(EXTRA_OVERLAY_SUBNET).orEmpty()
+                    val peer = intent.getStringExtra(EXTRA_OVERLAY_PEER).orEmpty()
+                    val guest = intent.getBooleanExtra(EXTRA_IS_GUEST, false)
+                    if (local.isNotBlank() && subnet.isNotBlank() && peer.isNotBlank()) {
+                        startForegroundNotification()
+                        configureOverlay(local, subnet, peer, guest)
+                    }
+                }
                 ACTION_ATTACH_P2P -> {
                     val isGuest = intent.getBooleanExtra(EXTRA_IS_GUEST, false)
                     val host = intent.getStringExtra(EXTRA_HOST).orEmpty()
@@ -202,7 +216,7 @@ class PhantomVpnService : VpnService() {
         if (remoteAddress == null) return  // 无有效端点
 
         if (activeTransport == TRANSPORT_TCP) {
-            startTcpDataPlane(vpn)
+            startPacketDataPlane(vpn)
             return
         }
 
@@ -360,6 +374,51 @@ class PhantomVpnService : VpnService() {
         }
     }
 
+    private fun startPacketDataPlane(vpn: ParcelFileDescriptor) {
+        if (uplinkJob?.isActive == true) return
+        uplinkJob = ioScope.launch {
+            var tunIn: java.io.FileInputStream? = null
+            var tunOut: FileOutputStream? = null
+            var bridge: NativePacketBridge? = null
+            try {
+                tunIn = java.io.FileInputStream(vpn.fileDescriptor)
+                tunOut = FileOutputStream(vpn.fileDescriptor)
+                bridge = NativePacketBridge.create(
+                    this@PhantomVpnService,
+                    activeMode,
+                    activeEndpoint,
+                    activeRelayToken,
+                    p2pLocalPort,
+                    isGuestRole,
+                    onPacket = { packet ->
+                        runCatching {
+                            synchronized(this@PhantomVpnService) {
+                                tunOut?.write(packet)
+                                tunOut?.flush()
+                            }
+                            rxBytes.addAndGet(packet.size.toLong())
+                        }.onFailure { Log.w(TAG, "写回 VPN TUN 失败: ${it.message}") }
+                    },
+                    onLog = { Log.w(TAG, it) }
+                ) ?: error("native packet bridge unavailable")
+                p2pLocalPort = 0
+                val buffer = ByteArray(TUN_BUFFER_SIZE)
+                while (isActive) {
+                    val read = tunIn.read(buffer)
+                    if (read < 20) continue
+                    bridge.writePacket(buffer.copyOf(read))
+                    txBytes.addAndGet(read.toLong())
+                }
+            } catch (error: Exception) {
+                if (isActive) Log.e(TAG, "IPv4 packet data plane stopped: ${error.message}", error)
+            } finally {
+                bridge?.close()
+                runCatching { tunIn?.close() }
+                runCatching { tunOut?.close() }
+            }
+        }
+    }
+
     /**
      * 根据角色建立 VPN TUN 接口。
      *   Guest: tun=10.219.0.2/32, route=10.219.0.1/32  （游戏流量 → host）
@@ -369,8 +428,8 @@ class PhantomVpnService : VpnService() {
      */
     private fun establishTunForRole(isGuest: Boolean) {
         isGuestRole = isGuest
-        val localIp = if (isGuest) "10.219.0.2" else "10.219.0.1"
-        val peerIp  = if (isGuest) "10.219.0.1" else "10.219.0.2"
+        val localIp = overlayLocalIp
+        val peerIp = overlayPeerIp
 
         stopDataPlaneLoops()       // 停止 I/O 协程并关闭旧 socket
         vpnInterface?.close()      // 关闭旧 TUN fd
@@ -381,7 +440,10 @@ class PhantomVpnService : VpnService() {
                 .setSession(getString(R.string.app_name))
                 .setMtu(1500)
                 .addAddress(localIp, 32)
-                .addRoute(peerIp, 32)
+                .addRoute(
+                    if (isGuest) peerIp else overlaySubnet.substringBefore('/').substringBeforeLast('.') + ".0",
+                    if (isGuest) 32 else 24
+                )
                 .establish()
         }.onFailure { error ->
             Log.e(TAG, "VPN TUN 建立失败 local=$localIp peer=$peerIp: ${error.message}", error)
@@ -394,6 +456,14 @@ class PhantomVpnService : VpnService() {
             persistRunningState(true)
             refreshNotification()
         }
+    }
+
+    private fun configureOverlay(localIp: String, subnet: String, peerIp: String, isGuest: Boolean) {
+        overlayLocalIp = localIp
+        overlayPeerIp = peerIp
+        val prefix = subnet.substringBefore('/').substringBeforeLast('.')
+        overlaySubnet = "$prefix.0/24"
+        establishTunForRole(isGuest)
     }
 
     private fun parseEndpoint(endpoint: String): InetSocketAddress? {
@@ -518,6 +588,7 @@ class PhantomVpnService : VpnService() {
         private const val ACTION_STOP = "com.buildin1.phantom_p2p.action.STOP_VPN"
         private const val ACTION_ATTACH_P2P = "com.buildin1.phantom_p2p.action.ATTACH_P2P"
         private const val ACTION_ATTACH_RELAY = "com.buildin1.phantom_p2p.action.ATTACH_RELAY"
+        private const val ACTION_CONFIGURE_OVERLAY = "com.buildin1.phantom_p2p.action.CONFIGURE_OVERLAY"
         private const val ACTION_CLEAR_BINDING = "com.buildin1.phantom_p2p.action.CLEAR_BINDING"
         private const val PREFS_NAME = "phantom_runtime"
         private const val KEY_VPN_RUNNING = "vpn_running"
@@ -533,6 +604,9 @@ class PhantomVpnService : VpnService() {
         private const val EXTRA_RELAY_TOKEN = "extra_relay_token"
         private const val EXTRA_IS_GUEST = "extra_is_guest"      // true=guest(10.219.0.2) false=host(10.219.0.1)
         private const val EXTRA_TRANSPORT = "extra_transport"
+        private const val EXTRA_OVERLAY_LOCAL = "extra_overlay_local"
+        private const val EXTRA_OVERLAY_SUBNET = "extra_overlay_subnet"
+        private const val EXTRA_OVERLAY_PEER = "extra_overlay_peer"
         private const val NOTIFICATION_CHANNEL_ID = "phantom_vpn"
         private const val NOTIFICATION_ID = 2201
         private const val TUN_BUFFER_SIZE = 64 * 1024
@@ -584,6 +658,18 @@ class PhantomVpnService : VpnService() {
             } else {
                 context.startService(intent)
             }
+        }
+
+        fun configureOverlay(context: Context, localIp: String, subnet: String, peerIp: String, isGuest: Boolean) {
+            val intent = Intent(context, PhantomVpnService::class.java).apply {
+                action = ACTION_CONFIGURE_OVERLAY
+                putExtra(EXTRA_OVERLAY_LOCAL, localIp)
+                putExtra(EXTRA_OVERLAY_SUBNET, subnet)
+                putExtra(EXTRA_OVERLAY_PEER, peerIp)
+                putExtra(EXTRA_IS_GUEST, isGuest)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent)
+            else context.startService(intent)
         }
 
         fun attachRelay(context: Context, relayAddr: String, relayToken: String = "", isGuest: Boolean = false, transport: String = TRANSPORT_TCP) {

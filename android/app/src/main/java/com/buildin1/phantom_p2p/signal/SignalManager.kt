@@ -40,8 +40,8 @@ class SignalManager(
         fun onConnected(sessionId: String)
         fun onAuthenticated(userId: String)
         fun onAuthFailed(reason: String)
-        fun onRoomCreated(roomCode: String, transport: RoomTransport)
-        fun onJoinOk(roomCode: String, guestLocalPort: Int, hostGamePort: Int, transport: RoomTransport)
+        fun onRoomCreated(roomCode: String, subnet: String, virtualIp: String)
+        fun onJoinOk(roomCode: String, hostSessionId: String, subnet: String, virtualIp: String, hostVirtualIp: String)
         fun onJoinFailed(reason: String)
         fun onPeerJoined(peerSessionId: String, guestCount: Int)
         fun onPeerLeft(peerSessionId: String, guestCount: Int)
@@ -52,8 +52,7 @@ class SignalManager(
         fun onError(message: String)
         fun onDisconnected(code: Int, reason: String)
         fun onLog(message: String)
-        fun onAdvancedRoomCreated(roomCode: String, transport: RoomTransport, mainPort: Int, allPorts: List<Int>)
-        fun onAdvancedJoinOk(roomCode: String, hostSessionId: String, transport: RoomTransport, portMappings: List<AdvancedPortMapping>)
+        fun onFixedHostIpStatus(enabled: Boolean, virtualIp: String?)
     }
 
     private val mapper: ObjectMapper = MessagePackMapper()
@@ -101,9 +100,8 @@ class SignalManager(
         ws?.send(ByteString.of(*bytes))
     }
 
-    fun createRoom(gamePort: Int, transport: RoomTransport) {
-        send(ClientMessage.CreateRoom(gamePort, transport))
-    }
+    fun createRoom() = send(ClientMessage.CreateRoom)
+    fun hostReady() = send(ClientMessage.HostReady)
 
     fun joinRoom(roomCode: String) {
         send(ClientMessage.JoinRoom(roomCode))
@@ -117,20 +115,12 @@ class SignalManager(
         send(ClientMessage.LeaveRoom)
     }
 
-    fun createAdvancedRoom(ports: List<Int>, mainPort: Int, transport: RoomTransport) {
-        send(ClientMessage.CreateAdvancedRoom(ports, mainPort, transport))
-    }
-
-    fun joinAdvancedRoom(roomCode: String) {
-        send(ClientMessage.JoinAdvancedRoom(roomCode))
-    }
+    fun requestFixedHostIp() = send(ClientMessage.RequestFixedHostIp)
+    fun releaseFixedHostIp() = send(ClientMessage.ReleaseFixedHostIp)
+    fun getFixedHostIp() = send(ClientMessage.GetFixedHostIp)
 
     fun sendIceCandidates(candidates: List<IceCandidate>, ufrag: String, pwd: String, natType: String) {
         send(ClientMessage.IceCandidates(candidates, ufrag, pwd, natType))
-    }
-
-    fun sendIceCandidatesTagged(candidates: List<IceCandidate>, ufrag: String, pwd: String, natType: String, portTag: Int) {
-        send(ClientMessage.IceCandidatesTagged(candidates, ufrag, pwd, natType, portTag))
     }
 
     fun requestRelay() {
@@ -271,13 +261,13 @@ class SignalManager(
             }
 
             is ServerMessage.RoomCreated -> {
-                listener.onRoomCreated(msg.roomCode, msg.roomTransport)
+                listener.onRoomCreated(msg.roomCode, msg.subnet, msg.virtualIp)
                 listener.onLog("房间已创建，房间码 ${msg.roomCode}")
             }
 
             is ServerMessage.JoinOk -> {
-                listener.onJoinOk(msg.roomCode, msg.guestLocalPort, msg.hostGamePort, msg.roomTransport)
-                listener.onLog("加入房间成功，本地端口 ${msg.guestLocalPort}")
+                listener.onJoinOk(msg.roomCode, msg.hostSessionId, msg.subnet, msg.virtualIp, msg.hostVirtualIp)
+                listener.onLog("加入房间成功，虚拟地址 ${msg.virtualIp}")
             }
 
             is ServerMessage.JoinFailed -> {
@@ -305,9 +295,13 @@ class SignalManager(
                 listener.onLog("收到 PeerCandidates，开始连通性检测")
             }
 
+            is ServerMessage.FixedHostIpStatus -> {
+                listener.onFixedHostIpStatus(msg.enabled, msg.virtualIp)
+            }
+
             is ServerMessage.RelayPreAllocated -> {
                 listener.onRelayPreAllocated(msg)
-                listener.onLog("中继已预分配 ${msg.relayAddr}:${msg.relayUdpPort}")
+                listener.onLog("QUIC 通道已预分配 ${msg.relayAddr}:${msg.relayQuicPort}")
             }
 
             is ServerMessage.RelayReady -> {
@@ -322,15 +316,6 @@ class SignalManager(
 
             is ServerMessage.Pong -> { /* 心跳，忽略 */ }
 
-            is ServerMessage.AdvancedRoomCreated -> {
-                listener.onAdvancedRoomCreated(msg.roomCode, msg.roomTransport, msg.mainPort, msg.allPorts)
-                listener.onLog("高级房间已创建: ${msg.roomCode} (共 ${msg.allPorts.size} 个端口)")
-            }
-
-            is ServerMessage.AdvancedJoinOk -> {
-                listener.onAdvancedJoinOk(msg.roomCode, msg.hostSessionId, msg.roomTransport, msg.portMappings)
-                listener.onLog("高级房间加入成功: ${msg.roomCode}, 授权端口数 ${msg.portMappings.size}")
-            }
         }
     }
 }

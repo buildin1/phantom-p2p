@@ -7,10 +7,8 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.viewModelScope
-import com.buildin1.phantom_p2p.signal.AdvancedPortMapping
 import com.buildin1.phantom_p2p.signal.IceEngine
 import com.buildin1.phantom_p2p.signal.IdentityManager
-import com.buildin1.phantom_p2p.signal.RoomTransport
 import com.buildin1.phantom_p2p.signal.ServerMessage
 import com.buildin1.phantom_p2p.signal.SignalManager
 import com.buildin1.phantom_p2p.signal.StunClient
@@ -34,9 +32,9 @@ data class StunMapping(val server: String, val mapping: String, val rttMs: Long)
 
 data class AppSettings(
     val signal: String = USER_MODE_LOCKED_SIGNAL,
-    val gamePort: Int = 25565,
-    val guestPort: Int = 25642,
-    val preferUdp: Boolean = false,
+    @Deprecated("Transparent TUN mode does not use a game port") val gamePort: Int = 25565,
+    @Deprecated("Transparent TUN mode does not use a guest port") val guestPort: Int = 25642,
+    @Deprecated("Transparent TUN mode chooses QUIC internally") val preferUdp: Boolean = false,
     val relayFallback: Boolean = true,
     val forceRelay: Boolean = false,
     val autoRelay: Boolean = true,
@@ -56,18 +54,14 @@ data class AppState(
     val hostActive: Boolean = false,
     val guestActive: Boolean = false,
     val isJoining: Boolean = false,  // 正在加入房间（单击连接到 guestActive/失败之间）
-    val roomTransport: RoomTransport = RoomTransport.UDP,
-    // Advanced / multi-port
-    val isAdvancedMode: Boolean = false,
-    val useMultiPort: Boolean = false,
-    val advancedPorts: List<Int> = emptyList(),
-    val advancedMainPort: Int = 0,
-    val portTunnelStatus: Map<Int, PortStatus> = emptyMap(),
+    val subnet: String = "",
+    val virtualIp: String = "",
+    val hostVirtualIp: String = "",
+    val fixedHostIp: String? = null,
+    val fixedIpBusy: Boolean = false,
     // Guest connection
     val peerSessionId: String? = null,
-    val hostGamePort: Int = 0,
-    val guestLocalPort: Int = 0,
-    val guestAddr: String = "127.0.0.1:----",
+    val guestAddr: String = "--",
     val connectionMode: String = "---",
     val latencyMs: Int = 0,
     val uploadBps: Long = 0,
@@ -109,7 +103,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
     private var signalManager: SignalManager? = null
     private val iceEngine = IceEngine()
     private var iceSession: IceEngine.LocalIceSession? = null
-    private var advancedMappings: List<AdvancedPortMapping> = emptyList()
     private var relayPreAllocated: ServerMessage.RelayPreAllocated? = null
     private var relayFallbackJob: Job? = null
     private var statsJob: Job? = null
@@ -129,20 +122,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
     fun clearNavigateToTab() { _navigateToTab.value = null }
 
     private sealed class PendingAction {
-        data class CreateRoom(val gamePort: Int, val transport: RoomTransport) : PendingAction()
-        data class CreateAdvancedRoom(val ports: List<Int>, val mainPort: Int, val transport: RoomTransport) : PendingAction()
+        object CreateRoom : PendingAction()
         data class JoinRoom(val roomCode: String) : PendingAction()
     }
-
-    var portTablePage: Int = 0
 
     // ── Settings ──
 
     private fun loadSettingsFromPrefs() = AppSettings(
         signal = prefs.getString("signal", USER_MODE_LOCKED_SIGNAL) ?: USER_MODE_LOCKED_SIGNAL,
-        gamePort = prefs.getInt("game_port", 25565),
-        guestPort = prefs.getInt("guest_port", 25642),
-        preferUdp = prefs.getBoolean("prefer_udp", false),
         relayFallback = prefs.getBoolean("relay_fallback", true),
         forceRelay = prefs.getBoolean("force_relay", false),
         autoRelay = prefs.getBoolean("auto_relay", true),
@@ -154,9 +141,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
     fun saveSettings(s: AppSettings) {
         prefs.edit()
             .putString("signal", s.signal)
-            .putInt("game_port", s.gamePort)
-            .putInt("guest_port", s.guestPort)
-            .putBoolean("prefer_udp", s.preferUdp)
             .putBoolean("relay_fallback", s.relayFallback)
             .putBoolean("force_relay", s.forceRelay)
             .putBoolean("auto_relay", s.autoRelay)
@@ -195,15 +179,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
         cancelRelayFallback()
         stopStatsSampling(reset = true)
         relayPreAllocated = null
-        advancedMappings = emptyList()
         clearIceSession()
         updateState {
             it.copy(
                 connectionState = ConnectionState.DISCONNECTED,
                 sessionId = null, roomCode = null,
                 hostActive = false, guestActive = false,
-                isAdvancedMode = false, advancedPorts = emptyList(),
-                portTunnelStatus = emptyMap(),
+                subnet = "", virtualIp = "", hostVirtualIp = "",
                 uploadBps = 0,
                 downloadBps = 0,
                 uptimeSeconds = 0
@@ -213,36 +195,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
 
     // ── Room ──
 
-    fun createRoom(gamePort: Int = -1, transport: RoomTransport? = null) {
-        val port = if (gamePort > 0) gamePort else (_settings.value?.gamePort ?: 25565)
-        val tx = transport ?: defaultRoomTransport()
+    fun createRoom() {
         checkVpnThenRun {
             if (!isSignalAuthenticated()) {
-                pendingAction = PendingAction.CreateRoom(port, tx)
+                pendingAction = PendingAction.CreateRoom
                 ensureConnected()
-                addLog("等待鉴权完成后创建房间（端口 $port, $tx）", "INFO", "host")
+                addLog("等待鉴权完成后创建房间", "INFO", "host")
                 return@checkVpnThenRun
             }
-            signalManager?.createRoom(port, tx)
-            addLog("正在创建房间（端口 $port, $tx）", "INFO", "host")
-        }
-    }
-
-    private fun defaultRoomTransport(): RoomTransport {
-        if (BuildConfig.FLAVOR != "dev") return RoomTransport.TCP
-        return if (_settings.value?.preferUdp == true) RoomTransport.UDP else RoomTransport.TCP
-    }
-
-    fun createAdvancedRoom(ports: List<Int>, mainPort: Int, transport: RoomTransport) {
-        checkVpnThenRun {
-            if (!isSignalAuthenticated()) {
-                pendingAction = PendingAction.CreateAdvancedRoom(ports, mainPort, transport)
-                ensureConnected()
-                addLog("等待鉴权完成后创建高级房间（主端口 $mainPort）", "INFO", "host")
-                return@checkVpnThenRun
-            }
-            signalManager?.createAdvancedRoom(ports, mainPort, transport)
-            addLog("正在创建高级房间（主端口 $mainPort, 共 ${ports.size} 个端口）", "INFO", "host")
+            signalManager?.createRoom()
+            addLog("正在创建房间", "INFO", "host")
         }
     }
 
@@ -256,13 +218,22 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
                 addLog("等待鉴权完成后加入房间 $code", "INFO", "guest")
                 return@checkVpnThenRun
             }
-            if (code.endsWith("-A")) {
-                signalManager?.joinAdvancedRoom(code)
-                updateState { it.copy(isAdvancedMode = true) }
-            } else {
-                signalManager?.joinRoom(code)
-            }
+            signalManager?.joinRoom(code)
             addLog("正在加入房间 $code", "INFO", "guest")
+        }
+    }
+
+    fun toggleFixedHostIp() {
+        if (_state.value?.roomCode != null || _state.value?.fixedIpBusy == true) return
+        if (!isSignalAuthenticated()) {
+            ensureConnected()
+            return
+        }
+        updateState { it.copy(fixedIpBusy = true) }
+        if (_state.value?.fixedHostIp == null) {
+            signalManager?.requestFixedHostIp()
+        } else {
+            signalManager?.releaseFixedHostIp()
         }
     }
 
@@ -304,14 +275,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
         cancelRelayFallback()
         stopStatsSampling(reset = true)
         relayPreAllocated = null
-        advancedMappings = emptyList()
         updateState {
             it.copy(
                 roomCode = null, isHost = false, hostActive = false,
-                isAdvancedMode = false, advancedPorts = emptyList(),
-                advancedMainPort = 0, portTunnelStatus = emptyMap(),
-                guestAddr = "127.0.0.1:----", connectionMode = "---",
-                latencyMs = 0, guestLocalPort = 0, hostGamePort = 0,
+                guestAddr = "--", connectionMode = "---",
+                subnet = "", virtualIp = "", hostVirtualIp = "",
+                latencyMs = 0,
                 uploadBps = 0, downloadBps = 0, uptimeSeconds = 0
             )
         }
@@ -325,38 +294,17 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
         cancelRelayFallback()
         stopStatsSampling(reset = true)
         relayPreAllocated = null
-        advancedMappings = emptyList()
         updateState {
             it.copy(
                 roomCode = null, isHost = false, guestActive = false,
-                isAdvancedMode = false, advancedPorts = emptyList(),
-                portTunnelStatus = emptyMap(), guestAddr = "127.0.0.1:----",
-                connectionMode = "---", latencyMs = 0, guestLocalPort = 0, hostGamePort = 0,
+                guestAddr = "--", connectionMode = "---", latencyMs = 0,
+                subnet = "", virtualIp = "", hostVirtualIp = "",
                 uploadBps = 0, downloadBps = 0, uptimeSeconds = 0
             )
         }
         stopVpnService()
         clearIceSession()
         addLog("已离开房间", "WARN", "guest")
-    }
-
-    // ── Advanced mode ──
-
-    fun setMultiPort(enabled: Boolean) {
-        updateState { it.copy(useMultiPort = enabled) }
-        if (!enabled) updateState { it.copy(advancedPorts = emptyList(), advancedMainPort = 0) }
-    }
-
-    fun parseAndSetPorts(spec: String): Int {
-        val ports = parsePortSpec(spec)
-        if (ports.isNotEmpty()) updateState { it.copy(advancedPorts = ports, advancedMainPort = ports[0]) }
-        return ports.size
-    }
-
-    fun updatePortStatus(port: Int, status: PortStatus) {
-        val map = (_state.value?.portTunnelStatus ?: emptyMap()).toMutableMap()
-        map[port] = status
-        updateState { it.copy(portTunnelStatus = map.toMap()) }
     }
 
     // ── NAT Diagnosis ──
@@ -401,6 +349,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
 
     override fun onAuthenticated(userId: String) {
         updateState { it.copy(connectionState = ConnectionState.AUTHENTICATED, userId = userId) }
+        signalManager?.getFixedHostIp()
         addLog("认证成功", "INFO", "system")
         runPendingActionIfAny()
     }
@@ -411,22 +360,39 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
         addLog("认证失败: $reason", "ERROR", "system")
     }
 
-    override fun onRoomCreated(roomCode: String, transport: RoomTransport) {
-        updateState { it.copy(roomCode = roomCode, isHost = true, hostActive = true, guestActive = false, roomTransport = transport) }
+    override fun onRoomCreated(roomCode: String, subnet: String, virtualIp: String) {
+        updateState {
+            it.copy(
+                roomCode = roomCode,
+                isHost = true,
+                hostActive = true,
+                guestActive = false,
+                subnet = subnet,
+                virtualIp = virtualIp,
+                hostVirtualIp = virtualIp,
+                guestAddr = virtualIp
+            )
+        }
+        configureVpnOverlay(virtualIp, subnet, virtualIp, isGuest = false)
+        signalManager?.hostReady()
         addLog("房间已创建: $roomCode", "INFO", "host")
     }
 
-    override fun onJoinOk(roomCode: String, guestLocalPort: Int, hostGamePort: Int, transport: RoomTransport) {
-        advancedMappings = emptyList()
+    override fun onJoinOk(roomCode: String, hostSessionId: String, subnet: String, virtualIp: String, hostVirtualIp: String) {
         updateState {
             it.copy(
-                roomCode = roomCode, isHost = false, roomTransport = transport,
-                hostGamePort = hostGamePort,
-                guestLocalPort = guestLocalPort, guestAddr = "10.219.0.1:$hostGamePort",
-                connectionMode = "连接中"  // isJoining 保持 true，等到 P2P/中继真正建立时才清除
+                roomCode = roomCode,
+                isHost = false,
+                peerSessionId = hostSessionId,
+                subnet = subnet,
+                virtualIp = virtualIp,
+                hostVirtualIp = hostVirtualIp,
+                guestAddr = hostVirtualIp,
+                connectionMode = "连接中"
             )
         }
-        addLog("加入成功, 本地端口 $guestLocalPort", "INFO", "guest")
+        configureVpnOverlay(virtualIp, subnet, hostVirtualIp, isGuest = true)
+        addLog("加入成功，Host 虚拟地址 $hostVirtualIp", "INFO", "guest")
         startIceNegotiation(reuseExisting = false)
     }
 
@@ -438,12 +404,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
     override fun onPeerJoined(peerSessionId: String, guestCount: Int) {
         updateState { it.copy(peerSessionId = peerSessionId) }
         addLog("玩家加入 (共 $guestCount 人)", "INFO", "host")
-        if (_state.value?.isAdvancedMode == true) {
-            val ports = _state.value?.advancedPorts.orEmpty().ifEmpty {
-                listOfNotNull(_state.value?.advancedMainPort?.takeIf { it > 0 })
-            }
-            ports.forEach { updatePortStatus(it, PortStatus.PENDING) }
-        }
         startIceNegotiation(reuseExisting = true)
     }
 
@@ -455,8 +415,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
         cancelRelayFallback()
         stopStatsSampling(reset = true)
         relayPreAllocated = null
-        advancedMappings = emptyList()
-        updateState { it.copy(roomCode = null, isHost = false, hostActive = false, guestActive = false, connectionMode = "---") }
+        updateState {
+            it.copy(
+                roomCode = null, isHost = false, hostActive = false, guestActive = false,
+                connectionMode = "---", subnet = "", virtualIp = "", hostVirtualIp = "",
+                guestAddr = "--"
+            )
+        }
         stopVpnService()
         clearIceSession()
         addLog("房间已关闭", "WARN", "system")
@@ -479,19 +444,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
             val result = iceEngine.runConnectivityChecks(session.socket, msg.candidates, msg.startAtMs)
             if (result.success) {
                 updateState {
-                    val modeText = if (msg.roomTransport == RoomTransport.UDP) "P2P-UDP" else "P2P-TCP"
                     it.copy(
                         guestActive = !it.isHost || it.guestActive,
                         isJoining = false,
-                        connectionMode = modeText,
+                        connectionMode = "P2P 直连 (UDP)",
                         latencyMs = result.latencyMs,
                         peerSessionId = msg.peerSessionId
                     )
                 }
                 if (!_state.value!!.isHost) _navigateToTab.postValue(R.id.nav_connect)
-                if (msg.portTag > 0) {
-                    markPortReadyByTag(msg.portTag)
-                }
                 addLog("ICE 打洞成功: ${result.peerAddress} RTT=${result.latencyMs}ms", "INFO", "ice")
                 maybeAttachVpnP2P(result.peerAddress)
                 startStatsSampling()
@@ -516,9 +477,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
     override fun onRelayReady(msg: ServerMessage.RelayReady) {
         cancelRelayFallback()
         clearIceSession()  // P2P 已放弃，释放 ICE socket
-        updateState { it.copy(connectionMode = "中继", guestActive = true, isJoining = false) }
-        addLog("中继已就绪: ${msg.relayAddr}:${msg.relayUdpPort}", "INFO", "system")
-        maybeAttachVpnRelay(msg.relayAddr, msg.relayQuicPort, msg.relayUdpPort, msg.token)
+        updateState { it.copy(connectionMode = "P2P 直连 (QUIC)", guestActive = true, isJoining = false) }
+        addLog("QUIC 通道已就绪: ${msg.relayAddr}:${msg.relayQuicPort}", "INFO", "system")
+        maybeAttachVpnRelay(msg.relayAddr, msg.relayQuicPort, msg.token)
         startStatsSampling()
         _navigateToTab.postValue(R.id.nav_connect)
     }
@@ -532,7 +493,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
         cancelRelayFallback()
         stopStatsSampling(reset = true)
         relayPreAllocated = null
-        advancedMappings = emptyList()
         updateState { it.copy(connectionState = ConnectionState.DISCONNECTED, hostActive = false, guestActive = false) }
         stopVpnService()
         clearIceSession()
@@ -544,33 +504,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
         addLog(message, "INFO", "signal")
     }
 
-    override fun onAdvancedRoomCreated(roomCode: String, transport: RoomTransport, mainPort: Int, allPorts: List<Int>) {
-        advancedMappings = emptyList()
-        val initialStatus = allPorts.associateWith { PortStatus.PENDING }
-        updateState {
-            it.copy(
-                roomCode = roomCode, isHost = true, hostActive = true, guestActive = false,
-                isAdvancedMode = true, roomTransport = transport,
-                advancedMainPort = mainPort, advancedPorts = allPorts,
-                portTunnelStatus = initialStatus
-            )
-        }
-        addLog("高级房间已创建: $roomCode (${allPorts.size}端口)", "INFO", "host")
-    }
-
-    override fun onAdvancedJoinOk(roomCode: String, hostSessionId: String, transport: RoomTransport, portMappings: List<AdvancedPortMapping>) {
-        advancedMappings = portMappings
-        val initialStatus = portMappings.associate { it.hostPort to PortStatus.PENDING }
-        updateState {
-            it.copy(
-                roomCode = roomCode, isHost = false, guestActive = true, isJoining = false,
-                isAdvancedMode = true, roomTransport = transport,
-                portTunnelStatus = initialStatus, peerSessionId = hostSessionId,
-                connectionMode = "建立中"
-            )
-        }
-        addLog("高级房间加入成功: $roomCode, ${portMappings.size}个端口", "INFO", "guest")
-        startIceNegotiation(reuseExisting = false)
+    override fun onFixedHostIpStatus(enabled: Boolean, virtualIp: String?) {
+        updateState { it.copy(fixedHostIp = virtualIp.takeIf { enabled }, fixedIpBusy = false) }
+        addLog(if (enabled) "固定 IP 已启用: $virtualIp" else "当前使用动态 IP", "INFO", "host")
     }
 
     private fun startIceNegotiation(reuseExisting: Boolean) {
@@ -578,37 +514,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
             val session = ensureIceSession(reuseExisting) ?: return@launch
             updateState { it.copy(connectionMode = "等待对端 ICE…") }
 
-            val current = _state.value
-            val isAdvanced = current?.isAdvancedMode == true
-            val tags = if (isAdvanced) {
-                if (current?.isHost == true) {
-                    current.advancedPorts.ifEmpty {
-                        listOfNotNull(current.advancedMainPort.takeIf { it > 0 })
-                    }
-                } else {
-                    advancedMappings.map { it.hostPort }.distinct().ifEmpty {
-                        listOfNotNull(current?.advancedMainPort?.takeIf { it > 0 })
-                    }
-                }
-            } else {
-                emptyList()
-            }
-
-            if (tags.isEmpty()) {
-                signalManager?.sendIceCandidates(session.candidates, session.ufrag, session.pwd, session.natType)
-                addLog("已上报 ${session.candidates.size} 个 ICE 候选，等待对端…", "INFO", "ice")
-            } else {
-                tags.forEach { tag ->
-                    signalManager?.sendIceCandidatesTagged(
-                        session.candidates,
-                        session.ufrag,
-                        session.pwd,
-                        session.natType,
-                        tag
-                    )
-                }
-                addLog("已上报 tagged ICE 候选: ${tags.size} 组", "INFO", "ice")
-            }
+            signalManager?.sendIceCandidates(session.candidates, session.ufrag, session.pwd, session.natType)
+            addLog("已上报 ${session.candidates.size} 个 ICE 候选，等待对端…", "INFO", "ice")
 
             scheduleRelayFallback("未收到 PeerCandidates")
         }
@@ -653,16 +560,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
 
         val host = peer.address?.hostAddress ?: peer.hostString
         val isGuest = !(_state.value?.isHost ?: true)
-        val transport = if (_state.value?.roomTransport == RoomTransport.UDP) {
-            PhantomVpnService.TRANSPORT_UDP
-        } else {
-            PhantomVpnService.TRANSPORT_TCP
-        }
-        PhantomVpnService.attachP2P(app, host, peer.port, iceLocalPort, isGuest = isGuest, transport = transport)
+        PhantomVpnService.attachP2P(
+            app, host, peer.port, iceLocalPort,
+            isGuest = isGuest, transport = PhantomVpnService.TRANSPORT_TCP
+        )
         addLog("VPN 数据面已绑定 P2P: $host:${peer.port} (本地端口 $iceLocalPort)", "INFO", "vpn")
     }
 
-    private fun maybeAttachVpnRelay(relayAddr: String, relayQuicPort: Int, relayUdpPort: Int, token: String) {
+    private fun maybeAttachVpnRelay(relayAddr: String, relayQuicPort: Int, token: String) {
         val app = getApplication<Application>()
         if (relayAddr.isBlank()) return
         if (VpnService.prepare(app) != null) {
@@ -671,15 +576,18 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
         }
 
         val isGuest = !(_state.value?.isHost ?: true)
-        val transport = if (_state.value?.roomTransport == RoomTransport.UDP) {
-            PhantomVpnService.TRANSPORT_UDP
-        } else {
-            PhantomVpnService.TRANSPORT_TCP
-        }
-        val relayPort = if (transport == PhantomVpnService.TRANSPORT_TCP) relayQuicPort else relayUdpPort
-        if (relayPort !in 1..65535) return
-        PhantomVpnService.attachRelay(app, "$relayAddr:$relayPort", token, isGuest = isGuest, transport = transport)
-        addLog("VPN 数据面已绑定中继: $relayAddr:$relayPort", "INFO", "vpn")
+        if (relayQuicPort !in 1..65535) return
+        PhantomVpnService.attachRelay(
+            app, "$relayAddr:$relayQuicPort", token,
+            isGuest = isGuest, transport = PhantomVpnService.TRANSPORT_TCP
+        )
+        addLog("VPN 数据面已绑定 QUIC: $relayAddr:$relayQuicPort", "INFO", "vpn")
+    }
+
+    private fun configureVpnOverlay(localIp: String, subnet: String, hostIp: String, isGuest: Boolean) {
+        val app = getApplication<Application>()
+        if (VpnService.prepare(app) != null) return
+        PhantomVpnService.configureOverlay(app, localIp, subnet, hostIp, isGuest)
     }
 
     /** 房间关闭时停止 VPN 前台服务（进程可被系统回收） */
@@ -699,41 +607,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
         pendingAction = null
 
         when (action) {
-            is PendingAction.CreateRoom -> {
-                signalManager?.createRoom(action.gamePort, action.transport)
-                addLog("鉴权完成，开始创建房间（端口 ${action.gamePort}, ${action.transport}）", "INFO", "host")
-            }
-
-            is PendingAction.CreateAdvancedRoom -> {
-                signalManager?.createAdvancedRoom(action.ports, action.mainPort, action.transport)
-                addLog("鉴权完成，开始创建高级房间（主端口 ${action.mainPort}）", "INFO", "host")
+            PendingAction.CreateRoom -> {
+                signalManager?.createRoom()
+                addLog("鉴权完成，开始创建房间", "INFO", "host")
             }
 
             is PendingAction.JoinRoom -> {
-                if (action.roomCode.endsWith("-A")) {
-                    signalManager?.joinAdvancedRoom(action.roomCode)
-                    updateState { it.copy(isAdvancedMode = true) }
-                } else {
-                    signalManager?.joinRoom(action.roomCode)
-                }
+                signalManager?.joinRoom(action.roomCode)
                 addLog("鉴权完成，开始加入房间 ${action.roomCode}", "INFO", "guest")
             }
-        }
-    }
-
-    private fun markPortReadyByTag(portTag: Int) {
-        val stateNow = _state.value ?: return
-        if (!stateNow.isAdvancedMode) return
-
-        val directPort = stateNow.portTunnelStatus.keys.firstOrNull { it == portTag }
-        if (directPort != null) {
-            updatePortStatus(directPort, PortStatus.READY)
-            return
-        }
-
-        val mapped = advancedMappings.firstOrNull { it.hostPort == portTag }
-        if (mapped != null) {
-            updatePortStatus(mapped.hostPort, PortStatus.READY)
         }
     }
 
@@ -849,4 +731,3 @@ fun parsePortSpec(str: String): List<Int> {
     }
     return result
 }
-

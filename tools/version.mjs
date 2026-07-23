@@ -138,18 +138,24 @@ function desiredFiles(version) {
   files.set("index.html", html);
 
   let gradle = fs.readFileSync(path.join(root, "android/app/build.gradle.kts"), "utf8");
-  gradle = replaceRequired(
-    gradle,
-    /(versionCode\s*=\s*)\d+/,
-    `$1${number}`,
-    "Android versionCode",
-  );
-  gradle = replaceRequired(
-    gradle,
-    /(versionName\s*=\s*")[^"]+("\s*)/,
-    `$1${version}$2`,
-    "Android versionName",
-  );
+  // Android reads both values from version.json at configuration time. Keep
+  // that dynamic form intact; older projects may still contain literals.
+  if (!/versionCode\s*=\s*\(phantomVersion\["buildNumber"\]/.test(gradle)) {
+    gradle = replaceRequired(
+      gradle,
+      /(versionCode\s*=\s*)\d+/,
+      `$1${number}`,
+      "Android versionCode",
+    );
+  }
+  if (!/versionName\s*=\s*phantomVersion\["version"\]/.test(gradle)) {
+    gradle = replaceRequired(
+      gradle,
+      /(versionName\s*=\s*")[^"]+("\s*)/,
+      `$1${version}$2`,
+      "Android versionName",
+    );
+  }
   files.set("android/app/build.gradle.kts", gradle);
 
   let installer = fs.readFileSync(path.join(root, "build/windows-installer.nsi"), "utf8");
