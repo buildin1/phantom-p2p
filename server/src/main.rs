@@ -467,13 +467,22 @@ async fn handle_client_message(session_id: &str, msg: ClientMessage, state: &Sha
                     handle_get_fixed_host_ip(session_id, state).await;
                 }
                 ClientMessage::IceCandidates {
+                    target_peer_session_id,
                     candidates,
                     ufrag,
                     pwd,
                     nat_type,
                 } => {
-                    handle_ice_candidates(session_id, candidates, ufrag, pwd, nat_type, state)
-                        .await;
+                    handle_ice_candidates(
+                        session_id,
+                        target_peer_session_id,
+                        candidates,
+                        ufrag,
+                        pwd,
+                        nat_type,
+                        state,
+                    )
+                    .await;
                 }
                 _ => {} // Ping/Auth 已在上面处理
             }
@@ -821,6 +830,7 @@ async fn guest_relay_credential(registry: &relay::SharedRegistry, room_token: &s
 /// 确保两端精确同步开始连通性检测，避免单边打洞失败。
 async fn handle_ice_candidates(
     session_id: &str,
+    target_peer_session_id: Option<String>,
     candidates: Vec<phantom_protocol::IceCandidate>,
     ufrag: String,
     pwd: String,
@@ -854,53 +864,72 @@ async fn handle_ice_candidates(
         };
 
         // 写入本方候选缓存
+        let host_sid = room.host_session_id.clone();
+        let cache_key = if session_id == host_sid {
+            target_peer_session_id
+                .as_deref()
+                .filter(|peer| room.guests.contains(*peer))
+                .map(|peer| format!("{}::{}", session_id, peer))
+                .unwrap_or_else(|| session_id.to_string())
+        } else {
+            session_id.to_string()
+        };
         room.ice_candidate_cache.insert(
-            session_id.to_string(),
+            cache_key.clone(),
             IceCandidateEntry {
                 candidates: candidates.clone(),
             },
         );
         // 缓存鉴权信息（ufrag/pwd/nat_type）
-        room.ice_auth_info.insert(
-            session_id.to_string(),
-            (ufrag.clone(), pwd.clone(), nat_type.clone()),
-        );
+        room.ice_auth_info
+            .insert(cache_key, (ufrag.clone(), pwd.clone(), nat_type.clone()));
 
         // 检查 host 和所有 guest 是否都已提交
         let host_sid = room.host_session_id.clone();
-        let host_entry = room.ice_candidate_cache.get(&host_sid).cloned();
-        let host_auth = room.ice_auth_info.get(&host_sid).cloned();
         let guests: Vec<String> = room.guests.iter().cloned().collect();
 
         // 收集所有已缓存的 guest 候选及鉴权信息
-        let ready_guests: Vec<(String, IceCandidateEntry, (String, String, String))> = guests
+        let ready_guests: Vec<(
+            String,
+            IceCandidateEntry,
+            (String, String, String),
+            IceCandidateEntry,
+            (String, String, String),
+        )> = guests
             .iter()
             .filter_map(|g| {
-                let entry = room.ice_candidate_cache.get(g).cloned()?;
-                let auth = room.ice_auth_info.get(g).cloned()?;
-                Some((g.clone(), entry, auth))
+                let guest_entry = room.ice_candidate_cache.get(g).cloned()?;
+                let guest_auth = room.ice_auth_info.get(g).cloned()?;
+                let scoped_key = format!("{}::{}", host_sid, g);
+                let host_entry = room
+                    .ice_candidate_cache
+                    .get(&scoped_key)
+                    .or_else(|| room.ice_candidate_cache.get(&host_sid))
+                    .cloned()?;
+                let host_auth = room
+                    .ice_auth_info
+                    .get(&scoped_key)
+                    .or_else(|| room.ice_auth_info.get(&host_sid))
+                    .cloned()?;
+                Some((g.clone(), host_entry, host_auth, guest_entry, guest_auth))
             })
             .collect();
 
         // trigger_pairs: (host_sid, host_entry, host_auth, ready_guests)
         // 只有 host 和至少一个 guest 都就绪时才触发
-        let trigger_pairs = if let Some(he) = host_entry {
-            if let Some(ha) = host_auth {
-                if !ready_guests.is_empty() {
-                    // 清除已触发的缓存条目，避免重复触发
-                    room.ice_candidate_cache.remove(&host_sid);
-                    room.ice_auth_info.remove(&host_sid);
-                    for (gsid, _, _) in &ready_guests {
-                        room.ice_candidate_cache.remove(gsid);
-                        room.ice_auth_info.remove(gsid);
-                    }
-                    Some((host_sid.clone(), he, ha, ready_guests))
-                } else {
-                    None
-                }
-            } else {
-                None
+        let trigger_pairs = if !ready_guests.is_empty() {
+            // Keep the Host candidate set. A Host socket is long-lived
+            // and must be reusable for every later Guest. Removing it
+            // here creates a race where a Guest joins after the first
+            // timeout and no second ICE check is ever triggered.
+            for (gsid, _, _, _, _) in &ready_guests {
+                room.ice_candidate_cache.remove(gsid);
+                room.ice_auth_info.remove(gsid);
+                let scoped_key = format!("{}::{}", host_sid, gsid);
+                room.ice_candidate_cache.remove(&scoped_key);
+                room.ice_auth_info.remove(&scoped_key);
             }
+            Some((host_sid.clone(), ready_guests))
         } else {
             None
         };
@@ -916,9 +945,7 @@ async fn handle_ice_candidates(
     );
 
     // ── Step 2: 双边同步下发（仅在双方均就绪时执行）────────────────
-    if let Some((host_sid, host_entry, host_auth, ready_guests)) = trigger_pairs {
-        let (host_ufrag, host_pwd, host_nat_type) = host_auth;
-
+    if let Some((host_sid, ready_guests)) = trigger_pairs {
         // 用同一个 start_at_ms，给双方 200ms 窗口同步启动
         let start_at_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -928,7 +955,8 @@ async fn handle_ice_candidates(
 
         let st = state.lock().await;
 
-        for (guest_sid, guest_entry, guest_auth) in &ready_guests {
+        for (guest_sid, host_entry, host_auth, guest_entry, guest_auth) in &ready_guests {
+            let (host_ufrag, host_pwd, host_nat_type) = host_auth;
             let (guest_ufrag, guest_pwd, guest_nat_type) = guest_auth;
             // 向 Guest 发送 Host 的候选
             if let Some(guest_sess) = st.sessions.get(guest_sid) {
@@ -1536,6 +1564,11 @@ fn do_leave_room(session_id: &str, st: &mut AppState) {
             // Guest 离开
             if let Some(room) = st.rooms.get_mut(&room_code) {
                 room.guests.remove(session_id);
+                room.ice_candidate_cache.remove(session_id);
+                room.ice_auth_info.remove(session_id);
+                let scoped_key = format!("{}::{}", room.host_session_id, session_id);
+                room.ice_candidate_cache.remove(&scoped_key);
+                room.ice_auth_info.remove(&scoped_key);
                 let guest_count = room.guests.len();
 
                 // 房间内无 Guest 时回到待加入状态，避免复用过期中继 token

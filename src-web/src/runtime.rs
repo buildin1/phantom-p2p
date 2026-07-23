@@ -24,6 +24,11 @@ struct RelayInfo {
     token: String,
 }
 
+struct HostPeer {
+    socket: Arc<UdpSocket>,
+    endpoint: Option<quinn::Endpoint>,
+}
+
 struct RuntimeState {
     authenticated_user: Option<String>,
     fixed_host_ip: Option<String>,
@@ -37,6 +42,8 @@ struct RuntimeState {
     relay: Option<RelayInfo>,
     conn_manager: Option<Arc<tunnel::TunnelConnManager>>,
     host_endpoint: Option<quinn::Endpoint>,
+    host_peers: HashMap<String, HostPeer>,
+    host_ice_tasks: HashMap<String, tokio::task::JoinHandle<()>>,
     relay_host_conn: Option<quinn::Connection>,
     tun_bridge: Option<Arc<tun_bridge::TunBridge>>,
 }
@@ -56,6 +63,8 @@ impl Default for RuntimeState {
             relay: None,
             conn_manager: None,
             host_endpoint: None,
+            host_peers: HashMap::new(),
+            host_ice_tasks: HashMap::new(),
             relay_host_conn: None,
             tun_bridge: None,
         }
@@ -212,6 +221,14 @@ impl HeadlessRuntime {
                 if let Some(old) = self.state.lock().await.host_endpoint.take() {
                     old.close(0u32.into(), b"Host address changed");
                 }
+                for (_, peer) in std::mem::take(&mut self.state.lock().await.host_peers) {
+                    if let Some(endpoint) = peer.endpoint {
+                        endpoint.close(0u32.into(), b"Host address changed");
+                    }
+                }
+                for (_, task) in std::mem::take(&mut self.state.lock().await.host_ice_tasks) {
+                    task.abort();
+                }
                 if let Some(old) = self.state.lock().await.relay_host_conn.take() {
                     old.close(0u32.into(), b"Host address changed");
                 }
@@ -270,9 +287,14 @@ impl HeadlessRuntime {
                 peer_session_id, ..
             } => {
                 self.stats
-                    .add_connection(peer_session_id, "p2p".into())
+                    .add_connection(peer_session_id.clone(), "p2p".into())
                     .await;
-                if let Err(error) = self.start_punch().await {
+                let result = if self.state.lock().await.is_host {
+                    self.start_host_punch_for_peer(&peer_session_id).await
+                } else {
+                    self.start_punch().await
+                };
+                if let Err(error) = result {
                     self.emit("punch:phase", puncher::PunchPhase::Failed { reason: error });
                 }
             }
@@ -280,6 +302,20 @@ impl HeadlessRuntime {
                 peer_session_id, ..
             } => {
                 self.stats.remove_connection(&peer_session_id).await;
+                if let Some(task) = self
+                    .state
+                    .lock()
+                    .await
+                    .host_ice_tasks
+                    .remove(&peer_session_id)
+                {
+                    task.abort();
+                }
+                if let Some(peer) = self.state.lock().await.host_peers.remove(&peer_session_id) {
+                    if let Some(endpoint) = peer.endpoint {
+                        endpoint.close(0u32.into(), b"peer left");
+                    }
+                }
             }
             ServerMessage::RelayPreAllocated {
                 room_code,
@@ -319,7 +355,8 @@ impl HeadlessRuntime {
                 ..
             } => {
                 let runtime = self.clone();
-                tokio::spawn(async move {
+                let peer_id = peer_session_id.clone();
+                let task = tokio::spawn(async move {
                     runtime
                         .handle_peer_candidates(
                             peer_session_id,
@@ -329,6 +366,9 @@ impl HeadlessRuntime {
                         )
                         .await;
                 });
+                if self.state.lock().await.is_host {
+                    self.state.lock().await.host_ice_tasks.insert(peer_id, task);
+                }
             }
             ServerMessage::RoomClosed { .. } => self.reset_room().await,
             _ => {}
@@ -348,6 +388,7 @@ impl HeadlessRuntime {
         if let Some(candidates) = existing {
             self.signal
                 .send(ClientMessage::IceCandidates {
+                    target_peer_session_id: None,
                     candidates,
                     ufrag: String::new(),
                     pwd: String::new(),
@@ -374,6 +415,45 @@ impl HeadlessRuntime {
         }
         self.signal
             .send(ClientMessage::IceCandidates {
+                target_peer_session_id: None,
+                candidates,
+                ufrag: String::new(),
+                pwd: String::new(),
+                nat_type: String::new(),
+            })
+            .await?;
+        self.emit("punch:phase", puncher::PunchPhase::WaitingPeer);
+        Ok(())
+    }
+
+    async fn start_host_punch_for_peer(&self, peer_session_id: &str) -> Result<(), String> {
+        if self
+            .state
+            .lock()
+            .await
+            .host_peers
+            .contains_key(peer_session_id)
+        {
+            return Ok(());
+        }
+        let (socket, candidates) = tokio::task::spawn_blocking(|| {
+            let socket = network::bind_dual_stack_udp(0)
+                .map_err(|e| format!("bind per-peer ICE socket: {}", e))?;
+            let (candidates, _, _, _) = puncher::gather_ice_candidates(&socket);
+            Ok::<_, String>((Arc::new(socket), candidates))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        self.state.lock().await.host_peers.insert(
+            peer_session_id.to_string(),
+            HostPeer {
+                socket: socket.clone(),
+                endpoint: None,
+            },
+        );
+        self.signal
+            .send(ClientMessage::IceCandidates {
+                target_peer_session_id: Some(peer_session_id.to_string()),
                 candidates,
                 ufrag: String::new(),
                 pwd: String::new(),
@@ -393,7 +473,15 @@ impl HeadlessRuntime {
     ) {
         let (socket, is_host) = {
             let state = self.state.lock().await;
-            (state.socket.clone(), state.is_host)
+            let socket = if state.is_host {
+                state
+                    .host_peers
+                    .get(&peer_session_id)
+                    .map(|peer| peer.socket.clone())
+            } else {
+                state.socket.clone()
+            };
+            (socket, state.is_host)
         };
         let Some(socket) = socket else {
             self.emit(
@@ -412,6 +500,13 @@ impl HeadlessRuntime {
         self.emit("punch:phase", puncher::PunchPhase::Punching);
         let result = puncher::do_ice_punch(socket.clone(), candidates, start_at_ms).await;
         if !result.success {
+            if is_host {
+                if let Some(peer) = self.state.lock().await.host_peers.remove(&peer_session_id) {
+                    if let Some(endpoint) = peer.endpoint {
+                        endpoint.close(0u32.into(), b"ICE failed");
+                    }
+                }
+            }
             self.emit(
                 "punch:phase",
                 puncher::PunchPhase::Failed {
@@ -437,32 +532,31 @@ impl HeadlessRuntime {
             .await;
         if is_host {
             let mut state = self.state.lock().await;
-            if state.host_endpoint.is_none() {
-                match socket
-                    .try_clone()
-                    .map_err(|e| e.to_string())
-                    .and_then(tunnel::create_host_endpoint)
-                {
-                    Ok(endpoint) => {
-                        let task_endpoint = endpoint.clone();
-                        let stats = self.stats.clone();
-                        let tun = state.tun_bridge.clone();
-                        tokio::spawn(async move {
-                            let _ = tunnel::start_host_tunnel(
-                                task_endpoint,
-                                stats,
-                                Arc::new(Mutex::new(HashMap::new())),
-                                tun,
-                            )
-                            .await;
-                        });
-                        state.host_endpoint = Some(endpoint);
+            match socket
+                .try_clone()
+                .map_err(|e| e.to_string())
+                .and_then(tunnel::create_host_endpoint)
+            {
+                Ok(endpoint) => {
+                    let task_endpoint = endpoint.clone();
+                    let stats = self.stats.clone();
+                    let tun = state.tun_bridge.clone();
+                    let peer_map = Arc::new(Mutex::new(HashMap::from([(
+                        result.peer_addr.clone(),
+                        peer_session_id.clone(),
+                    )])));
+                    tokio::spawn(async move {
+                        let _ =
+                            tunnel::start_host_tunnel(task_endpoint, stats, peer_map, tun).await;
+                    });
+                    if let Some(peer) = state.host_peers.get_mut(&peer_session_id) {
+                        peer.endpoint = Some(endpoint);
                     }
-                    Err(error) => {
-                        drop(state);
-                        self.emit("tunnel:failed", json!({"mode": "P2P", "reason": error}));
-                        return;
-                    }
+                }
+                Err(error) => {
+                    drop(state);
+                    self.emit("tunnel:failed", json!({"mode": "P2P", "reason": error}));
+                    return;
                 }
             }
             drop(state);
@@ -593,6 +687,14 @@ impl HeadlessRuntime {
         if let Some(endpoint) = state.host_endpoint.take() {
             endpoint.close(0u32.into(), b"room closed");
         }
+        for (_, peer) in std::mem::take(&mut state.host_peers) {
+            if let Some(endpoint) = peer.endpoint {
+                endpoint.close(0u32.into(), b"room closed");
+            }
+        }
+        for (_, task) in std::mem::take(&mut state.host_ice_tasks) {
+            task.abort();
+        }
         if let Some(connection) = state.relay_host_conn.take() {
             connection.close(0u32.into(), b"room closed");
         }
@@ -680,7 +782,20 @@ impl HeadlessRuntime {
                 Ok(Value::Null)
             }
             "start_punch" => {
-                self.start_punch().await?;
+                let peer = payload
+                    .get("peerSessionId")
+                    .or_else(|| payload.get("peer_session_id"))
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(ToOwned::to_owned);
+                if self.state.lock().await.is_host {
+                    self.start_host_punch_for_peer(
+                        peer.as_deref().ok_or("peerSessionId is required")?,
+                    )
+                    .await?;
+                } else {
+                    self.start_punch().await?;
+                }
                 Ok(Value::Null)
             }
             "start_tun_bridge" => {

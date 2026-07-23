@@ -2884,7 +2884,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "phantom-core"
-version = "2.7.6"
+version = "2.7.7"
 dependencies = [
  "dirs",
  "ed25519-dalek",
@@ -2908,7 +2908,7 @@ dependencies = [
 
 [[package]]
 name = "phantom-mobile"
-version = "2.7.6"
+version = "2.7.7"
 dependencies = [
  "jni",
  "once_cell",
@@ -2920,7 +2920,7 @@ dependencies = [
 
 [[package]]
 name = "phantom-p2p"
-version = "2.7.6"
+version = "2.7.7"
 dependencies = [
  "axum",
  "dirs",
@@ -2949,7 +2949,7 @@ dependencies = [
 
 [[package]]
 name = "phantom-p2p-web"
-version = "2.7.6"
+version = "2.7.7"
 dependencies = [
  "axum",
  "clap",
@@ -2966,7 +2966,7 @@ dependencies = [
 
 [[package]]
 name = "phantom-protocol"
-version = "2.7.6"
+version = "2.7.7"
 dependencies = [
  "ed25519-dalek",
  "rmp-serde",
@@ -2976,7 +2976,7 @@ dependencies = [
 
 [[package]]
 name = "phantom-server"
-version = "2.7.6"
+version = "2.7.7"
 dependencies = [
  "chrono",
  "ed25519-dalek",
