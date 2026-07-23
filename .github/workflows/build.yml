@@ -61,7 +61,7 @@ jobs:
 
   windows-arm64:
     name: Windows ARM64
-    runs-on: windows-2022
+    runs-on: windows-11-arm
     needs: checks
     steps:
       - uses: actions/checkout@v4
@@ -71,11 +71,7 @@ jobs:
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable-x86_64-pc-windows-msvc
-          targets: aarch64-pc-windows-msvc
-      - uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: arm64
+          toolchain: stable
       - name: Download ARM64 runtime DLLs
         shell: pwsh
         run: |
@@ -94,14 +90,14 @@ jobs:
       - name: Build ARM64 client and server
         shell: pwsh
         run: |
-          cargo build --locked --release --target aarch64-pc-windows-msvc -p phantom-p2p
-          cargo build --locked --release --target aarch64-pc-windows-msvc -p phantom-server
+          cargo build --locked --release -p phantom-p2p
+          cargo build --locked --release -p phantom-server
       - name: Stage ARM64 binaries
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force build\release\windows-arm64 | Out-Null
-          Copy-Item target\aarch64-pc-windows-msvc\release\phantom-p2p.exe build\release\windows-arm64\
-          Copy-Item target\aarch64-pc-windows-msvc\release\phantom-server.exe build\release\windows-arm64\
+          Copy-Item target\release\phantom-p2p.exe build\release\windows-arm64\
+          Copy-Item target\release\phantom-server.exe build\release\windows-arm64\
           Copy-Item build\wintun.dll,build\WebView2Loader.dll build\release\windows-arm64\
       - uses: actions/upload-artifact@v4
         with:
@@ -111,7 +107,7 @@ jobs:
 
   macos:
     name: macOS ${{ matrix.arch }}
-    runs-on: macos-13
+    runs-on: ${{ matrix.runner }}
     needs: checks
     strategy:
       fail-fast: false
@@ -119,8 +115,10 @@ jobs:
         include:
           - arch: x64
             target: x86_64-apple-darwin
+            runner: macos-15-intel
           - arch: arm64
             target: aarch64-apple-darwin
+            runner: macos-15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -134,15 +132,15 @@ jobs:
         run: npm ci && npm run build
       - name: Build app and server
         run: |
-          npx tauri build --target ${{ matrix.target }} --bundles app,dmg
-          cargo build --locked --release --target ${{ matrix.target }} -p phantom-server
+          npx tauri build --bundles app,dmg
+          cargo build --locked --release -p phantom-server
       - name: Stage macOS artifacts
         run: |
           set -euxo pipefail
           out="build/release/macos-${{ matrix.arch }}"
           mkdir -p "$out"
-          cp "target/${{ matrix.target }}/release/phantom-server" "$out/"
-          find "target/${{ matrix.target }}/release/bundle" -type f -name '*.dmg' -exec cp {} "$out/" \;
+          cp target/release/phantom-server "$out/"
+          find target/release/bundle -type f -name '*.dmg' -exec cp {} "$out/" \;
           test -n "$(find "$out" -type f -print -quit)"
       - uses: actions/upload-artifact@v4
         with:
@@ -167,10 +165,10 @@ jobs:
           sudo apt-get install -y build-essential pkg-config
           npm ci
           npm run build
-          cargo build --locked --release -p phantom-p2p-web -p phantom-server
+          cargo build --locked --release -p phantom-p2p-web
           mkdir -p build/release/linux-x64
-          cp target/release/phantom-p2p-web target/release/phantom-server server/config.toml build/release/linux-x64/
-          chmod +x build/release/linux-x64/phantom-p2p-web build/release/linux-x64/phantom-server
+          cp target/release/phantom-p2p build/release/linux-x64/
+          chmod +x build/release/linux-x64/phantom-p2p
       - uses: actions/upload-artifact@v4
         with:
           name: phantom-p2p-linux-x64
@@ -201,48 +199,12 @@ jobs:
         run: |
           npm ci
           npm run build
-          cargo build --locked --release --target aarch64-unknown-linux-gnu -p phantom-p2p-web -p phantom-server
+          cargo build --locked --release --target aarch64-unknown-linux-gnu -p phantom-p2p-web
           mkdir -p build/release/linux-arm64
-          cp target/aarch64-unknown-linux-gnu/release/phantom-p2p-web target/aarch64-unknown-linux-gnu/release/phantom-server server/config.toml build/release/linux-arm64/
-          chmod +x build/release/linux-arm64/phantom-p2p-web build/release/linux-arm64/phantom-server
+          cp target/aarch64-unknown-linux-gnu/release/phantom-p2p build/release/linux-arm64/
+          chmod +x build/release/linux-arm64/phantom-p2p
       - uses: actions/upload-artifact@v4
         with:
           name: phantom-p2p-linux-arm64
           path: build/release/linux-arm64/
-          if-no-files-found: error
-
-  android:
-    name: Android
-    runs-on: ubuntu-22.04
-    needs: checks
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17
-      - uses: android-actions/setup-android@v3
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
-      - name: Install Android SDK and cargo-ndk
-        run: |
-          sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;27.2.12479018"
-          cargo install cargo-ndk --locked
-      - name: Build Android APKs
-        run: |
-          echo "sdk.dir=$ANDROID_SDK_ROOT" > android/local.properties
-          chmod +x android/gradlew
-          cd android
-          ./gradlew --no-daemon clean assembleStandardDebug assembleStandardRelease -Pphantom.buildRustNative=true
-      - name: Stage Android artifacts
-        run: |
-          mkdir -p build/release/android
-          cp android/app/build/outputs/apk/standard/debug/*.apk build/release/android/
-          cp android/app/build/outputs/apk/standard/release/*.apk build/release/android/ || true
-          sha256sum build/release/android/*.apk > build/release/android/SHA256SUMS
-      - uses: actions/upload-artifact@v4
-        with:
-          name: phantom-p2p-android
-          path: build/release/android/
           if-no-files-found: error

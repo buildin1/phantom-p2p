@@ -4,7 +4,7 @@ version = "2.7.5"
 edition = "2021"
 
 [[bin]]
-name = "phantom-p2p-web"
+name = "phantom-p2p"
 path = "src/main.rs"
 
 [dependencies]

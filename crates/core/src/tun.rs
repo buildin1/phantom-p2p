@@ -105,6 +105,7 @@ impl Ipv4Header {
 #[cfg_attr(target_os = "windows", path = "tun_windows.rs")]
 #[cfg_attr(target_os = "linux", path = "tun_linux.rs")]
 #[cfg_attr(target_os = "macos", path = "tun_macos.rs")]
+#[cfg_attr(target_os = "android", path = "tun_android.rs")]
 mod platform;
 
 /// TUN 设备

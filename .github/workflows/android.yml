@@ -1,0 +1,59 @@
+name: Build Android
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - android/**
+      - crates/core/**
+      - crates/mobile/**
+      - crates/protocol/**
+      - Cargo.lock
+      - Cargo.toml
+      - build/build-android.*
+      - .github/workflows/android.yml
+
+permissions:
+  contents: read
+
+env:
+  PHANTOM_SKIP_VERSION_BUMP: "1"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  android:
+    name: Android APK
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+      - name: Install Android SDK and cargo-ndk
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;27.2.12479018"
+          cargo install cargo-ndk --locked
+      - name: Build Android APKs
+        run: |
+          echo "sdk.dir=$ANDROID_SDK_ROOT" > android/local.properties
+          chmod +x android/gradlew
+          cd android
+          ./gradlew --no-daemon clean assembleStandardDebug assembleStandardRelease -Pphantom.buildRustNative=true --stacktrace
+      - name: Stage Android artifacts
+        run: |
+          mkdir -p build/release/android
+          cp android/app/build/outputs/apk/standard/debug/*.apk build/release/android/
+          cp android/app/build/outputs/apk/standard/release/*.apk build/release/android/ || true
+          sha256sum build/release/android/*.apk > build/release/android/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: phantom-p2p-android
+          path: build/release/android/
+          if-no-files-found: error
