@@ -258,6 +258,53 @@
                     android:textColor="@color/colorDanger"
                     android:textSize="13sp" />
             </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:padding="10dp"
+                android:background="@drawable/bg_code_box">
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="本机公网 IP"
+                        android:textColor="@color/textMuted"
+                        android:textSize="11sp" />
+                    <TextView
+                        android:id="@+id/tvHostVirtualIp"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="2dp"
+                        android:text="127.0.0.1"
+                        android:textColor="@color/textMain"
+                        android:textSize="18sp"
+                        android:textStyle="bold"
+                        android:fontFamily="monospace" />
+                </LinearLayout>
+                <TextView
+                    android:id="@+id/tvHostIpMode"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="未开房间"
+                    android:textColor="@color/textMuted"
+                    android:textSize="11sp" />
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnRequestFixedIp"
+                    style="@style/Widget.Phantom.Button.Outlined"
+                    android:layout_width="wrap_content"
+                    android:layout_height="40dp"
+                    android:layout_marginStart="8dp"
+                    android:text="申请固定 IP"
+                    android:textSize="12sp" />
+            </LinearLayout>
         </LinearLayout>
 
         <!-- ── 创建房间 ── -->
@@ -324,6 +371,7 @@
 
             <!-- Protocol row -->
             <LinearLayout
+                android:id="@+id/rowProtocol"
                 android:layout_width="match_parent"
                 android:layout_height="40dp"
                 android:orientation="horizontal"
@@ -366,6 +414,7 @@
 
             <!-- Game port row -->
             <LinearLayout
+                android:id="@+id/rowGamePort"
                 android:layout_width="match_parent"
                 android:layout_height="44dp"
                 android:orientation="horizontal"

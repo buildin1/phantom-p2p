@@ -34,6 +34,9 @@ struct BridgeState {
     connection: quinn::Connection,
     callback: Arc<NativeCallback>,
     streams: HashMap<i64, StreamState>,
+    // One writer per QUIC PIP1 stream. A Host may have several Guest
+    // streams, so packets must be broadcast to every live peer.
+    packet_writers: Vec<mpsc::UnboundedSender<Vec<u8>>>,
 }
 
 struct StreamState {
@@ -43,6 +46,24 @@ struct StreamState {
 struct NativeCallback {
     vm: JavaVM,
     object: GlobalRef,
+}
+
+impl NativeCallback {
+    fn ip_packet(&self, data: &[u8]) {
+        let Ok(mut env) = self.vm.attach_current_thread() else {
+            return;
+        };
+        let Ok(array) = env.byte_array_from_slice(data) else {
+            return;
+        };
+        let array_obj = JObject::from(array);
+        let _ = env.call_method(
+            self.object.as_obj(),
+            "onNativeIpPacket",
+            "([B)V",
+            &[JValue::Object(&array_obj)],
+        );
+    }
 }
 impl NativeCallback {
     fn tcp_data(&self, stream_id: i64, data: &[u8]) {
@@ -88,6 +109,22 @@ impl NativeCallback {
 
 #[no_mangle]
 pub extern "system" fn Java_com_buildin1_phantom_1p2p_data_NativeQuicStreamBridge_nativeCreateBridge(
+    env: JNIEnv,
+    this: JObject,
+    mode: JString,
+    endpoint: JString,
+    relay_token: JString,
+    local_port: jint,
+    is_guest: jboolean,
+) -> jlong {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        native_create_bridge_inner(env, this, mode, endpoint, relay_token, local_port, is_guest)
+    }));
+    result.unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_buildin1_phantom_1p2p_data_NativePacketBridge_nativeCreateBridge(
     env: JNIEnv,
     this: JObject,
     mode: JString,
@@ -187,6 +224,7 @@ fn native_create_bridge_inner(
             connection,
             callback: Arc::new(NativeCallback { vm, object }),
             streams: HashMap::new(),
+            packet_writers: Vec::new(),
         },
     );
     let callback = BRIDGES
@@ -198,9 +236,102 @@ fn native_create_bridge_inner(
         .get(&handle)
         .map(|bridge| bridge.connection.clone());
     if let (Some(callback), Some(connection)) = (callback, connection) {
-        RUNTIME.spawn(accept_inbound_streams(handle, connection, callback));
+        RUNTIME.spawn(accept_inbound_streams(handle, connection, callback.clone()));
+        if mode == "p2p" && is_guest == 0 {
+            let endpoint = BRIDGES
+                .lock()
+                .get(&handle)
+                .and_then(|bridge| bridge._endpoint.clone());
+            if let Some(endpoint) = endpoint {
+                RUNTIME.spawn(accept_additional_connections(handle, endpoint, callback));
+            }
+        }
     }
     handle as jlong
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_buildin1_phantom_1p2p_data_NativePacketBridge_nativeStartPacketStream(
+    env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+) -> jboolean {
+    let (connection, callback) = {
+        let bridges = BRIDGES.lock();
+        let Some(bridge) = bridges.get(&(handle as i64)) else {
+            return 0;
+        };
+        (bridge.connection.clone(), bridge.callback.clone())
+    };
+    let opened = RUNTIME.block_on(async {
+        tokio::time::timeout(Duration::from_secs(12), connection.open_bi()).await
+    });
+    let (mut send, mut recv) = match opened {
+        Ok(Ok(streams)) => streams,
+        _ => return 0,
+    };
+    if RUNTIME.block_on(send.write_all(b"PIP1")).is_err() {
+        return 0;
+    }
+    let (writer, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    RUNTIME.spawn(async move {
+        while let Some(packet) = rx.recv().await {
+            if packet.len() < 20 || packet.len() > 65535 {
+                continue;
+            }
+            if send
+                .write_all(&(packet.len() as u16).to_be_bytes())
+                .await
+                .is_err()
+                || send.write_all(&packet).await.is_err()
+            {
+                break;
+            }
+        }
+        let _ = send.finish();
+    });
+    let read_callback = callback.clone();
+    RUNTIME.spawn(async move {
+        let mut len = [0u8; 2];
+        loop {
+            if recv.read_exact(&mut len).await.is_err() {
+                break;
+            }
+            let size = u16::from_be_bytes(len) as usize;
+            if !(20..=65535).contains(&size) {
+                break;
+            }
+            let mut packet = vec![0u8; size];
+            if recv.read_exact(&mut packet).await.is_err() {
+                break;
+            }
+            read_callback.ip_packet(&packet);
+        }
+    });
+    if let Some(bridge) = BRIDGES.lock().get_mut(&(handle as i64)) {
+        bridge.packet_writers.push(writer);
+        1
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_buildin1_phantom_1p2p_data_NativePacketBridge_nativeWritePacket(
+    mut env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    data: JByteArray,
+) {
+    let Some(data) = byte_array_to_vec(&mut env, data) else {
+        return;
+    };
+    if let Some(bridge) = BRIDGES.lock().get_mut(&(handle as i64)) {
+        bridge.packet_writers.retain(|writer| !writer.is_closed());
+        for writer in &bridge.packet_writers {
+            let _ = writer.send(data.clone());
+        }
+    }
 }
 
 #[no_mangle]
@@ -319,6 +450,17 @@ pub extern "system" fn Java_com_buildin1_phantom_1p2p_data_NativeQuicStreamBridg
     }
 }
 
+#[no_mangle]
+pub extern "system" fn Java_com_buildin1_phantom_1p2p_data_NativePacketBridge_nativeCloseBridge(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+) {
+    if let Some(bridge) = BRIDGES.lock().remove(&(handle as i64)) {
+        bridge.connection.close(0u32.into(), b"closed");
+    }
+}
+
 fn bind_udp_socket(local_port: i32) -> std::io::Result<UdpSocket> {
     let bind_addr = if local_port > 0 && local_port <= 65535 {
         format!("0.0.0.0:{}", local_port)
@@ -377,12 +519,53 @@ async fn accept_inbound_streams(
         let Ok((mut send, mut recv)) = connection.accept_bi().await else {
             break;
         };
-        let mut port_buf = [0u8; 2];
-        if recv.read_exact(&mut port_buf).await.is_err() {
+        let mut header = [0u8; 4];
+        if recv.read_exact(&mut header).await.is_err() {
             let _ = send.finish();
             continue;
         }
-        let target_port = u16::from_be_bytes(port_buf);
+        if &header == b"PIP1" {
+            let (writer, mut packets) = mpsc::unbounded_channel::<Vec<u8>>();
+            if let Some(bridge) = BRIDGES.lock().get_mut(&handle) {
+                bridge.packet_writers.push(writer);
+            }
+            RUNTIME.spawn(async move {
+                while let Some(packet) = packets.recv().await {
+                    if packet.len() < 20 || packet.len() > 65535 {
+                        continue;
+                    }
+                    if send
+                        .write_all(&(packet.len() as u16).to_be_bytes())
+                        .await
+                        .is_err()
+                        || send.write_all(&packet).await.is_err()
+                    {
+                        break;
+                    }
+                }
+                let _ = send.finish();
+            });
+            let read_callback = callback.clone();
+            RUNTIME.spawn(async move {
+                let mut len = [0u8; 2];
+                loop {
+                    if recv.read_exact(&mut len).await.is_err() {
+                        break;
+                    }
+                    let size = u16::from_be_bytes(len) as usize;
+                    if !(20..=65535).contains(&size) {
+                        break;
+                    }
+                    let mut packet = vec![0u8; size];
+                    if recv.read_exact(&mut packet).await.is_err() {
+                        break;
+                    }
+                    read_callback.ip_packet(&packet);
+                }
+            });
+            continue;
+        }
+        let target_port = u16::from_be_bytes([header[0], header[1]]);
         let stream_id = NEXT_STREAM.fetch_add(1, Ordering::Relaxed);
         let (writer, mut receiver) = mpsc::unbounded_channel::<Vec<u8>>();
         if let Some(bridge) = BRIDGES.lock().get_mut(&handle) {
@@ -417,6 +600,19 @@ async fn accept_inbound_streams(
                 .map(|bridge| bridge.streams.remove(&stream_id));
             read_callback.tcp_closed(stream_id);
         });
+    }
+}
+
+async fn accept_additional_connections(
+    handle: i64,
+    endpoint: quinn::Endpoint,
+    callback: Arc<NativeCallback>,
+) {
+    while let Some(incoming) = endpoint.accept().await {
+        let Ok(connection) = incoming.await else {
+            continue;
+        };
+        RUNTIME.spawn(accept_inbound_streams(handle, connection, callback.clone()));
     }
 }
 

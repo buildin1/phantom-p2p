@@ -3,6 +3,9 @@ plugins {
     alias(libs.plugins.kotlin.android)
 }
 
+val phantomVersion = groovy.json.JsonSlurper()
+    .parseText(rootProject.file("../version.json").readText()) as Map<*, *>
+
 // macOS 外置卷会产生 ._* 资源叉文件，在每次构建前自动清理
 tasks.configureEach {
     doFirst {
@@ -22,8 +25,8 @@ android {
         applicationId = "com.buildin1.phantom_p2p"
         minSdk = 26
         targetSdk = 36
-        versionCode = 324
-        versionName = "2.7.5"
+        versionCode = (phantomVersion["buildNumber"] as Number).toInt()
+        versionName = phantomVersion["version"] as String
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
