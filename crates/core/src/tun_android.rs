@@ -4,11 +4,20 @@
 use crate::tun::TunError;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::Notify;
 
 pub struct PlatformTun {
     name: String,
     address: Ipv4Addr,
     closed: AtomicBool,
+    /// Kept for interface parity with the other platforms' cancellation
+    /// mechanism. The Android app owns the actual VPN fd via JNI, so this
+    /// stub never blocks in `read_packet`/`write_packet`, but a future real
+    /// implementation (a blocking JNI read bridged onto a channel) should
+    /// wire this the same way `tun_linux.rs`/`tun_windows.rs` do so `close()`
+    /// can unblock it.
+    #[allow(dead_code)]
+    close_notify: Notify,
 }
 
 impl PlatformTun {
@@ -44,5 +53,6 @@ impl PlatformTun {
 
     pub async fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
+        self.close_notify.notify_waiters();
     }
 }

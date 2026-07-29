@@ -10,14 +10,91 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncReadExt;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, warn};
 
 const STREAM_MAGIC: &[u8; 4] = b"PIP1";
 const MAX_PACKET: usize = 65535;
 
-type PeerSenders = Arc<Mutex<HashMap<Ipv4Addr, Arc<Mutex<SendStream>>>>>;
+/// Time budget for a single QUIC write to a peer's overlay stream. QUIC
+/// congestion / flow control can stall `write_all` indefinitely; without a
+/// timeout one slow/wedged peer would block the single TUN read loop and
+/// starve every other peer sharing this bridge (this is the relay-mode
+/// freeze this module used to suffer from).
+const PEER_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bounded per-peer outbound queue. Packets read from the TUN device are
+/// handed off here without waiting on the peer's QUIC stream; a dedicated
+/// task per peer performs the actual (potentially slow) write. Bounded so a
+/// permanently wedged peer applies backpressure only to itself (the queue
+/// fills and new packets for that peer are dropped) instead of unbounded
+/// memory growth.
+const PEER_QUEUE_DEPTH: usize = 256;
+
+/// A handle to a peer's dedicated forwarding task: send IP packets here and
+/// they will be written to the peer's QUIC SendStream by that task, with a
+/// bounded write timeout so a stalled peer cannot block anyone else.
+#[derive(Clone)]
+struct PeerForwarder {
+    tx: mpsc::Sender<Vec<u8>>,
+}
+
+impl PeerForwarder {
+    /// Best-effort enqueue; if the queue is full or the task has exited the
+    /// packet is dropped (never blocks the caller).
+    fn try_forward(&self, packet: &[u8]) -> bool {
+        match self.tx.try_send(packet.to_vec()) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!("[TUN] peer queue full, dropping packet");
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+}
+
+/// Spawn the task that owns a peer's SendStream and performs writes off the
+/// TUN read loop's critical path.
+fn spawn_peer_forwarder(sender: Arc<Mutex<SendStream>>) -> PeerForwarder {
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(PEER_QUEUE_DEPTH);
+    tokio::spawn(async move {
+        while let Some(packet) = rx.recv().await {
+            let len = packet.len() as u16;
+            let mut stream = sender.lock().await;
+            let write = async {
+                stream.write_all(&len.to_be_bytes()).await?;
+                stream.write_all(&packet).await
+            };
+            match tokio::time::timeout(PEER_WRITE_TIMEOUT, write).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!("[TUN] peer stream write failed ({} bytes): {}", packet.len(), e);
+                    // The stream is likely broken beyond recovery; stop this
+                    // forwarder so future sends are dropped immediately
+                    // instead of queueing behind a dead connection.
+                    break;
+                }
+                Err(_) => {
+                    warn!(
+                        "[TUN] peer stream write timed out after {:?} ({} bytes); dropping packet",
+                        PEER_WRITE_TIMEOUT,
+                        packet.len()
+                    );
+                    // Keep the forwarder alive: a single stalled write (e.g.
+                    // transient congestion) shouldn't necessarily kill the
+                    // peer, but repeated timeouts will keep dropping packets
+                    // rather than backing up the queue indefinitely.
+                }
+            }
+        }
+    });
+    PeerForwarder { tx }
+}
+
+type PeerSenders = Arc<Mutex<HashMap<Ipv4Addr, PeerForwarder>>>;
 
 pub struct TunBridge {
     tun: Arc<TunDevice>,
@@ -26,7 +103,7 @@ pub struct TunBridge {
     guest_network: Ipv4Addr,
     is_host: bool,
     peers: PeerSenders,
-    default_peer: Mutex<Option<Arc<Mutex<SendStream>>>>,
+    default_peer: Mutex<Option<PeerForwarder>>,
     closed: std::sync::atomic::AtomicBool,
     tx_packets: AtomicU64,
 }
@@ -123,6 +200,7 @@ impl TunBridge {
             .await
             .map_err(|e| TunError::WriteFailed(format!("写入 TUN 流头失败: {}", e)))?;
         let send = Arc::new(Mutex::new(send));
+        let forwarder = spawn_peer_forwarder(send);
         tracing::info!(
             "[TUN] PIP1 stream opened (local={}, peer_hint={:?}, host={})",
             self.my_vip,
@@ -130,17 +208,17 @@ impl TunBridge {
             self.is_host
         );
         if let Some(ip) = peer_hint {
-            self.peers.lock().await.insert(ip, send.clone());
+            self.peers.lock().await.insert(ip, forwarder.clone());
         }
         let mut default = self.default_peer.lock().await;
         if !self.is_host && default.is_none() {
-            *default = Some(send.clone());
+            *default = Some(forwarder.clone());
         }
         drop(default);
 
         let tun = self.tun.clone();
         let peers = self.peers.clone();
-        let sender = send.clone();
+        let sender = forwarder;
         let is_host = self.is_host;
         let host_vip = self.host_vip;
         let guest_network = self.guest_network;
@@ -169,7 +247,7 @@ impl TunBridge {
         send: SendStream,
         mut recv: RecvStream,
     ) -> Result<(), TunError> {
-        let sender = Arc::new(Mutex::new(send));
+        let sender = spawn_peer_forwarder(Arc::new(Mutex::new(send)));
         tracing::info!(
             "[TUN] PIP1 stream accepted (local={}, host={})",
             self.my_vip,
@@ -226,16 +304,12 @@ impl TunBridge {
                 None => None,
             };
             if let Some(sender) = sender {
-                let mut stream = sender.lock().await;
-                let len = n as u16;
-                if stream.write_all(&len.to_be_bytes()).await.is_err()
-                    || stream.write_all(&buf[..n]).await.is_err()
-                {
-                    warn!(
-                        "[TUN] peer stream write failed {} -> {} ({} bytes)",
-                        src, dst, n
-                    );
-                } else {
+                // Handing off to the peer's dedicated forwarder task keeps
+                // this loop non-blocking: the actual (possibly slow) QUIC
+                // write happens elsewhere, under its own timeout, so a
+                // single wedged peer can no longer starve every other peer
+                // sharing this bridge.
+                if sender.try_forward(&buf[..n]) {
                     let count = self.tx_packets.fetch_add(1, Ordering::Relaxed) + 1;
                     if count <= 100 || count % 1000 == 0 {
                         tracing::info!(
@@ -247,6 +321,11 @@ impl TunBridge {
                             n
                         );
                     }
+                } else {
+                    warn!(
+                        "[TUN] peer forward queue rejected packet {} -> {} ({} bytes)",
+                        src, dst, n
+                    );
                 }
             } else {
                 warn!(
@@ -275,7 +354,7 @@ async fn receive_frames(
     recv: &mut RecvStream,
     tun: Arc<TunDevice>,
     peers: PeerSenders,
-    sender: Arc<Mutex<SendStream>>,
+    sender: PeerForwarder,
     is_host: bool,
     host_vip: Ipv4Addr,
     guest_network: Ipv4Addr,
@@ -358,7 +437,7 @@ fn packet_protocol(packet: &[u8]) -> String {
 fn tun_rx_counter(
     _tun: &Arc<TunDevice>,
     _peers: &PeerSenders,
-    _sender: &Arc<Mutex<SendStream>>,
+    _sender: &PeerForwarder,
     _is_host: bool,
 ) -> u64 {
     // receive_frames is shared by host and guest and predates per-bridge state;
@@ -425,5 +504,50 @@ mod tests {
         let guest_network = parse_network("172.16.8").unwrap();
         assert!(same_prefix24(Ipv4Addr::new(172, 16, 8, 1), guest_network));
         assert!(!same_prefix24(Ipv4Addr::new(172, 24, 0, 1), guest_network));
+    }
+
+    // Regression tests for the relay-mode freeze: forwarding to one peer
+    // must never block or fail forwarding to another peer. `PeerForwarder`
+    // is exercised directly against a bare mpsc channel here (rather than a
+    // real QUIC SendStream) so the non-blocking/backpressure contract can be
+    // verified without a network stack.
+
+    #[tokio::test]
+    async fn try_forward_is_non_blocking_when_queue_is_full() {
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1);
+        let forwarder = PeerForwarder { tx };
+
+        // Fill the bounded queue.
+        assert!(forwarder.try_forward(b"first"));
+        // The queue is now full; try_forward must return immediately with
+        // `false` instead of blocking the caller (this is what previously
+        // starved every other peer sharing the single TUN read loop).
+        assert!(!forwarder.try_forward(b"second"));
+
+        let received = rx.recv().await.expect("first packet should be queued");
+        assert_eq!(received, b"first");
+    }
+
+    #[tokio::test]
+    async fn try_forward_reports_false_once_receiver_is_gone() {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(4);
+        drop(rx);
+        let forwarder = PeerForwarder { tx };
+        assert!(!forwarder.try_forward(b"packet"));
+    }
+
+    #[tokio::test]
+    async fn independent_peer_queues_do_not_block_each_other() {
+        // Two peers sharing a bridge: one has a full/stalled queue, the
+        // other must still accept packets without waiting.
+        let (stalled_tx, _stalled_rx) = mpsc::channel::<Vec<u8>>(1);
+        let stalled = PeerForwarder { tx: stalled_tx };
+        assert!(stalled.try_forward(b"a")); // fills the only slot
+        assert!(!stalled.try_forward(b"b")); // now full, must not block
+
+        let (healthy_tx, mut healthy_rx) = mpsc::channel::<Vec<u8>>(4);
+        let healthy = PeerForwarder { tx: healthy_tx };
+        assert!(healthy.try_forward(b"c"));
+        assert_eq!(healthy_rx.recv().await.unwrap(), b"c");
     }
 }
