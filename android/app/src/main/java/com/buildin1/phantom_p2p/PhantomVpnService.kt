@@ -367,7 +367,7 @@ class PhantomVpnService : VpnService() {
             } catch (error: Exception) {
                 if (isActive) {
                     Log.e(TAG, "TCP 数据面异常停止: ${error.message}", error)
-                    bindDataPlane(mode = MODE_IDLE, endpoint = "")
+                    recordDataPlaneFailure("TCP 数据面异常: ${error.message}")
                 }
             } finally {
                 runCatching { tunIn?.close() }
@@ -413,7 +413,10 @@ class PhantomVpnService : VpnService() {
                     txBytes.addAndGet(read.toLong())
                 }
             } catch (error: Exception) {
-                if (isActive) Log.e(TAG, "IPv4 packet data plane stopped: ${error.message}", error)
+                if (isActive) {
+                    Log.e(TAG, "IPv4 packet data plane stopped: ${error.message}", error)
+                    recordDataPlaneFailure("relay/P2P 数据面异常: ${error.message}")
+                }
             } finally {
                 bridge?.close()
                 runCatching { tunIn?.close() }
@@ -589,6 +592,22 @@ class PhantomVpnService : VpnService() {
             .apply()
     }
 
+    /**
+     * 数据面（P2P/中继）异常终止时的统一复位入口：
+     * 1) 记录失败时间戳 + 原因到 SharedPreferences，供 AppViewModel 轮询感知并结束"连接中"loading。
+     * 2) 复位 bindDataPlane 到 MODE_IDLE，避免服务停留在半死不活的状态。
+     * 修复 relay 卡死问题的核心：此前 startPacketDataPlane 的 catch 块只打日志、不复位，
+     * 导致 UI 侧 isJoining 永久为 true。
+     */
+    private fun recordDataPlaneFailure(reason: String) {
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putLong(KEY_DATA_PLANE_FAILURE_EPOCH, System.currentTimeMillis())
+            .putString(KEY_DATA_PLANE_FAILURE_REASON, reason)
+            .apply()
+        bindDataPlane(mode = MODE_IDLE, endpoint = "")
+    }
+
     companion object {
         private const val ACTION_START = "com.buildin1.phantom_p2p.action.START_VPN"
         private const val ACTION_STOP = "com.buildin1.phantom_p2p.action.STOP_VPN"
@@ -604,6 +623,8 @@ class PhantomVpnService : VpnService() {
         private const val KEY_TX_BYTES = "vpn_tx_bytes"
         private const val KEY_RX_BYTES = "vpn_rx_bytes"
         private const val KEY_STARTED_AT_MS = "vpn_started_at_ms"
+        private const val KEY_DATA_PLANE_FAILURE_EPOCH = "vpn_data_plane_failure_epoch"
+        private const val KEY_DATA_PLANE_FAILURE_REASON = "vpn_data_plane_failure_reason"
         private const val EXTRA_HOST = "extra_host"
         private const val EXTRA_PORT = "extra_port"
         private const val EXTRA_LOCAL_PORT = "extra_local_port"  // ICE 打洞端口
@@ -717,6 +738,17 @@ class PhantomVpnService : VpnService() {
         fun isOverlayReady(context: Context): Boolean = context
             .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .getBoolean(KEY_OVERLAY_READY, false)
+
+        /**
+         * 读取最近一次数据面异常复位的时间戳（ms，0 表示从未发生）与原因。
+         * AppViewModel 在下发 P2P/中继数据面后据此轮询，一旦时间戳晚于下发时刻，
+         * 说明数据面已异常复位，需要结束"连接中"loading 并提示用户，而不是无限挂起。
+         */
+        fun readDataPlaneFailure(context: Context): Pair<Long, String> {
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            return prefs.getLong(KEY_DATA_PLANE_FAILURE_EPOCH, 0L) to
+                prefs.getString(KEY_DATA_PLANE_FAILURE_REASON, "").orEmpty()
+        }
 
         fun readRuntimeStats(context: Context): RuntimeStats {
             val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
