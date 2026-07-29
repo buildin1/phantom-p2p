@@ -88,6 +88,8 @@ const state = {
   monitoringBusy: false,
   diagBusy: false,
   lastStatsErr: "",
+  /** 处于自建/第三方信令模式下，最近一次信令连接是否失败（用于展示"恢复使用官方服务器"按钮） */
+  customConnectFailed: false,
   diagProgress: {
     value: 0,
     stage: "待命",
@@ -474,6 +476,53 @@ function updateNetworkModeBanner() {
       : maskSignalUrl(state.settings.signal);
     addrEl.textContent = `(${displayAddr})`;
   }
+
+  const recoverBtn = $("networkModeRecoverBtn");
+  if (recoverBtn) recoverBtn.hidden = !state.customConnectFailed;
+}
+
+/**
+ * 记录自建/第三方信令模式下的连接结果，用于控制"恢复使用官方服务器"按钮的显隐。
+ * 仅在非官方地址下才会置位失败标记；官方地址下的失败走普通错误提示，不引导"恢复官方"。
+ */
+function markCustomConnectResult(success) {
+  if (isOfficialSignal(state.settings?.signal)) {
+    state.customConnectFailed = false;
+    return;
+  }
+  state.customConnectFailed = !success;
+  refresh();
+}
+
+/**
+ * 恢复使用官方信令服务器：仅在用户主动点击时触发（不做自动无感知切换）。
+ * 这是"回到官方"方向，不涉及离开官方网络的风险，因此不需要走自建确认弹窗。
+ */
+async function revertToOfficialServer() {
+  state.settings = { ...state.settings, signal: OFFICIAL_SIGNAL_SERVER };
+
+  const cfg = state.config || {};
+  cfg.signal_server = OFFICIAL_SIGNAL_SERVER;
+  state.config = cfg;
+
+  try {
+    await invoke("save_config", { config: cfg });
+    addLog("已恢复为官方信令服务器", "INFO", "system");
+    toast("已切换回官方服务器，正在重新连接...", "info");
+  } catch (err) {
+    addLog(`恢复官方服务器配置保存失败: ${err}`, "ERROR", "system");
+    toast(`保存失败: ${err}`, "error", 2200);
+  }
+
+  state.customConnectFailed = false;
+  applySettingsToForm();
+  refresh();
+
+  // 主动重新连接一次
+  state.connected = false;
+  state.authenticated = false;
+  await ensureConnected();
+  refresh();
 }
 
 function addLog(message, level = "INFO", module = "system") {
@@ -913,9 +962,11 @@ async function ensureConnected() {
       const ok = await waitForAuth(5000);
       if (!ok) {
         addLog("认证超时，请重试", "ERROR", "system");
+        markCustomConnectResult(false);
         return false;
       }
     }
+    markCustomConnectResult(true);
     return true;
   }
   try {
@@ -925,11 +976,14 @@ async function ensureConnected() {
     const ok = await waitForAuth(5000);
     if (!ok) {
       addLog("认证超时，请重试", "ERROR", "system");
+      markCustomConnectResult(false);
       return false;
     }
+    markCustomConnectResult(true);
     return true;
   } catch (err) {
     addLog(`连接信令失败: ${err}`, "ERROR", "system");
+    markCustomConnectResult(false);
     return false;
   }
 }
@@ -1380,6 +1434,11 @@ function bindActions() {
   });
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") closeCustomServerDialog(false);
+  });
+
+  // 持续可见横幅上的"恢复使用官方服务器"按钮：仅在自建模式下连接失败时出现，需用户主动点击
+  $("networkModeRecoverBtn")?.addEventListener("click", () => {
+    revertToOfficialServer();
   });
 
   $("requestFixedIpBtn")?.addEventListener("click", async () => {
