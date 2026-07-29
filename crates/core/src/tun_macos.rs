@@ -187,7 +187,8 @@ impl PlatformTun {
         let (fd, actual_name) = open_utun()?;
         set_nonblocking(&fd)?;
         let async_fd = Arc::new(
-            AsyncFd::new(fd).map_err(|e| TunError::CreateFailed(format!("AsyncFd failed: {}", e)))?,
+            AsyncFd::new(fd)
+                .map_err(|e| TunError::CreateFailed(format!("AsyncFd failed: {}", e)))?,
         );
 
         // utun interfaces are point-to-point by kernel default; assigning
@@ -206,10 +207,7 @@ impl PlatformTun {
                 "up",
             ],
         )?;
-        run_command(
-            "ifconfig",
-            &[&actual_name, "mtu", &mtu.to_string()],
-        )?;
+        run_command("ifconfig", &[&actual_name, "mtu", &mtu.to_string()])?;
 
         tracing::info!(
             "[TUN] macOS device ready: {} (requested name={}) {}/{} mtu={}",

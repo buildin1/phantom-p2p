@@ -71,7 +71,11 @@ fn spawn_peer_forwarder(sender: Arc<Mutex<SendStream>>) -> PeerForwarder {
             match tokio::time::timeout(PEER_WRITE_TIMEOUT, write).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
-                    warn!("[TUN] peer stream write failed ({} bytes): {}", packet.len(), e);
+                    warn!(
+                        "[TUN] peer stream write failed ({} bytes): {}",
+                        packet.len(),
+                        e
+                    );
                     // The stream is likely broken beyond recovery; stop this
                     // forwarder so future sends are dropped immediately
                     // instead of queueing behind a dead connection.
