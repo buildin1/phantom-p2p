@@ -54,6 +54,7 @@ data class AppState(
     val hostActive: Boolean = false,
     val guestActive: Boolean = false,
     val isJoining: Boolean = false,  // 正在加入房间（单击连接到 guestActive/失败之间）
+    val isCreating: Boolean = false,  // 正在创建房间（单击创建到 onRoomCreated/失败之间）
     val subnet: String = "",
     val virtualIp: String = "",
     val hostVirtualIp: String = "",
@@ -211,6 +212,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
     // ── Room ──
 
     fun createRoom() {
+        updateState { it.copy(isCreating = true) }
         checkVpnThenRun {
             if (!isSignalAuthenticated()) {
                 pendingAction = PendingAction.CreateRoom
@@ -281,7 +283,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
     /** Activity 收到 VPN 授权拒绝后调用 —— 不保活但仍允许操作（用户自担风险） */
     fun onVpnDenied() {
         pendingVpnAction = null
-        updateState { it.copy(isJoining = false, connectionMode = "VPN 未授权") }
+        updateState { it.copy(isJoining = false, isCreating = false, connectionMode = "VPN 未授权") }
         addLog("用户拒绝 VPN 权限，房间操作未执行", "WARN", "vpn")
         _vpnPermissionNeeded.postValue(null)
     }
@@ -385,6 +387,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
                 isHost = true,
                 hostActive = true,
                 guestActive = false,
+                isCreating = false,
                 subnet = subnet,
                 virtualIp = virtualIp,
                 hostVirtualIp = virtualIp,
@@ -515,7 +518,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
     }
 
     override fun onError(message: String) {
-        updateState { it.copy(isJoining = false) }
+        updateState { it.copy(isJoining = false, isCreating = false) }
         addLog("服务器错误: $message", "ERROR", "system")
     }
 
