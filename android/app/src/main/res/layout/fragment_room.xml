@@ -743,6 +743,48 @@
                 android:layout_height="wrap_content"
                 android:orientation="vertical">
 
+                <!-- 上次房间：一键自动重连入口 -->
+                <LinearLayout
+                    android:id="@+id/lastRoomEntry"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:padding="10dp"
+                    android:layout_marginBottom="12dp"
+                    android:background="@drawable/bg_code_box"
+                    android:visibility="gone">
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:orientation="vertical">
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="上次房间"
+                            android:textColor="@color/textMuted"
+                            android:textSize="11sp" />
+                        <TextView
+                            android:id="@+id/tvLastRoomCode"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="2dp"
+                            android:text="------"
+                            android:textColor="@color/textMain"
+                            android:textSize="18sp"
+                            android:textStyle="bold"
+                            android:fontFamily="monospace" />
+                    </LinearLayout>
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnAutoJoinLastRoom"
+                        style="@style/Widget.Phantom.Button.Outlined"
+                        android:layout_width="wrap_content"
+                        android:layout_height="40dp"
+                        android:text="一键连接"
+                        android:textSize="12sp" />
+                </LinearLayout>
+
                 <!-- 6-box room code input -->
                 <LinearLayout
                     android:layout_width="match_parent"

@@ -85,6 +85,9 @@ data class AppState(
 
 const val USER_MODE_LOCKED_SIGNAL = "ws://qx.coreyuan.cn:10112/ws"
 
+/** 房间号持久化 key，写入 phantom_settings SharedPreferences（参考 IdentityManager 的独立 prefs 写法）。 */
+private const val KEY_LAST_ROOM_CODE = "last_room_code"
+
 class AppViewModel(application: Application) : AndroidViewModel(application), SignalManager.SignalListener {
 
     val identity = IdentityManager(application)
@@ -121,6 +124,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
     val navigateToTab: LiveData<Int?> = _navigateToTab
 
     fun clearNavigateToTab() { _navigateToTab.value = null }
+
+    /** 上次成功加入的房间号（跨进程重启持久化），供 UI 展示"一键连接"入口。 */
+    val lastRoomCode: String?
+        get() = prefs.getString(KEY_LAST_ROOM_CODE, null)
+
+    /** 复用 joinRoom() 逻辑，直接用上次成功加入的房间号重新连接。 */
+    fun autoJoinLastRoom() {
+        val code = lastRoomCode ?: return
+        joinRoom(code)
+    }
 
     private sealed class PendingAction {
         object CreateRoom : PendingAction()
@@ -391,6 +404,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
     }
 
     override fun onJoinOk(roomCode: String, hostSessionId: String, subnet: String, virtualIp: String, hostVirtualIp: String) {
+        prefs.edit().putString(KEY_LAST_ROOM_CODE, roomCode).apply()
         updateState {
             it.copy(
                 roomCode = roomCode,
