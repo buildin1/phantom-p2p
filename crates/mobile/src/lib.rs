@@ -20,8 +20,12 @@ use tokio::sync::mpsc;
 static NEXT_HANDLE: AtomicI64 = AtomicI64::new(1);
 static NEXT_STREAM: AtomicI64 = AtomicI64::new(1);
 static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
+    // 2 个 worker 线程在 relay 场景下容易被同步 JNI 回调（见 ip_packet）和
+    // block_on 调用叠加占满，导致整个 Runtime 上所有连接一起卡死。
+    // 提升到 4 个线程：在典型 Android 设备（4核以上）上开销可接受，
+    // 同时显著降低"两个线程都被阻塞"的概率。
     Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(4)
         .enable_all()
         .thread_name("phantom-mobile")
         .build()
@@ -305,7 +309,11 @@ pub extern "system" fn Java_com_buildin1_phantom_1p2p_data_NativePacketBridge_na
             if recv.read_exact(&mut packet).await.is_err() {
                 break;
             }
-            read_callback.ip_packet(&packet);
+            // ip_packet() 内部是同步阻塞的 JNI 调用（attach_current_thread + call_method），
+            // 直接在 async worker 线程上执行会占用 RUNTIME 的宝贵线程；
+            // 用 spawn_blocking 移到专用阻塞线程池执行，await 该 JoinHandle 不会阻塞 worker。
+            let cb = read_callback.clone();
+            let _ = tokio::task::spawn_blocking(move || cb.ip_packet(&packet)).await;
         }
     });
     if let Some(bridge) = BRIDGES.lock().get_mut(&(handle as i64)) {
@@ -560,7 +568,9 @@ async fn accept_inbound_streams(
                     if recv.read_exact(&mut packet).await.is_err() {
                         break;
                     }
-                    read_callback.ip_packet(&packet);
+                    // 同上：避免同步 JNI 回调阻塞 async worker 线程。
+                    let cb = read_callback.clone();
+                    let _ = tokio::task::spawn_blocking(move || cb.ip_packet(&packet)).await;
                 }
             });
             continue;
