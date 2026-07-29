@@ -733,4 +733,72 @@ mod tests {
         assert!(!is_pip1_stream(b"\0\0\x27\x15"));
         assert!(!is_pip1_stream(b"PIP2"));
     }
+
+    /// End-to-end smoke test for the UDP relay's core forwarding path:
+    /// two "clients" bind real loopback sockets, perform the PPTK token
+    /// handshake against a live `start_udp_relay` instance, and exchange a
+    /// packet through it in both directions. This exercises the exact code
+    /// path `server/src/main.rs` wires up for real Host/Guest UDP sessions,
+    /// without needing a full client stack or TUN devices.
+    #[tokio::test]
+    async fn udp_relay_forwards_packets_between_registered_peers() {
+        let port_pool = Arc::new(Mutex::new(crate::port_pool::RelayPortPool::new(
+            40000, 40100,
+        )));
+        let mut registry = RelayRegistry::new(port_pool, 60);
+        registry
+            .register_token("smoke-token".to_string())
+            .await
+            .expect("port pool should have room for one token");
+        let registry: SharedRegistry = Arc::new(Mutex::new(registry));
+
+        // Bind the relay itself on an OS-assigned loopback port so the test
+        // cannot collide with another instance running concurrently.
+        let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_port = probe.local_addr().unwrap().port();
+        drop(probe);
+        start_udp_relay(relay_port, registry.clone())
+            .await
+            .expect("relay should bind its UDP socket");
+        let relay_addr: SocketAddr = format!("127.0.0.1:{relay_port}").parse().unwrap();
+
+        let host_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let guest_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let mut token_packet = UDP_TOKEN_MAGIC.to_vec();
+        token_packet.extend_from_slice(b"smoke-token");
+
+        // Host registers first (alone in the token's client list, so it does
+        // not get a route yet), then the guest joins (crossing the >= 2
+        // threshold that unlocks routing for whoever sends after that
+        // point). Real clients keep resending this handshake packet as a
+        // keepalive, so the host re-sends once more to pick up its route --
+        // mirroring how the production Host/Guest UDP session comes up.
+        host_sock.send_to(&token_packet, relay_addr).await.unwrap();
+        guest_sock.send_to(&token_packet, relay_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        host_sock.send_to(&token_packet, relay_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        host_sock
+            .send_to(b"ping-payload", relay_addr)
+            .await
+            .unwrap();
+        let mut buf = [0u8; 128];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), guest_sock.recv_from(&mut buf))
+            .await
+            .expect("guest did not receive the forwarded packet in time")
+            .unwrap();
+        assert_eq!(&buf[..n], b"ping-payload");
+
+        guest_sock
+            .send_to(b"pong-payload", relay_addr)
+            .await
+            .unwrap();
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), host_sock.recv_from(&mut buf))
+            .await
+            .expect("host did not receive the forwarded packet in time")
+            .unwrap();
+        assert_eq!(&buf[..n], b"pong-payload");
+    }
 }

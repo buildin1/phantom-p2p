@@ -46,6 +46,7 @@ jobs:
       - run: npm run version:check
       - run: cargo fmt --all -- --check
       - run: cargo check --locked --workspace --exclude phantom-p2p
+      - run: cargo test --locked --workspace --exclude phantom-p2p
 
   windows-x64:
     name: Windows x64
