@@ -295,6 +295,11 @@ pub struct PlatformTun {
     /// 用于向接收线程发送退出信号
     quit_event: Mutex<Option<std::mem::ManuallyDrop<*mut c_void>>>,
     closed: AtomicBool,
+    /// Wakes any task parked in `read_packet` (waiting on `packet_rx`) or
+    /// `write_packet` (waiting on the injection thread) so `close()` returns
+    /// its callers promptly instead of leaving them blocked until unrelated
+    /// traffic arrives.
+    close_notify: tokio::sync::Notify,
 }
 
 enum InjectCommand {
@@ -490,6 +495,7 @@ impl PlatformTun {
             inject_thread: Mutex::new(Some(inject_thread)),
             quit_event: Mutex::new(Some(std::mem::ManuallyDrop::new(quit_event))),
             closed: AtomicBool::new(false),
+            close_notify: tokio::sync::Notify::new(),
         })
     }
 
@@ -499,13 +505,16 @@ impl PlatformTun {
             return Err(TunError::ReadFailed("设备已关闭".into()));
         }
 
-        let data = self
-            .packet_rx
-            .lock()
-            .await
-            .recv()
-            .await
-            .ok_or_else(|| TunError::ReadFailed("接收通道已关闭".into()))?;
+        let mut rx = self.packet_rx.lock().await;
+        let data = tokio::select! {
+            data = rx.recv() => {
+                data.ok_or_else(|| TunError::ReadFailed("接收通道已关闭".into()))?
+            }
+            _ = self.close_notify.notified() => {
+                return Err(TunError::ReadFailed("设备已关闭".into()));
+            }
+        };
+        drop(rx);
 
         let len = data.len();
         if buf.len() < len {
@@ -529,8 +538,14 @@ impl PlatformTun {
             })
             .map_err(|_| TunError::WriteFailed("Wintun injection thread stopped".into()))?;
 
-        rx.await
-            .map_err(|e| TunError::WriteFailed(format!("Wintun injection interrupted: {}", e)))?
+        tokio::select! {
+            result = rx => {
+                result.map_err(|e| TunError::WriteFailed(format!("Wintun injection interrupted: {}", e)))?
+            }
+            _ = self.close_notify.notified() => {
+                Err(TunError::WriteFailed("device is closed".into()))
+            }
+        }
     }
 
     pub fn name(&self) -> String {
@@ -561,6 +576,9 @@ impl PlatformTun {
         if self.closed.swap(true, Ordering::Relaxed) {
             return;
         }
+        // Wake any task parked in read_packet/write_packet immediately;
+        // the rest of teardown below can take a moment (thread joins).
+        self.close_notify.notify_waiters();
 
         // The writer owns the raw session pointer and must exit before the
         // Wintun session is ended below.

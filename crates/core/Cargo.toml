@@ -27,3 +27,6 @@ socket2 = { version = "0.5", features = ["all"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
