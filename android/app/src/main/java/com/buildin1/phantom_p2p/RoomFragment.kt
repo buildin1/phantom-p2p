@@ -44,7 +44,9 @@ class RoomFragment : Fragment() {
         binding.advancedPanel.visibility = View.GONE
         binding.inlineHostIpCard.visibility = View.GONE
         binding.topHostIpCard.visibility = View.VISIBLE
-        savedRoomCode.take(6).forEachIndexed { index, char -> codeBoxes[index].setText(char.toString()) }
+        val prefillCode = savedRoomCode.ifBlank { viewModel.lastRoomCode.orEmpty() }
+        prefillCode.take(6).forEachIndexed { index, char -> codeBoxes[index].setText(char.toString()) }
+        updateLastRoomEntry()
     }
 
     private fun setupCodeBoxes() {
@@ -93,6 +95,13 @@ class RoomFragment : Fragment() {
             Toast.makeText(requireContext(), "房间码已复制", Toast.LENGTH_SHORT).show()
         }
         binding.btnCloseRoom.setOnClickListener { viewModel.closeRoom() }
+        binding.btnAutoJoinLastRoom.setOnClickListener {
+            val code = viewModel.lastRoomCode ?: return@setOnClickListener
+            suppressWatcher = true
+            code.take(6).forEachIndexed { index, char -> codeBoxes[index].setText(char.toString()) }
+            suppressWatcher = false
+            viewModel.autoJoinLastRoom()
+        }
         val fixedIpClick = View.OnClickListener {
             val fixedIp = viewModel.state.value?.fixedHostIp
             if (fixedIp == null) {
@@ -126,6 +135,9 @@ class RoomFragment : Fragment() {
                 }
             }
             binding.btnJoinRoom.isEnabled = !state.isJoining && !state.guestActive
+            updateLastRoomEntry()
+            binding.creatingStateContent.visibility = if (state.isCreating) View.VISIBLE else View.GONE
+            binding.btnCreateRoom.isEnabled = !state.isCreating
             binding.tvRoomCode.text = state.roomCode ?: "------"
             binding.tvTransportBadge.text = state.connectionMode.ifBlank { "等待连接" }
             val roomActive = state.roomCode != null
@@ -153,6 +165,16 @@ class RoomFragment : Fragment() {
             binding.tvTopHostVirtualIp.text = hostIp
             binding.tvTopHostIpMode.text = ipMode
         }
+    }
+
+    /** 展示/隐藏"上次房间：一键连接"入口。仅在不处于加入流程中且存在持久化房间号时显示。 */
+    private fun updateLastRoomEntry() {
+        if (_binding == null) return
+        val last = viewModel.lastRoomCode
+        val joining = viewModel.state.value?.isJoining == true
+        val show = !last.isNullOrBlank() && !joining
+        binding.lastRoomEntry.visibility = if (show) View.VISIBLE else View.GONE
+        binding.tvLastRoomCode.text = last ?: "------"
     }
 
     private fun setupKeyboardInsets() {
