@@ -9,6 +9,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::unix::AsyncFd;
+use tokio::sync::Notify;
 
 const IFNAMSIZ: usize = 16;
 const IFF_TUN: libc::c_short = 0x0001;
@@ -27,6 +28,11 @@ pub struct PlatformTun {
     address: Ipv4Addr,
     fd: Arc<AsyncFd<OwnedFd>>,
     closed: AtomicBool,
+    /// Wakes any task parked in `read_packet`/`write_packet` waiting on the
+    /// fd so that `close()` can return promptly instead of leaving the
+    /// reader blocked on `AsyncFd::readable()` until unrelated traffic
+    /// arrives (or never, if the peer is gone).
+    close_notify: Notify,
 }
 
 impl PlatformTun {
@@ -102,6 +108,7 @@ impl PlatformTun {
             address,
             fd: async_fd,
             closed: AtomicBool::new(false),
+            close_notify: Notify::new(),
         })
     }
 
@@ -110,11 +117,12 @@ impl PlatformTun {
             if self.closed.load(Ordering::Relaxed) {
                 return Err(TunError::ReadFailed("device is closed".into()));
             }
-            let mut guard = self
-                .fd
-                .readable()
-                .await
-                .map_err(|e| TunError::ReadFailed(e.to_string()))?;
+            let mut guard = tokio::select! {
+                r = self.fd.readable() => r.map_err(|e| TunError::ReadFailed(e.to_string()))?,
+                _ = self.close_notify.notified() => {
+                    return Err(TunError::ReadFailed("device is closed".into()));
+                }
+            };
             match guard.try_io(|inner| {
                 let n = unsafe {
                     libc::read(
@@ -142,11 +150,12 @@ impl PlatformTun {
             if self.closed.load(Ordering::Relaxed) {
                 return Err(TunError::WriteFailed("device is closed".into()));
             }
-            let mut guard = self
-                .fd
-                .writable()
-                .await
-                .map_err(|e| TunError::WriteFailed(e.to_string()))?;
+            let mut guard = tokio::select! {
+                r = self.fd.writable() => r.map_err(|e| TunError::WriteFailed(e.to_string()))?,
+                _ = self.close_notify.notified() => {
+                    return Err(TunError::WriteFailed("device is closed".into()));
+                }
+            };
             match guard.try_io(|inner| {
                 let n = unsafe {
                     libc::write(inner.get_ref().as_raw_fd(), buf.as_ptr().cast(), buf.len())
@@ -186,6 +195,10 @@ impl PlatformTun {
 
     pub async fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
+        // Wake any task currently parked in read_packet/write_packet so it
+        // observes the closed flag and returns immediately instead of
+        // waiting indefinitely for the fd to become ready.
+        self.close_notify.notify_waiters();
     }
 }
 
