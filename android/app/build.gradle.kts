@@ -6,6 +6,25 @@ plugins {
 val phantomVersion = groovy.json.JsonSlurper()
     .parseText(rootProject.file("../version.json").readText()) as Map<*, *>
 
+// 官方信令服务器地址：单一配置源在项目根目录 official.env（纯 KEY=VALUE，无需额外解析库）。
+// 编译期注入到 BuildConfig.OFFICIAL_SIGNAL_SERVER，Android 侧不再手写字面量。
+val officialEnvFile = rootProject.file("../official.env")
+val officialEnv: Map<String, String> = if (officialEnvFile.isFile) {
+    officialEnvFile.readLines()
+        .map { it.trim() }
+        .filter { it.isNotEmpty() && !it.startsWith("#") && it.contains("=") }
+        .associate { line ->
+            val idx = line.indexOf('=')
+            line.substring(0, idx).trim() to line.substring(idx + 1).trim()
+        }
+} else {
+    emptyMap()
+}
+val officialSignalScheme = officialEnv["OFFICIAL_SIGNAL_SCHEME"] ?: "ws"
+val officialSignalHost = officialEnv["OFFICIAL_SIGNAL_HOST"] ?: "qx.coreyuan.cn"
+val officialSignalPort = officialEnv["OFFICIAL_SIGNAL_PORT"] ?: "10112"
+val officialSignalServer = "$officialSignalScheme://$officialSignalHost:$officialSignalPort/ws"
+
 // macOS 外置卷会产生 ._* 资源叉文件，在每次构建前自动清理
 tasks.configureEach {
     doFirst {
@@ -29,6 +48,8 @@ android {
         versionName = phantomVersion["version"] as String
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        buildConfigField("String", "OFFICIAL_SIGNAL_SERVER", "\"$officialSignalServer\"")
     }
 
     buildTypes {

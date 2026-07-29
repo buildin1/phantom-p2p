@@ -84,7 +84,8 @@ data class AppState(
     val diagProgressMsg: String = ""
 )
 
-const val USER_MODE_LOCKED_SIGNAL = "ws://qx.coreyuan.cn:10112/ws"
+// 编译期从项目根目录 official.env 注入（见 app/build.gradle.kts），不再手写字面量。
+val USER_MODE_LOCKED_SIGNAL: String = BuildConfig.OFFICIAL_SIGNAL_SERVER
 
 /** 房间号持久化 key，写入 phantom_settings SharedPreferences（参考 IdentityManager 的独立 prefs 写法）。 */
 private const val KEY_LAST_ROOM_CODE = "last_room_code"
