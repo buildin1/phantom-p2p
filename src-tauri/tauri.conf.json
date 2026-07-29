@@ -27,9 +27,22 @@
   },
   "bundle": {
     "active": true,
-    "targets": [
-      "nsis"
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
     ],
+    "category": "Utility",
+    "shortDescription": "幻梦P2P - 游戏联机隧道",
+    "longDescription": "幻梦P2P 是一个基于 P2P 打洞技术的游戏联机加速工具，支持跨网络虚拟局域网联机。",
+    "macOS": {
+      "minimumSystemVersion": "10.15",
+      "entitlements": "entitlements.plist",
+      "hardenedRuntime": true
+    },
     "windows": {
       "webviewInstallMode": {
         "type": "embedBootstrapper",
