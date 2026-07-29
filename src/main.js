@@ -459,6 +459,23 @@ function confirmCustomServer() {
   });
 }
 
+/** 顶部持续可见的"自建网络模式"横幅：只要生效的信令地址不是官方地址就一直显示 */
+function updateNetworkModeBanner() {
+  const banner = $("networkModeBanner");
+  if (!banner) return;
+  const custom = !isOfficialSignal(state.settings?.signal);
+  banner.hidden = !custom;
+  if (!custom) return;
+
+  const addrEl = $("networkModeBannerAddr");
+  if (addrEl) {
+    const displayAddr = state.isDevMode
+      ? state.settings.signal
+      : maskSignalUrl(state.settings.signal);
+    addrEl.textContent = `(${displayAddr})`;
+  }
+}
+
 function addLog(message, level = "INFO", module = "system") {
   if (level === "INFO" && module !== "system" && !state.flags.verbose) return;
 
@@ -776,6 +793,7 @@ function renderLogs() {
 }
 
 function refresh() {
+  updateNetworkModeBanner();
   updateActionButtons();
   updateSidebar();
   renderPlayers();
