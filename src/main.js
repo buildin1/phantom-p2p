@@ -49,8 +49,21 @@ const $ = (id) => document.getElementById(id);
 const MAX_POINTS = 60;
 const LOG_LIMIT = 400;
 const FLOW_STEPS = ["STUN 探测", "信令交换", "UDP 打洞", "隧道启动"];
+
+// 编译期注入的官方信令服务器地址（见 vite.config.js / official.env）。
+// 仅用简单字符串比较区分"官方网络"与"自建/第三方网络"，不做密码学身份校验（后续任务）。
+const OFFICIAL_SIGNAL_SERVER =
+  typeof __OFFICIAL_SIGNAL_SERVER__ !== "undefined" && __OFFICIAL_SIGNAL_SERVER__
+    ? __OFFICIAL_SIGNAL_SERVER__
+    : "ws://qx.coreyuan.cn:10112";
+
+/** 当前地址是否为官方信令服务器（简单字符串比较，不做证书/签名校验） */
+function isOfficialSignal(url) {
+  return String(url || "").trim() === OFFICIAL_SIGNAL_SERVER;
+}
+
 const DEFAULT_SETTINGS = {
-  signal: "ws://qx.coreyuan.cn:10112",
+  signal: OFFICIAL_SIGNAL_SERVER,
   timeout: 8
 };
 
