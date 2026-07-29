@@ -6,6 +6,8 @@ import path from "node:path";
 
 // 读取根目录 official.env，拼出官方信令地址，编译期注入到前端常量
 // __OFFICIAL_SIGNAL_SERVER__ 里，避免在 src/main.js 里重复手写字面量。
+// official.env 已提交入库（唯一真源），本地开发/CI 中始终存在；缺失视为配置错误直接报错，
+// 避免静默回退到可能过期的硬编码地址。
 function readOfficialSignalServer() {
   const rootDir = path.dirname(fileURLToPath(import.meta.url));
   const envPath = path.join(rootDir, "official.env");

@@ -49,8 +49,21 @@ const $ = (id) => document.getElementById(id);
 const MAX_POINTS = 60;
 const LOG_LIMIT = 400;
 const FLOW_STEPS = ["STUN 探测", "信令交换", "UDP 打洞", "隧道启动"];
+
+// 编译期注入的官方信令服务器地址（见 vite.config.js / official.env）。
+// 仅用简单字符串比较区分"官方网络"与"自建/第三方网络"，不做密码学身份校验（后续任务）。
+const OFFICIAL_SIGNAL_SERVER =
+  typeof __OFFICIAL_SIGNAL_SERVER__ !== "undefined" && __OFFICIAL_SIGNAL_SERVER__
+    ? __OFFICIAL_SIGNAL_SERVER__
+    : "ws://qx.coreyuan.cn:10112";
+
+/** 当前地址是否为官方信令服务器（简单字符串比较，不做证书/签名校验） */
+function isOfficialSignal(url) {
+  return String(url || "").trim() === OFFICIAL_SIGNAL_SERVER;
+}
+
 const DEFAULT_SETTINGS = {
-  signal: __OFFICIAL_SIGNAL_SERVER__,
+  signal: OFFICIAL_SIGNAL_SERVER,
   timeout: 8
 };
 
@@ -75,6 +88,8 @@ const state = {
   monitoringBusy: false,
   diagBusy: false,
   lastStatsErr: "",
+  /** 处于自建/第三方信令模式下，最近一次信令连接是否失败（用于展示"恢复使用官方服务器"按钮） */
+  customConnectFailed: false,
   diagProgress: {
     value: 0,
     stage: "待命",
@@ -407,6 +422,109 @@ function confirmInApp({ title, message, confirmText = "确认" }) {
   });
 }
 
+let customServerResolver = null;
+
+function closeCustomServerDialog(accepted) {
+  const modal = $("customServerModal");
+  if (!modal || modal.hidden) return;
+  modal.classList.remove("open");
+  const resolve = customServerResolver;
+  customServerResolver = null;
+  setTimeout(() => {
+    modal.hidden = true;
+    resolve?.(accepted);
+  }, 160);
+}
+
+/**
+ * 切换到自建/第三方信令服务器前的强确认弹窗。
+ * 用户必须勾选风险确认复选框后，"确认切换"按钮才会启用；不勾选则无法通过点击跳过。
+ * 返回 true 表示用户已完成确认流程，可以继续保存新地址；false 表示取消。
+ */
+function confirmCustomServer() {
+  const modal = $("customServerModal");
+  if (!modal) return Promise.resolve(false);
+  if (customServerResolver) closeCustomServerDialog(false);
+
+  const ackBox = $("customServerAckBox");
+  const acceptBtn = $("customServerAcceptBtn");
+  if (ackBox) ackBox.checked = false;
+  if (acceptBtn) acceptBtn.disabled = true;
+
+  modal.hidden = false;
+  requestAnimationFrame(() => {
+    modal.classList.add("open");
+    ackBox?.focus();
+  });
+  return new Promise((resolve) => {
+    customServerResolver = resolve;
+  });
+}
+
+/** 顶部持续可见的"自建网络模式"横幅：只要生效的信令地址不是官方地址就一直显示 */
+function updateNetworkModeBanner() {
+  const banner = $("networkModeBanner");
+  if (!banner) return;
+  const custom = !isOfficialSignal(state.settings?.signal);
+  banner.hidden = !custom;
+  if (!custom) return;
+
+  const addrEl = $("networkModeBannerAddr");
+  if (addrEl) {
+    const displayAddr = state.isDevMode
+      ? state.settings.signal
+      : maskSignalUrl(state.settings.signal);
+    addrEl.textContent = `(${displayAddr})`;
+  }
+
+  const recoverBtn = $("networkModeRecoverBtn");
+  if (recoverBtn) recoverBtn.hidden = !state.customConnectFailed;
+}
+
+/**
+ * 记录自建/第三方信令模式下的连接结果，用于控制"恢复使用官方服务器"按钮的显隐。
+ * 仅在非官方地址下才会置位失败标记；官方地址下的失败走普通错误提示，不引导"恢复官方"。
+ */
+function markCustomConnectResult(success) {
+  if (isOfficialSignal(state.settings?.signal)) {
+    state.customConnectFailed = false;
+    return;
+  }
+  state.customConnectFailed = !success;
+  refresh();
+}
+
+/**
+ * 恢复使用官方信令服务器：仅在用户主动点击时触发（不做自动无感知切换）。
+ * 这是"回到官方"方向，不涉及离开官方网络的风险，因此不需要走自建确认弹窗。
+ */
+async function revertToOfficialServer() {
+  state.settings = { ...state.settings, signal: OFFICIAL_SIGNAL_SERVER };
+
+  const cfg = state.config || {};
+  cfg.signal_server = OFFICIAL_SIGNAL_SERVER;
+  state.config = cfg;
+
+  try {
+    await invoke("save_config", { config: cfg });
+    addLog("已恢复为官方信令服务器", "INFO", "system");
+    toast("已切换回官方服务器，正在重新连接...", "info");
+  } catch (err) {
+    addLog(`恢复官方服务器配置保存失败: ${err}`, "ERROR", "system");
+    toast(`保存失败: ${err}`, "error", 2200);
+  }
+
+  state.customConnectFailed = false;
+  applySettingsToForm();
+  refresh();
+
+  // 主动重新连接一次
+  state.connected = false;
+  state.authenticated = false;
+  await ensureConnected();
+  refresh();
+}
+
 function addLog(message, level = "INFO", module = "system") {
   if (level === "INFO" && module !== "system" && !state.flags.verbose) return;
 
@@ -724,6 +842,7 @@ function renderLogs() {
 }
 
 function refresh() {
+  updateNetworkModeBanner();
   updateActionButtons();
   updateSidebar();
   renderPlayers();
@@ -843,9 +962,11 @@ async function ensureConnected() {
       const ok = await waitForAuth(5000);
       if (!ok) {
         addLog("认证超时，请重试", "ERROR", "system");
+        markCustomConnectResult(false);
         return false;
       }
     }
+    markCustomConnectResult(true);
     return true;
   }
   try {
@@ -855,11 +976,14 @@ async function ensureConnected() {
     const ok = await waitForAuth(5000);
     if (!ok) {
       addLog("认证超时，请重试", "ERROR", "system");
+      markCustomConnectResult(false);
       return false;
     }
+    markCustomConnectResult(true);
     return true;
   } catch (err) {
     addLog(`连接信令失败: ${err}`, "ERROR", "system");
+    markCustomConnectResult(false);
     return false;
   }
 }
@@ -993,6 +1117,17 @@ async function saveSettings() {
     addLog("保存失败: 超时阈值应在 2-60 秒", "ERROR", "system");
     toast("保存失败：超时阈值应在 2-60 秒", "error");
     return;
+  }
+
+  // 用户把信令地址改成了非官方地址：必须先完成强确认（勾选风险复选框）才能生效保存。
+  // "改回官方地址"这个方向不涉及离开官方网络的风险，不需要走这个确认流程。
+  const changingToCustom = signal !== state.settings.signal && !isOfficialSignal(signal);
+  if (changingToCustom) {
+    const confirmed = await confirmCustomServer();
+    if (!confirmed) {
+      addLog("已取消切换到自定义信令服务器", "WARN", "system");
+      return;
+    }
   }
 
   state.settings = { signal, timeout };
@@ -1282,6 +1417,28 @@ function bindActions() {
   });
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") closeConfirmDialog(false);
+  });
+
+  // 自建/第三方信令服务器风险确认弹窗：必须勾选复选框后"确认切换"按钮才可点击
+  $("customServerAckBox")?.addEventListener("change", (event) => {
+    const acceptBtn = $("customServerAcceptBtn");
+    if (acceptBtn) acceptBtn.disabled = !event.target.checked;
+  });
+  $("customServerCancelBtn")?.addEventListener("click", () => closeCustomServerDialog(false));
+  $("customServerAcceptBtn")?.addEventListener("click", () => {
+    if ($("customServerAcceptBtn")?.disabled) return;
+    closeCustomServerDialog(true);
+  });
+  $("customServerModal")?.addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) closeCustomServerDialog(false);
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeCustomServerDialog(false);
+  });
+
+  // 持续可见横幅上的"恢复使用官方服务器"按钮：仅在自建模式下连接失败时出现，需用户主动点击
+  $("networkModeRecoverBtn")?.addEventListener("click", () => {
+    revertToOfficialServer();
   });
 
   $("requestFixedIpBtn")?.addEventListener("click", async () => {
