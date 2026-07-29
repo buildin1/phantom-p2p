@@ -842,6 +842,107 @@
       height: 38px;
     }
 
+    .confirm-dialog.warn-dialog {
+      border-color: rgba(242, 169, 74, 0.45);
+    }
+
+    .confirm-dialog .risk-ack {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      padding: 10px 12px;
+      border-radius: var(--r-md);
+      border: 1px solid rgba(242, 169, 74, 0.35);
+      background: rgba(242, 169, 74, 0.08);
+      cursor: pointer;
+    }
+
+    .confirm-dialog .risk-ack input[type="checkbox"] {
+      margin-top: 2px;
+      width: 16px;
+      height: 16px;
+      accent-color: var(--warn);
+      flex: none;
+      cursor: pointer;
+    }
+
+    .confirm-dialog .risk-ack span {
+      font-size: 12.5px;
+      line-height: 1.6;
+      color: var(--text);
+      user-select: none;
+    }
+
+    /* 自建网络模式：持续可见的顶部横幅（非一次性提示，只要信令地址不是官方地址就一直显示） */
+    .network-mode-banner {
+      position: relative;
+      z-index: 2;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 16px;
+      background: rgba(242, 169, 74, 0.14);
+      border-bottom: 1px solid rgba(242, 169, 74, 0.4);
+      color: var(--warn);
+      font-size: 12.5px;
+      font-weight: 600;
+      line-height: 1.5;
+    }
+
+    .network-mode-banner[hidden] {
+      display: none !important;
+    }
+
+    .network-mode-banner .badge {
+      flex: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 2px 9px;
+      border-radius: 999px;
+      background: rgba(242, 169, 74, 0.22);
+      border: 1px solid rgba(242, 169, 74, 0.5);
+      font-weight: 800;
+      letter-spacing: 0.02em;
+    }
+
+    .network-mode-banner .addr {
+      color: var(--text-soft);
+      font-weight: 500;
+      overflow-wrap: anywhere;
+    }
+
+    .network-mode-banner .spacer {
+      flex: 1;
+    }
+
+    .network-mode-banner .recover-btn {
+      flex: none;
+      height: 26px;
+      padding: 0 12px;
+      border-radius: 999px;
+      border: 1px solid rgba(242, 169, 74, 0.55);
+      background: rgba(242, 169, 74, 0.9);
+      color: #241605;
+      font-size: 12px;
+      font-weight: 800;
+      cursor: pointer;
+      transition: transform 120ms ease, opacity 120ms ease;
+    }
+
+    .network-mode-banner .recover-btn:hover {
+      transform: translateY(-1px);
+    }
+
+    .network-mode-banner .recover-btn[hidden] {
+      display: none !important;
+    }
+
+    body.theme-light .network-mode-banner {
+      background: rgba(232, 154, 62, 0.14);
+      border-bottom-color: rgba(232, 154, 62, 0.4);
+    }
+
     .toast-layer {
       position: relative;
       width: 100%;
@@ -1554,6 +1655,14 @@
       </div>
     </header>
 
+    <div class="network-mode-banner" id="networkModeBanner" hidden>
+      <span class="badge">⚠ 自建网络模式</span>
+      <span>当前信令地址与官方服务器不同，只能连接同样使用该自建地址的用户，无法与官方网络互通。</span>
+      <span class="addr" id="networkModeBannerAddr"></span>
+      <span class="spacer"></span>
+      <button class="recover-btn" id="networkModeRecoverBtn" hidden>恢复使用官方服务器</button>
+    </div>
+
     <div class="layout">
       <aside class="sidebar">
         <section class="brand">
@@ -1985,6 +2094,24 @@
       <div class="actions">
         <button class="btn sub" id="confirmCancelBtn">取消</button>
         <button class="btn danger" id="confirmAcceptBtn">确认</button>
+      </div>
+    </section>
+  </div>
+  <div class="modal-layer" id="customServerModal" hidden>
+    <section class="confirm-dialog warn-dialog" role="dialog" aria-modal="true" aria-labelledby="customServerTitle" aria-describedby="customServerMessage">
+      <div>
+        <h3 id="customServerTitle">⚠️ 自建服务器提示</h3>
+        <p id="customServerMessage">
+          切换到自定义信令服务器后，你将<strong>无法</strong>加入或被使用官方服务器的用户连接，相当于建立了一个完全独立、互不相通的网络。这不是官方功能，出现任何问题官方不提供支持。
+        </p>
+      </div>
+      <label class="risk-ack" id="customServerAckRow">
+        <input type="checkbox" id="customServerAckBox" />
+        <span>我已了解上述风险，继续使用自定义服务器</span>
+      </label>
+      <div class="actions">
+        <button class="btn sub" id="customServerCancelBtn">取消</button>
+        <button class="btn warn" id="customServerAcceptBtn" disabled>确认切换</button>
       </div>
     </section>
   </div>
