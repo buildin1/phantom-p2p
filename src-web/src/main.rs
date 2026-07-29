@@ -14,8 +14,11 @@ struct Args {
     bind: SocketAddr,
 
     /// Signaling WebSocket URL (developer mode may override the built-in endpoint).
-    #[arg(long, default_value = "ws://qx.coreyuan.cn:10112")]
-    signal: String,
+    /// Defaults to phantom_core::config::USER_MODE_SIGNAL_SERVER when not given
+    /// (resolved in `main`, since clap's `#[arg(default_value = ...)]` needs a
+    /// string literal and can't reference a const from another crate directly).
+    #[arg(long)]
+    signal: Option<String>,
 
     /// Do not create a Host room automatically after authentication.
     #[arg(long)]
@@ -42,7 +45,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Linux TUN requires root or CAP_NET_ADMIN.");
 
     let runtime = runtime::HeadlessRuntime::new(args.bind.port())?;
-    let signal_url = phantom_core::config::runtime_signal_server(&args.signal);
+    let signal_arg = args
+        .signal
+        .unwrap_or_else(|| phantom_core::config::USER_MODE_SIGNAL_SERVER.to_string());
+    let signal_url = phantom_core::config::runtime_signal_server(&signal_arg);
     runtime.start(signal_url, !args.no_auto_room).await;
     web_server::start_web_server(args.bind, runtime).await
 }

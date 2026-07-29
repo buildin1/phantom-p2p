@@ -50,7 +50,7 @@ const MAX_POINTS = 60;
 const LOG_LIMIT = 400;
 const FLOW_STEPS = ["STUN 探测", "信令交换", "UDP 打洞", "隧道启动"];
 const DEFAULT_SETTINGS = {
-  signal: "ws://qx.coreyuan.cn:10112",
+  signal: __OFFICIAL_SIGNAL_SERVER__,
   timeout: 8
 };
 
