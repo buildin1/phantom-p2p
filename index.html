@@ -842,6 +842,37 @@
       height: 38px;
     }
 
+    .confirm-dialog.warn-dialog {
+      border-color: rgba(242, 169, 74, 0.45);
+    }
+
+    .confirm-dialog .risk-ack {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      padding: 10px 12px;
+      border-radius: var(--r-md);
+      border: 1px solid rgba(242, 169, 74, 0.35);
+      background: rgba(242, 169, 74, 0.08);
+      cursor: pointer;
+    }
+
+    .confirm-dialog .risk-ack input[type="checkbox"] {
+      margin-top: 2px;
+      width: 16px;
+      height: 16px;
+      accent-color: var(--warn);
+      flex: none;
+      cursor: pointer;
+    }
+
+    .confirm-dialog .risk-ack span {
+      font-size: 12.5px;
+      line-height: 1.6;
+      color: var(--text);
+      user-select: none;
+    }
+
     .toast-layer {
       position: relative;
       width: 100%;
@@ -1985,6 +2016,24 @@
       <div class="actions">
         <button class="btn sub" id="confirmCancelBtn">取消</button>
         <button class="btn danger" id="confirmAcceptBtn">确认</button>
+      </div>
+    </section>
+  </div>
+  <div class="modal-layer" id="customServerModal" hidden>
+    <section class="confirm-dialog warn-dialog" role="dialog" aria-modal="true" aria-labelledby="customServerTitle" aria-describedby="customServerMessage">
+      <div>
+        <h3 id="customServerTitle">⚠️ 自建服务器提示</h3>
+        <p id="customServerMessage">
+          切换到自定义信令服务器后，你将<strong>无法</strong>加入或被使用官方服务器的用户连接，相当于建立了一个完全独立、互不相通的网络。这不是官方功能，出现任何问题官方不提供支持。
+        </p>
+      </div>
+      <label class="risk-ack" id="customServerAckRow">
+        <input type="checkbox" id="customServerAckBox" />
+        <span>我已了解上述风险，继续使用自定义服务器</span>
+      </label>
+      <div class="actions">
+        <button class="btn sub" id="customServerCancelBtn">取消</button>
+        <button class="btn warn" id="customServerAcceptBtn" disabled>确认切换</button>
       </div>
     </section>
   </div>
