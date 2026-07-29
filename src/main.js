@@ -420,6 +420,45 @@ function confirmInApp({ title, message, confirmText = "确认" }) {
   });
 }
 
+let customServerResolver = null;
+
+function closeCustomServerDialog(accepted) {
+  const modal = $("customServerModal");
+  if (!modal || modal.hidden) return;
+  modal.classList.remove("open");
+  const resolve = customServerResolver;
+  customServerResolver = null;
+  setTimeout(() => {
+    modal.hidden = true;
+    resolve?.(accepted);
+  }, 160);
+}
+
+/**
+ * 切换到自建/第三方信令服务器前的强确认弹窗。
+ * 用户必须勾选风险确认复选框后，"确认切换"按钮才会启用；不勾选则无法通过点击跳过。
+ * 返回 true 表示用户已完成确认流程，可以继续保存新地址；false 表示取消。
+ */
+function confirmCustomServer() {
+  const modal = $("customServerModal");
+  if (!modal) return Promise.resolve(false);
+  if (customServerResolver) closeCustomServerDialog(false);
+
+  const ackBox = $("customServerAckBox");
+  const acceptBtn = $("customServerAcceptBtn");
+  if (ackBox) ackBox.checked = false;
+  if (acceptBtn) acceptBtn.disabled = true;
+
+  modal.hidden = false;
+  requestAnimationFrame(() => {
+    modal.classList.add("open");
+    ackBox?.focus();
+  });
+  return new Promise((resolve) => {
+    customServerResolver = resolve;
+  });
+}
+
 function addLog(message, level = "INFO", module = "system") {
   if (level === "INFO" && module !== "system" && !state.flags.verbose) return;
 
@@ -1008,6 +1047,17 @@ async function saveSettings() {
     return;
   }
 
+  // 用户把信令地址改成了非官方地址：必须先完成强确认（勾选风险复选框）才能生效保存。
+  // "改回官方地址"这个方向不涉及离开官方网络的风险，不需要走这个确认流程。
+  const changingToCustom = signal !== state.settings.signal && !isOfficialSignal(signal);
+  if (changingToCustom) {
+    const confirmed = await confirmCustomServer();
+    if (!confirmed) {
+      addLog("已取消切换到自定义信令服务器", "WARN", "system");
+      return;
+    }
+  }
+
   state.settings = { signal, timeout };
 
   const cfg = state.config || {
@@ -1295,6 +1345,23 @@ function bindActions() {
   });
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") closeConfirmDialog(false);
+  });
+
+  // 自建/第三方信令服务器风险确认弹窗：必须勾选复选框后"确认切换"按钮才可点击
+  $("customServerAckBox")?.addEventListener("change", (event) => {
+    const acceptBtn = $("customServerAcceptBtn");
+    if (acceptBtn) acceptBtn.disabled = !event.target.checked;
+  });
+  $("customServerCancelBtn")?.addEventListener("click", () => closeCustomServerDialog(false));
+  $("customServerAcceptBtn")?.addEventListener("click", () => {
+    if ($("customServerAcceptBtn")?.disabled) return;
+    closeCustomServerDialog(true);
+  });
+  $("customServerModal")?.addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) closeCustomServerDialog(false);
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeCustomServerDialog(false);
   });
 
   $("requestFixedIpBtn")?.addEventListener("click", async () => {
