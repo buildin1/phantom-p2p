@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
 /// 用户模式固定信令地址（不允许被普通用户修改）
-pub const USER_MODE_SIGNAL_SERVER: &str = "ws://qx.coreyuan.cn:10112";
+pub const USER_MODE_SIGNAL_SERVER: &str = env!("OFFICIAL_SIGNAL_SERVER");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
