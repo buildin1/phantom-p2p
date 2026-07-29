@@ -31,7 +31,10 @@ impl Database {
     }
 
     fn init_tables(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS users (
                 user_id TEXT PRIMARY KEY, username TEXT NOT NULL, public_key TEXT,
@@ -83,7 +86,10 @@ impl Database {
     }
 
     pub fn upsert_user(&self, user_id: &str, username: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO users (user_id, username, created_at, last_seen) VALUES (?1, ?2, ?3, ?3)
@@ -94,7 +100,10 @@ impl Database {
     }
 
     pub fn create_room(&self, room_code: &str, host_user_id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO rooms (room_code, host_user_id, created_at) VALUES (?1, ?2, ?3)
@@ -104,7 +113,10 @@ impl Database {
     }
 
     pub fn close_room(&self, room_code: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.execute(
             "UPDATE rooms SET closed_at = ?1 WHERE room_code = ?2",
             rusqlite::params![chrono::Utc::now().to_rfc3339(), room_code],
@@ -113,7 +125,10 @@ impl Database {
     }
 
     pub fn update_guest_count(&self, room_code: &str, count: i32) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.execute(
             "UPDATE rooms SET guest_count = ?1 WHERE room_code = ?2",
             rusqlite::params![count, room_code],
@@ -128,7 +143,10 @@ impl Database {
         event_type: &str,
         details: Option<&str>,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.execute(
             "INSERT INTO connection_logs (user_id, room_code, event_type, timestamp, details) VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params![user_id, room_code.unwrap_or(""), event_type, chrono::Utc::now().to_rfc3339(), details.unwrap_or("")])?;
@@ -136,17 +154,26 @@ impl Database {
     }
 
     pub fn get_user_count(&self) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
     }
 
     pub fn get_room_count(&self) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.query_row("SELECT COUNT(*) FROM rooms", [], |row| row.get(0))
     }
 
     pub fn allocate_subnet(&self, room_code: &str) -> Result<String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = chrono::Utc::now().to_rfc3339();
         if let Ok(existing) = conn.query_row(
             "SELECT subnet FROM room_networks WHERE room_code = ?1 AND released_at IS NULL",
@@ -171,7 +198,10 @@ impl Database {
     }
 
     pub fn get_fixed_host_ip(&self, user_id: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.query_row(
             "SELECT virtual_ip FROM fixed_host_addresses
              WHERE user_id = ?1 AND released_at IS NULL",
@@ -182,7 +212,10 @@ impl Database {
     }
 
     pub fn allocate_fixed_host_ip(&self, user_id: &str) -> Result<String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(existing) = conn
             .query_row(
                 "SELECT virtual_ip FROM fixed_host_addresses
@@ -227,7 +260,10 @@ impl Database {
         if existing.is_none() {
             return Ok(None);
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.execute(
             "UPDATE fixed_host_addresses SET released_at = ?1
              WHERE user_id = ?2 AND released_at IS NULL",
@@ -243,7 +279,10 @@ impl Database {
         virtual_ip: &str,
         role: &str,
     ) -> Result<String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO room_peers
@@ -262,7 +301,10 @@ impl Database {
         session_id: &str,
         role: &str,
     ) -> Result<String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = chrono::Utc::now().to_rfc3339();
         if let Ok(existing) = conn.query_row(
             "SELECT virtual_ip FROM room_peers WHERE room_code = ?1 AND session_id = ?2 AND released_at IS NULL",
@@ -289,13 +331,19 @@ impl Database {
     }
 
     pub fn release_peer(&self, room_code: &str, session_id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.execute("UPDATE room_peers SET released_at = ?1 WHERE room_code = ?2 AND session_id = ?3 AND released_at IS NULL", rusqlite::params![chrono::Utc::now().to_rfc3339(), room_code, session_id])?;
         Ok(())
     }
 
     pub fn release_room_network(&self, room_code: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE room_peers SET released_at = ?1 WHERE room_code = ?2 AND released_at IS NULL",
