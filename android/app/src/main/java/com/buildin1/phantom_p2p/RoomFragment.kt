@@ -136,6 +136,8 @@ class RoomFragment : Fragment() {
             }
             binding.btnJoinRoom.isEnabled = !state.isJoining && !state.guestActive
             updateLastRoomEntry()
+            binding.creatingStateContent.visibility = if (state.isCreating) View.VISIBLE else View.GONE
+            binding.btnCreateRoom.isEnabled = !state.isCreating
             binding.tvRoomCode.text = state.roomCode ?: "------"
             binding.tvTransportBadge.text = state.connectionMode.ifBlank { "等待连接" }
             val roomActive = state.roomCode != null
