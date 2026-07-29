@@ -109,6 +109,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
     private var lastStatsTxBytes: Long = 0L
     private var lastStatsRxBytes: Long = 0L
     private var pendingAction: PendingAction? = null
+    private var dataPlaneWatchJob: Job? = null
 
     // VPN 权限申请：仅在创建/加入房间时触发，避免启动时骚扰用户
     private val _vpnPermissionNeeded = MutableLiveData<Intent?>()
@@ -177,6 +178,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
         signalManager = null
         pendingAction = null
         cancelRelayFallback()
+        dataPlaneWatchJob?.cancel()
         stopStatsSampling(reset = true)
         relayPreAllocated = null
         clearIceSession()
@@ -274,6 +276,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
     fun closeRoom() {
         signalManager?.closeRoom()
         cancelRelayFallback()
+        dataPlaneWatchJob?.cancel()
         stopStatsSampling(reset = true)
         relayPreAllocated = null
         updateState {
@@ -293,6 +296,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
     fun leaveRoom() {
         signalManager?.leaveRoom()
         cancelRelayFallback()
+        dataPlaneWatchJob?.cancel()
         stopStatsSampling(reset = true)
         relayPreAllocated = null
         updateState {
@@ -424,6 +428,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
 
     override fun onRoomClosed(reason: String) {
         cancelRelayFallback()
+        dataPlaneWatchJob?.cancel()
         stopStatsSampling(reset = true)
         relayPreAllocated = null
         updateState {
@@ -502,6 +507,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
 
     override fun onDisconnected(code: Int, reason: String) {
         cancelRelayFallback()
+        dataPlaneWatchJob?.cancel()
         stopStatsSampling(reset = true)
         relayPreAllocated = null
         updateState { it.copy(connectionState = ConnectionState.DISCONNECTED, hostActive = false, guestActive = false) }
@@ -576,6 +582,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
             isGuest = isGuest, transport = PhantomVpnService.TRANSPORT_TCP
         )
         addLog("VPN 数据面已绑定 P2P: $host:${peer.port} (本地端口 $iceLocalPort)", "INFO", "vpn")
+        watchDataPlaneFailure()
     }
 
     private fun maybeAttachVpnRelay(relayAddr: String, relayQuicPort: Int, token: String) {
@@ -593,6 +600,38 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
             isGuest = isGuest, transport = PhantomVpnService.TRANSPORT_TCP
         )
         addLog("VPN 数据面已绑定 QUIC: $relayAddr:$relayQuicPort", "INFO", "vpn")
+        watchDataPlaneFailure()
+    }
+
+    /**
+     * relay 卡死修复：PhantomVpnService 的数据面协程若异常终止（例如中继连接失败/超时），
+     * 会通过 recordDataPlaneFailure() 复位到 MODE_IDLE 并记录失败时间戳。
+     * 这里在下发 P2P/中继数据面后启动一个轻量轮询（复用现有 statsJob 的轮询风格），
+     * 一旦检测到比本次下发更晚的失败时间戳，就结束"连接中"loading 并提示用户，
+     * 避免 UI 永久停留在 isJoining/连接中状态。
+     */
+    private fun watchDataPlaneFailure() {
+        dataPlaneWatchJob?.cancel()
+        val app = getApplication<Application>()
+        val baselineEpoch = PhantomVpnService.readDataPlaneFailure(app).first
+        dataPlaneWatchJob = viewModelScope.launch(Dispatchers.IO) {
+            repeat(240) { // 240 * 500ms = 120s，覆盖 relay 最坏情况下的建连+配对超时
+                delay(500)
+                val (epoch, reason) = PhantomVpnService.readDataPlaneFailure(app)
+                if (epoch > baselineEpoch) {
+                    updateState {
+                        it.copy(isJoining = false, connectionMode = "连接失败")
+                    }
+                    addLog("数据面异常，连接已复位: $reason", "ERROR", "vpn")
+                    return@launch
+                }
+                val st = _state.value
+                val stillWaiting = st?.isJoining == true ||
+                    st?.connectionMode in setOf("连接中", "ICE 打洞中", "等待对端 ICE…") ||
+                    st?.connectionMode?.startsWith("请求中继") == true
+                if (stillWaiting != true) return@launch
+            }
+        }
     }
 
     private fun configureVpnOverlay(localIp: String, subnet: String, hostIp: String, isGuest: Boolean) {
@@ -728,6 +767,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Si
     override fun onCleared() {
         super.onCleared()
         cancelRelayFallback()
+        dataPlaneWatchJob?.cancel()
         stopStatsSampling(reset = false)
         clearIceSession()
         signalManager?.destroy()
