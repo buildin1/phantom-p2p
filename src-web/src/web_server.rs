@@ -19,6 +19,40 @@ struct WebState {
     runtime: Arc<HeadlessRuntime>,
 }
 
+/// Number of consecutive ports to probe after the requested one before giving up.
+const PORT_FALLBACK_ATTEMPTS: u16 = 20;
+
+/// Binds `addr`, and if the port is already taken, transparently retries on the
+/// following ports (same host) instead of failing the whole process. Returns the
+/// listener together with the address it actually bound to, since callers (the
+/// overlay listener, the printed "Local WebUI" URL) need to agree on the final port.
+async fn bind_with_port_fallback(
+    mut addr: SocketAddr,
+) -> std::io::Result<(tokio::net::TcpListener, SocketAddr)> {
+    let requested_port = addr.port();
+    for offset in 0..=PORT_FALLBACK_ATTEMPTS {
+        addr.set_port(requested_port + offset);
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => {
+                if offset > 0 {
+                    println!("端口 {} 已被占用，自动改用 {}", requested_port, addr);
+                }
+                return Ok((listener, addr));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AddrInUse,
+        format!(
+            "端口 {}-{} 均被占用，请手动指定 --bind 换一个端口段",
+            requested_port,
+            requested_port + PORT_FALLBACK_ATTEMPTS
+        ),
+    ))
+}
+
 pub async fn start_web_server(
     bind_addr: SocketAddr,
     runtime: Arc<HeadlessRuntime>,
@@ -33,7 +67,7 @@ pub async fn start_web_server(
         .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
         .with_state(state);
 
-    let local_listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    let (local_listener, bind_addr) = bind_with_port_fallback(bind_addr).await?;
     println!("Local WebUI:      http://{}", bind_addr);
     let local_app = app.clone();
     tokio::spawn(async move {
