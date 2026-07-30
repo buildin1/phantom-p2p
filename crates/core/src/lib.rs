@@ -33,6 +33,7 @@ pub mod ice;
 pub mod identity;
 pub mod nat;
 pub mod network;
+pub mod network_info;
 pub mod puncher;
 pub mod signal;
 pub mod stats;
