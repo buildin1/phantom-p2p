@@ -506,6 +506,7 @@ async fn connect_signal(
                         let peer_nat_type = peer_nat_type.clone();
                         let start_at_ms = *start_at_ms;
                         let stats_for_ice = stats_mgr.clone();
+                        let signal_client_for_ice = client_clone.clone();
 
                         let ice_task = tokio::spawn(async move {
                             let ps = app_for_ice.state::<PunchState>();
@@ -554,6 +555,12 @@ async fn connect_signal(
                                     .add_connection(user_id.clone(), "p2p".to_string())
                                     .await;
                                 stats_for_ice.set_connection_mode(&user_id, "p2p").await;
+                                // 顺便把最终连接模式上报给信令服务器，供管理面板展示
+                                let _ = signal_client_for_ice
+                                    .send(ClientMessage::ReportConnectionMode {
+                                        mode: "p2p".to_string(),
+                                    })
+                                    .await;
 
                                 let peer_socket_addr: std::net::SocketAddr = result
                                     .peer_addr
@@ -958,6 +965,7 @@ async fn start_relay_tunnel(
     token: String,
     punch_state: tauri::State<'_, PunchState>,
     stats_state: tauri::State<'_, StatsState>,
+    signal_state: tauri::State<'_, SignalState>,
 ) -> Result<(), String> {
     abort_punch_task(&punch_state).await;
     let is_host = *punch_state.is_host.read().await;
@@ -975,6 +983,13 @@ async fn start_relay_tunnel(
     stats_state
         .manager
         .set_connection_mode(&user_id, "relay")
+        .await;
+    // 顺便把最终连接模式上报给信令服务器，供管理面板展示
+    let _ = signal_state
+        .client
+        .send(ClientMessage::ReportConnectionMode {
+            mode: "relay".to_string(),
+        })
         .await;
     tracing::info!("[统计] 已添加 Relay 连接");
 
