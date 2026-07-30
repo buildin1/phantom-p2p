@@ -108,6 +108,13 @@ impl Ipv4Header {
 #[cfg_attr(target_os = "android", path = "tun_android.rs")]
 mod platform;
 
+/// Root-only utun provisioning entry point, re-exported so the small
+/// elevated helper binary (`crates/macos-helper`) can call it without
+/// otherwise reaching into this crate's private platform module. See
+/// `tun_macos.rs`'s module doc comment for why this is split out.
+#[cfg(target_os = "macos")]
+pub use platform::{provision as macos_provision_tun, ProvisionedTun as MacosProvisionedTun};
+
 /// TUN 设备
 pub struct TunDevice {
     inner: Arc<platform::PlatformTun>,

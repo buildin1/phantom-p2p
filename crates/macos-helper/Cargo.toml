@@ -1,0 +1,15 @@
+[package]
+name = "macos-helper"
+version = "2.7.7"
+edition = "2021"
+description = "Tiny privileged helper: provisions a macOS utun device and hands its fd back to the unprivileged GUI process. See crates/core/src/tun_macos.rs."
+
+[[bin]]
+name = "macos-helper"
+path = "src/main.rs"
+
+[dependencies]
+phantom-core = { path = "../core" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+passfd = "0.1"

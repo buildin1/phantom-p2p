@@ -142,6 +142,13 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Build frontend
         run: npm ci && npm run build
+      - name: Build privileged TUN-provisioning helper (sidecar)
+        run: |
+          set -euxo pipefail
+          cargo build --locked --release -p macos-helper --target ${{ matrix.target }}
+          mkdir -p src-tauri/binaries
+          cp "target/${{ matrix.target }}/release/macos-helper" \
+             "src-tauri/binaries/phantom-macos-helper-${{ matrix.target }}"
       - name: Build app and server
         run: |
           npx tauri build --bundles app,dmg

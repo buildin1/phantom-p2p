@@ -5,6 +5,7 @@ members = [
     "crates/protocol",
     "crates/core",
     "crates/mobile",
+    "crates/macos-helper",
     "server",
     "src-web",
 ]

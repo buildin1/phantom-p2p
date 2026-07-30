@@ -50,6 +50,19 @@ cd "$PROJECT_ROOT/server"
 cargo build --release
 echo "✅ 信令服务器编译完成"
 
+# 编译特权 TUN 提权 helper，作为 Tauri sidecar 打包进 .app
+# （创建 utun 设备需要 root，见 crates/core/src/tun_macos.rs 的模块注释；
+#  GUI 主进程本身不提权，只在需要时临时提权这个很小的独立 helper）
+echo ""
+echo "[3.5/5] 编译特权 TUN 提权 helper..."
+cd "$PROJECT_ROOT"
+HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+cargo build --release -p macos-helper --target "$HOST_TARGET"
+mkdir -p "$PROJECT_ROOT/src-tauri/binaries"
+cp "$PROJECT_ROOT/target/$HOST_TARGET/release/macos-helper" \
+   "$PROJECT_ROOT/src-tauri/binaries/phantom-macos-helper-$HOST_TARGET"
+echo "✅ helper 编译完成（target=$HOST_TARGET）"
+
 # 编译客户端（Tauri 会同时打包 .app + .dmg）
 # 注意：tauri build script 在 target/ 中生成临时 .toml 文件后立刻读回，
 # macOS 外置卷会在期间插入 ._* 导致 UTF-8 解析失败。
@@ -147,6 +160,12 @@ cat > "$BUILD_DIR/README.txt" << EOF
 1. 启动服务器: ./start-server.sh
 2. 启动客户端: ./start-client.sh
 3. 或直接双击 .dmg 挂载后安装 ${APP_BASENAME}
+
+关于联机时的授权弹窗:
+创建虚拟网卡需要 root 权限，但客户端本身全程以普通用户权限运行（避免
+root 权限的 GUI 卡顿、无法最大/最小化）。首次建房/加入房间时会弹出一次
+系统原生的密码/Touch ID 授权框，这是在临时提权一个很小的独立组件去创建
+虚拟网卡，同意后即可正常联机。
 
 配置说明:
 - 编辑 config.toml 修改服务器配置
