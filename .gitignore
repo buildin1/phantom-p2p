@@ -9,6 +9,9 @@ target/
 src-tauri/target/
 dist/
 src-tauri/gen/
+# Tauri sidecar binaries are built by CI/build scripts (see build/build-macos.sh),
+# not committed -- see crates/macos-helper.
+src-tauri/binaries/
 
 *.log
 *.db

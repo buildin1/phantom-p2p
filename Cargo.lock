@@ -2252,6 +2252,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c41e0c4fef86961ac6d6f8a82609f55f31b05e4fce149ac5710e439df7619ba4"
 
 [[package]]
+name = "macos-helper"
+version = "2.7.7"
+dependencies = [
+ "passfd",
+ "phantom-core",
+]
+
+[[package]]
 name = "markup5ever"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2867,6 +2875,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "passfd"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b332c50e4d07c0011fff51ea305374408319908908bc1dbed7a0ffaaf63a8151"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "pem"
 version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2893,6 +2910,7 @@ dependencies = [
  "ipnetwork",
  "libc",
  "local-ip-address",
+ "passfd",
  "phantom-protocol",
  "quinn",
  "rand 0.8.5",
@@ -2927,7 +2945,6 @@ dependencies = [
  "ed25519-dalek",
  "futures-util",
  "igd-next",
- "libc",
  "local-ip-address",
  "phantom-core",
  "phantom-protocol",
