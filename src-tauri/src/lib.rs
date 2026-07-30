@@ -1323,6 +1323,60 @@ fn ensure_admin() {
     std::process::exit(0);
 }
 
+/// 如果不是 root，则弹出 macOS 原生授权对话框（密码/Touch ID）提权重新启动。
+///
+/// 创建 utun 虚拟网卡需要 root（`com.apple.net.utun_control` 是
+/// `CTL_FLAG_PRIVILEGED` 内核控制通道，见 crates/core/src/tun_macos.rs），
+/// 而 Finder 双击启动的 GUI App 默认不是 root，因此需要与 Windows
+/// `ensure_admin()`（UAC）对等的提权流程。
+///
+/// 与 Windows 版不同的是：Windows 的 `ShellExecuteW` 是 fire-and-forget，
+/// 不知道用户是否真的同意了 UAC，所以无条件退出旧进程。这里用
+/// `osascript` 能拿到真实的退出状态——用户同意则退出旧进程，让新的
+/// root 进程接管；用户在授权框里点了取消，则放弃提权、继续以普通用户
+/// 权限运行（此时应用其余功能仍可用，只是创建 TUN 会失败并给出上面
+/// 那条清晰的错误提示，而不是让整个 App 无法启动）。
+#[cfg(target_os = "macos")]
+fn ensure_admin_macos() {
+    // 已经是 root 则跳过（包括提权重启后的第二次调用）
+    if unsafe { libc::geteuid() == 0 } {
+        return;
+    }
+
+    let exe_path = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let Some(exe_path) = exe_path.to_str() else {
+        return;
+    };
+
+    // shell 级引号（单引号包裹，内部单引号用 '\'' 转义），保证路径中的空格/特殊字符安全
+    let shell_quoted = format!("'{}'", exe_path.replace('\'', r"'\''"));
+    // AppleScript 字符串字面量转义（反斜杠、双引号）
+    let applescript_quoted = shell_quoted.replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!(
+        "do shell script \"{}\" with administrator privileges",
+        applescript_quoted
+    );
+
+    let status = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .status();
+
+    match status {
+        Ok(status) if status.success() => {
+            // 提权后的新进程已经启动，退出当前非特权进程
+            std::process::exit(0);
+        }
+        _ => {
+            // 用户取消授权，或 osascript 本身不可用：降级为普通权限继续运行
+            tracing::warn!("[启动] 未获得管理员权限，虚拟网卡功能将不可用");
+        }
+    }
+}
+
 /// 提取嵌入到 exe 中的 DLL 到可执行文件所在目录
 ///
 /// wintun.dll 和 WebView2Loader.dll 通过 include_bytes! 嵌入到 exe 中，
@@ -1409,6 +1463,8 @@ pub fn run(dev_mode: bool) {
     // 以管理员权限运行（创建 TUN 虚拟网卡需要）
     #[cfg(windows)]
     ensure_admin();
+    #[cfg(target_os = "macos")]
+    ensure_admin_macos();
 
     // 提取嵌入的 DLL（wintun.dll + WebView2Loader.dll）到可执行文件目录
     #[cfg(windows)]
