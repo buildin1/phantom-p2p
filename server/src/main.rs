@@ -25,6 +25,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+mod admin;
 mod config;
 mod database;
 mod port_pool;
@@ -58,6 +59,11 @@ struct Session {
     virtual_ip: Option<String>,
     /// 最后活动时间（用于心跳超时检测）
     last_activity: tokio::time::Instant,
+    /// 连接建立时间（用于管理面板展示在线时长）
+    connected_at: tokio::time::Instant,
+    /// 客户端上报的最终连接模式（"p2p" / "relay"），仅供管理面板展示，
+    /// 不作为业务逻辑判断依据（打洞可能在中继预分配后仍然成功）
+    connection_mode: Option<String>,
 }
 
 /// 房间角色
@@ -256,6 +262,8 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: SharedSta
                     user_id: None,
                     virtual_ip: None,
                     last_activity: tokio::time::Instant::now(),
+                    connected_at: tokio::time::Instant::now(),
+                    connection_mode: None,
                 },
             );
             Some(sid)
@@ -466,6 +474,9 @@ async fn handle_client_message(session_id: &str, msg: ClientMessage, state: &Sha
                 ClientMessage::GetFixedHostIp => {
                     handle_get_fixed_host_ip(session_id, state).await;
                 }
+                ClientMessage::ReportConnectionMode { mode } => {
+                    handle_report_connection_mode(session_id, mode, state).await;
+                }
                 ClientMessage::IceCandidates {
                     target_peer_session_id,
                     candidates,
@@ -570,6 +581,15 @@ async fn handle_auth(
         enabled: fixed_host_ip.is_some(),
         virtual_ip: fixed_host_ip,
     });
+}
+
+/// 记录客户端上报的最终连接模式（p2p / relay），仅供管理面板只读展示。
+async fn handle_report_connection_mode(session_id: &str, mode: String, state: &SharedState) {
+    let mut st = state.lock().await;
+    if let Some(session) = st.sessions.get_mut(session_id) {
+        info!("[连接模式] {} 上报: {}", session_id, mode);
+        session.connection_mode = Some(mode);
+    }
 }
 
 async fn handle_get_fixed_host_ip(session_id: &str, state: &SharedState) {
@@ -1799,11 +1819,11 @@ async fn main() {
     )));
     relay::start_cleanup_task(relay_registry.clone());
 
-    let state = Arc::new(Mutex::new(AppState::new(
-        relay_registry,
-        Arc::new(cfg.clone()),
-    )));
+    let cfg_arc = Arc::new(cfg.clone());
+    let state = Arc::new(Mutex::new(AppState::new(relay_registry, cfg_arc.clone())));
     start_session_timeout_task(state.clone());
+
+    admin::maybe_start(&cfg_arc, state.clone());
 
     let bind_addr = format!("{}:{}", cfg.signal.bind, cfg.signal.port);
     let listener = TcpListener::bind(&bind_addr)

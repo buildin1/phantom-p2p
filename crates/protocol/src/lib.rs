@@ -145,6 +145,10 @@ pub enum ClientMessage {
     /// Query the persistent Host virtual address.
     #[serde(rename = "get_fixed_host_ip")]
     GetFixedHostIp,
+
+    /// 上报本次连接最终采用的模式（"p2p" 或 "relay"），供管理面板展示
+    #[serde(rename = "report_connection_mode")]
+    ReportConnectionMode { mode: String },
 }
 
 // ============================================================
@@ -377,6 +381,19 @@ mod tests {
                 assert_eq!(peer_session_id, "sess_guest_001");
                 assert_eq!(guest_count, 3);
             }
+            _ => panic!("消息类型不匹配"),
+        }
+    }
+
+    #[test]
+    fn test_report_connection_mode_roundtrip() {
+        let msg = ClientMessage::ReportConnectionMode {
+            mode: "p2p".to_string(),
+        };
+        let bytes = serialize(&msg).unwrap();
+        let decoded: ClientMessage = deserialize(&bytes).unwrap();
+        match decoded {
+            ClientMessage::ReportConnectionMode { mode } => assert_eq!(mode, "p2p"),
             _ => panic!("消息类型不匹配"),
         }
     }
