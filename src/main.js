@@ -1880,6 +1880,33 @@ async function setupEventListeners() {
       refresh();
     }
   });
+
+  // 宽带运营商检测：客户端启动时后台静默查询一次出口公网 IP 对应的
+  // 宽带运营商，用于展示在侧边栏（判断游戏联机是否跨运营商绕路的辅助信息）。
+  // 8 秒内没收到结果（查询失败/网络不通）就放弃等待，显示"未知"。
+  let ispDetected = false;
+  const ispTimeout = setTimeout(() => {
+    if (!ispDetected) {
+      setText("sideIsp", "未知");
+    }
+  }, 8000);
+
+  await listen("network:isp_detected", (event) => {
+    ispDetected = true;
+    clearTimeout(ispTimeout);
+    const payload = event.payload || {};
+    const isp = String(payload.isp || "").trim();
+    setText("sideIsp", isp || "未知");
+    const el = document.getElementById("sideIsp");
+    if (el) {
+      const parts = [payload.country, payload.region, payload.city]
+        .filter(Boolean)
+        .join(" · ");
+      el.title = payload.public_ip
+        ? `出口 IP: ${payload.public_ip}${parts ? " (" + parts + ")" : ""}`
+        : "";
+    }
+  });
 }
 
 async function bootstrap() {
