@@ -25,6 +25,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+mod admin;
 mod config;
 mod database;
 mod port_pool;
@@ -1818,11 +1819,11 @@ async fn main() {
     )));
     relay::start_cleanup_task(relay_registry.clone());
 
-    let state = Arc::new(Mutex::new(AppState::new(
-        relay_registry,
-        Arc::new(cfg.clone()),
-    )));
+    let cfg_arc = Arc::new(cfg.clone());
+    let state = Arc::new(Mutex::new(AppState::new(relay_registry, cfg_arc.clone())));
     start_session_timeout_task(state.clone());
+
+    admin::maybe_start(&cfg_arc, state.clone());
 
     let bind_addr = format!("{}:{}", cfg.signal.bind, cfg.signal.port);
     let listener = TcpListener::bind(&bind_addr)

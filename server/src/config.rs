@@ -22,6 +22,8 @@ pub struct ServerConfig {
     pub auth: AuthConfig,
     #[serde(default)]
     pub port_allocation: PortAllocationConfig,
+    #[serde(default)]
+    pub admin: AdminConfig,
 }
 
 /// 信令服务器配置
@@ -62,6 +64,19 @@ pub struct AuthConfig {
     pub enabled: bool,
 }
 
+/// 只读管理面板配置
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdminConfig {
+    /// 是否启用管理面板（默认关闭，需要自建者显式开启）
+    #[serde(default)]
+    pub enabled: bool,
+    /// 管理面板监听地址。
+    /// 默认仅监听本机回环地址；如需公网/内网其它主机访问，
+    /// 由自建者自行改为 "0.0.0.0:PORT" 并自行负责相应的安全防护。
+    #[serde(default = "default_admin_bind")]
+    pub bind: String,
+}
+
 // --- 默认值函数 ---
 
 fn default_bind() -> String {
@@ -91,6 +106,9 @@ fn default_token_ttl() -> u64 {
 fn default_true() -> bool {
     true
 }
+fn default_admin_bind() -> String {
+    "127.0.0.1:10210".to_string()
+}
 
 // --- Default impls ---
 
@@ -101,6 +119,7 @@ impl Default for ServerConfig {
             relay: RelayConfig::default(),
             auth: AuthConfig::default(),
             port_allocation: PortAllocationConfig::default(),
+            admin: AdminConfig::default(),
         }
     }
 }
@@ -142,8 +161,17 @@ impl Default for AuthConfig {
     }
 }
 
-/// 加载配置文件
-pub fn load_config() -> ServerConfig {
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: default_admin_bind(),
+        }
+    }
+}
+
+/// 计算 `config.toml` 的候选查找路径（与 `load_config` 的查找顺序一致）。
+fn config_search_candidates() -> Vec<PathBuf> {
     // 1. 命令行 --config <path>
     let args: Vec<String> = std::env::args().collect();
     let custom_path = args
@@ -152,7 +180,7 @@ pub fn load_config() -> ServerConfig {
         .map(|w| PathBuf::from(&w[1]));
 
     // 2. 查找顺序
-    let candidates: Vec<PathBuf> = if let Some(p) = custom_path {
+    if let Some(p) = custom_path {
         vec![p]
     } else {
         let mut v = vec![PathBuf::from("config.toml")];
@@ -164,7 +192,24 @@ pub fn load_config() -> ServerConfig {
         // 也检查 server/ 子目录（开发时 cwd 可能在项目根）
         v.push(PathBuf::from("server/config.toml"));
         v
-    };
+    }
+}
+
+/// 返回 `config.toml` 实际所在（或将要生成）的目录，供同目录下的其它运行期文件
+/// （如管理面板凭据文件 `admin.credential`）复用。找不到已存在的 `config.toml` 时，
+/// 退回当前工作目录（即 `save_default_config` 生成默认配置文件的位置）。
+pub fn find_config_dir() -> PathBuf {
+    config_search_candidates()
+        .into_iter()
+        .find(|p| p.exists())
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// 加载配置文件
+pub fn load_config() -> ServerConfig {
+    let candidates = config_search_candidates();
 
     for path in &candidates {
         if path.exists() {
@@ -227,6 +272,13 @@ guest_port_end = {}
 [auth]
 # 是否启用鉴权
 enabled = {}
+
+[admin]
+# 是否启用只读管理面板（默认关闭，需要自建者显式开启）
+enabled = {}
+# 管理面板监听地址（默认仅本机可访问；如需公网/内网其它主机访问，
+# 请自行改为例如 "0.0.0.0:10210"，并自行负责相应的安全防护，这是你的选择而非默认行为）
+bind = "{}"
 "#,
         config.signal.bind,
         config.signal.port,
@@ -237,6 +289,8 @@ enabled = {}
         config.port_allocation.guest_port_start,
         config.port_allocation.guest_port_end,
         config.auth.enabled,
+        config.admin.enabled,
+        config.admin.bind,
     );
 
     std::fs::write(&path, content)?;
