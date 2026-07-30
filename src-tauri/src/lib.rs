@@ -13,7 +13,9 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
 
 mod config;
-use phantom_core::{identity, nat, network, puncher, signal, stats, stun, tun_bridge, tunnel};
+use phantom_core::{
+    identity, nat, network, network_info, puncher, signal, stats, stun, tun_bridge, tunnel,
+};
 use std::sync::atomic::AtomicBool;
 
 // Web 服务器模块（仅在启用 web-server feature 时编译）
@@ -1529,6 +1531,25 @@ pub fn run(dev_mode: bool) {
             // 在 Tauri 的异步运行时中启动采样任务
             tauri::async_runtime::spawn(async move {
                 stats_manager.start_sampling_task();
+            });
+
+            // 启动时静默检测一次出口公网 IP 对应的宽带运营商（纯展示型功能，
+            // 不阻塞 UI，失败也不打断用户，只记日志）。
+            let app_for_isp = _app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                match network_info::detect_local_isp().await {
+                    Ok(info) => {
+                        tracing::info!(
+                            "[网络信息] 检测到出口 IP={} ISP={}",
+                            info.public_ip,
+                            info.isp
+                        );
+                        let _ = app_for_isp.emit("network:isp_detected", info);
+                    }
+                    Err(e) => {
+                        tracing::warn!("[网络信息] 检测运营商失败: {}", e);
+                    }
+                }
             });
             Ok(())
         })
