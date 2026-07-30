@@ -2927,6 +2927,7 @@ dependencies = [
  "ed25519-dalek",
  "futures-util",
  "igd-next",
+ "libc",
  "local-ip-address",
  "phantom-core",
  "phantom-protocol",
