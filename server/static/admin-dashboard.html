@@ -132,9 +132,9 @@
   .shell {
     position: relative;
     z-index: 1;
-    max-width: 1180px;
+    max-width: 1600px;
     margin: 0 auto;
-    padding: 28px 24px 64px;
+    padding: 28px 32px 64px;
   }
 
   .topbar {
@@ -564,8 +564,22 @@
     line-height: 1;
     flex-shrink: 0;
   }
-  .geo-place { font-size: 13px; }
-  .geo-isp { font-size: 11px; color: var(--muted-2); margin-top: 1px; }
+  .geo-place {
+    font-size: 13px;
+    max-width: 260px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .geo-isp {
+    font-size: 11px;
+    color: var(--muted-2);
+    margin-top: 1px;
+    max-width: 260px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 
   .carrier-tag {
     display: inline-flex;
@@ -736,12 +750,17 @@
     return sec + "s";
   }
 
-  // 归属地 isp 文案里出现三大运营商名称时，用彩色标签替代普通文字展示
+  // 归属地 isp 文案里出现三大运营商名称时，用彩色标签替代普通文字展示。
+  // ip-api 的 isp/org 字段来自 WHOIS 注册信息，不受 lang 参数影响，实际返回的
+  // 是英文/拼音原文（如 "China Telecom"、"Chinanet"、"China Mobile
+  // communications corporation"、"CHINA UNICOM China169 Backbone" 等），
+  // 不是中文"电信/移动/联通"这几个字，所以要按这些真实关键词做不区分大小写匹配。
   function carrierFromIsp(isp) {
     if (!isp) return null;
-    if (isp.indexOf("电信") !== -1) return "ct";
-    if (isp.indexOf("移动") !== -1) return "cm";
-    if (isp.indexOf("联通") !== -1) return "cu";
+    var s = isp.toLowerCase();
+    if (s.indexOf("电信") !== -1 || s.indexOf("china telecom") !== -1 || s.indexOf("chinanet") !== -1 || s.indexOf("ctnet") !== -1) return "ct";
+    if (s.indexOf("移动") !== -1 || s.indexOf("china mobile") !== -1 || s.indexOf("cmnet") !== -1 || s.indexOf("cmcc") !== -1) return "cm";
+    if (s.indexOf("联通") !== -1 || s.indexOf("china unicom") !== -1 || s.indexOf("unicom") !== -1 || s.indexOf("cnc group") !== -1 || s.indexOf("china169") !== -1) return "cu";
     return null;
   }
 
@@ -805,7 +824,7 @@
     var tbody = document.getElementById("tableBody");
     tbody.innerHTML = filtered.map(function (r) {
       var color = avatarColor(r.user);
-      var roleLabel = r.role === "host" ? "Host" : "Guest";
+      var roleLabel = r.role === "host" ? "房主" : "访客";
       var modeLabel = MODE_LABEL[r.mode] || "未知";
       return (
         '<tr>' +
