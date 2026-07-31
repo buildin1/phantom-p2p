@@ -163,41 +163,53 @@ pub async fn start_host_tunnel(
 ) -> Result<(), String> {
     info!("[隧道-Host] 等待 QUIC 连接...");
 
+    // `incoming.await`（完成握手）必须 spawn 到独立任务里，绝不能在这个循环里同步等待：
+    // 之前的写法是 `let conn = incoming.await?` 直接写在 while 循环体内，任何一个连接
+    // 的握手卡住（比如对端 NAT/防火墙把回包丢了），下一次 `accept()` 就永远排不上号，
+    // 整个 Host 会卡死，后续所有新用户（包括跟这个卡住的连接完全无关的新房客）都无法
+    // 建立 QUIC 连接。握手本身也补一个超时，避免卡住的任务无限期占着资源。
     while let Some(incoming) = quic_endpoint.accept().await {
-        let conn = match incoming.await {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("[隧道-Host] QUIC 连接失败: {}", e);
-                continue;
-            }
-        };
+        let stats_manager = stats_manager.clone();
+        let host_peer_addr_map = host_peer_addr_map.clone();
+        let tun_bridge = tun_bridge.clone();
 
-        let remote = conn.remote_address();
-        let remote_key = remote.to_string();
-        let mapped_user_id = {
-            let mut peer_map = host_peer_addr_map.lock().await;
-            peer_map.remove(&remote_key)
-        };
-        if let Some(user_id) = &mapped_user_id {
-            stats_manager
-                .add_connection(user_id.clone(), "p2p".to_string())
-                .await;
-            spawn_quic_monitor(conn.clone(), stats_manager.clone(), user_id.clone());
-        } else {
-            warn!(
-                "[隧道-Host] 未找到 {} 对应的 peer_session_id 映射，统计将忽略该连接",
-                remote
-            );
-        }
-        info!("[隧道-Host] QUIC 连接已建立: {}", remote);
-
-        let tun_bridge_for_conn = tun_bridge.clone();
         tokio::spawn(async move {
+            let conn = match tokio::time::timeout(Duration::from_secs(15), incoming).await {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
+                    warn!("[隧道-Host] QUIC 连接失败: {}", e);
+                    return;
+                }
+                Err(_) => {
+                    warn!("[隧道-Host] QUIC 握手超时（15s），放弃该连接");
+                    return;
+                }
+            };
+
+            let remote = conn.remote_address();
+            let remote_key = remote.to_string();
+            let mapped_user_id = {
+                let mut peer_map = host_peer_addr_map.lock().await;
+                peer_map.remove(&remote_key)
+            };
+            if let Some(user_id) = &mapped_user_id {
+                stats_manager
+                    .add_connection(user_id.clone(), "p2p".to_string())
+                    .await;
+                spawn_quic_monitor(conn.clone(), stats_manager.clone(), user_id.clone());
+            } else {
+                warn!(
+                    "[隧道-Host] 未找到 {} 对应的 peer_session_id 映射，统计将忽略该连接",
+                    remote
+                );
+            }
+            info!("[隧道-Host] QUIC 连接已建立: {}", remote);
+
             loop {
                 match conn.accept_bi().await {
                     Ok((send, recv)) => {
                         debug!("[隧道-Host] 新 QUIC 流 from {}", remote);
-                        let bridge = tun_bridge_for_conn.clone();
+                        let bridge = tun_bridge.clone();
                         tokio::spawn(async move {
                             let mut prefix = [0u8; 4];
                             let (mut send, mut recv) = (send, recv);

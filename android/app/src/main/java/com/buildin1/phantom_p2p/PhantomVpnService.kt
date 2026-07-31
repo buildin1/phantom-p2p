@@ -605,7 +605,13 @@ class PhantomVpnService : VpnService() {
             .putLong(KEY_DATA_PLANE_FAILURE_EPOCH, System.currentTimeMillis())
             .putString(KEY_DATA_PLANE_FAILURE_REASON, reason)
             .apply()
-        bindDataPlane(mode = MODE_IDLE, endpoint = "")
+        // 之前这里只调用 bindDataPlane(MODE_IDLE, ...)，只停掉了数据转发协程，
+        // 但 establishTunForRole() 建立的 VPN 接口（哪怕路由范围很窄）仍然挂着不关。
+        // 如果用户在系统设置里开了"阻止无 VPN 的连接"这类严格模式，一个失败后仍然
+        // 处于"已连接但不转发任何数据"状态的 VPN 接口会让系统认为所有不匹配它内部
+        // 路由的流量都无处可去，导致连接失败后手机正常上网也跟着不通。改成彻底关闭
+        // VPN（stopVpn 会关 TUN fd、停前台服务），下次重连会重新建立一个干净的接口。
+        stopVpn(removeService = true)
     }
 
     companion object {
