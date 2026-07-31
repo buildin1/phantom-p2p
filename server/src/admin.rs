@@ -400,6 +400,10 @@ fn query_ip_api_batch(ips: &[String]) -> Result<Vec<(String, GeoInfo)>, String> 
             json!({
                 "query": ip,
                 "fields": "status,message,country,countryCode,regionName,city,isp,query",
+                // country/regionName/city 会被翻译成中文；isp/org 字段是运营商的
+                // 注册名（WHOIS 来源），ip-api 不做翻译，仍是英文原文，前端按
+                // 关键词识别三大运营商（见 carrierFromIsp）。
+                "lang": "zh-CN",
             })
         })
         .collect();
