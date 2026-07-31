@@ -1792,7 +1792,14 @@ async function setupEventListeners() {
     state.relayInfo = payload;
     addLog("QUIC 通道信息已就绪", "INFO", "system");
     setProgress(Math.max(joinFlow.progress, 88));
-    if (isTauriMode && state.roomCode && !state.guest.mode.includes("P2P")) {
+    // 注意：不要用 state.guest.mode 是否包含 "P2P" 来判断"已经直连成功、不用中继"——
+    // 这个字段在本地 ICE 候选验证一通过就会被设成 "P2P 直连"（见 punch:phase Success
+    // 处理器），但本地验证通过不代表对端也验证通过、更不代表 QUIC 隧道真的端到端建立。
+    // 非对称 NAT 下常见的情况是：本机验证成功但对端没有，此时如果这里跳过启动中继，
+    // 对端会转向中继等待配对，却永远等不到本机（因为本机以为已经 P2P 成功），最终超时
+    // 连接失败。Rust 侧 start_relay_tunnel/should_start_host_relay 已经有基于 token 的
+    // 幂等判断，重复调用不会打断已经真正建立好的连接，所以这里始终尝试启动即可。
+    if (isTauriMode && state.roomCode) {
       await startRelayTunnel();
     }
     refresh();
