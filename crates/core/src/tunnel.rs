@@ -160,6 +160,9 @@ pub async fn start_host_tunnel(
     stats_manager: Arc<StatsManager>,
     host_peer_addr_map: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
     tun_bridge: Option<Arc<TunBridge>>,
+    // peer_crypto：与对端在打洞阶段协商好的 overlay 会话密钥。
+    // 中继模式下 QUIC 只做逐跳加密，端到端机密性靠这一层。
+    peer_crypto: Option<Arc<crate::crypto::SessionCrypto>>,
 ) -> Result<(), String> {
     info!("[隧道-Host] 等待 QUIC 连接...");
 
@@ -172,6 +175,7 @@ pub async fn start_host_tunnel(
         let stats_manager = stats_manager.clone();
         let host_peer_addr_map = host_peer_addr_map.clone();
         let tun_bridge = tun_bridge.clone();
+        let peer_crypto = peer_crypto.clone();
 
         tokio::spawn(async move {
             let conn = match tokio::time::timeout(Duration::from_secs(15), incoming).await {
@@ -205,44 +209,20 @@ pub async fn start_host_tunnel(
             }
             info!("[隧道-Host] QUIC 连接已建立: {}", remote);
 
-            loop {
-                match conn.accept_bi().await {
-                    Ok((send, recv)) => {
-                        debug!("[隧道-Host] 新 QUIC 流 from {}", remote);
-                        let bridge = tun_bridge.clone();
-                        tokio::spawn(async move {
-                            let mut prefix = [0u8; 4];
-                            let (mut send, mut recv) = (send, recv);
-                            if recv.read_exact(&mut prefix).await.is_err() {
-                                let _ = send.finish();
-                                return;
-                            }
-                            if &prefix == b"PIP1" {
-                                if let Some(bridge) = bridge {
-                                    if let Err(error) = bridge.handle_peer_stream(send, recv).await
-                                    {
-                                        warn!("[TUN] Host PIP1 stream ended with error: {}", error);
-                                    }
-                                } else {
-                                    warn!("[TUN] Host received PIP1 stream before TUN was ready");
-                                    let _ = send.finish();
-                                }
-                            } else {
-                                warn!("[TUN] rejected legacy port-proxy stream from {}", remote);
-                                let _ = send.finish();
-                            }
-                        });
-                    }
-                    Err(quinn::ConnectionError::ApplicationClosed(_)) => {
-                        info!("[隧道-Host] 对端主动关闭连接: {}", remote);
-                        break;
-                    }
-                    Err(e) => {
-                        warn!("[隧道-Host] 接受流失败: {}", e);
-                        break;
+            // 数据面走 DATAGRAM，不再需要分发业务流：
+            // 连接一建立就把它接入 TUN 桥，之后只等连接结束。
+            match (tun_bridge.clone(), peer_crypto.clone()) {
+                (Some(bridge), Some(crypto)) => {
+                    if let Err(e) = bridge.attach_peer(conn.clone(), crypto, None).await {
+                        warn!("[TUN] Host 接入对端数据报通道失败: {}", e);
                     }
                 }
+                _ => {
+                    warn!("[TUN] Host 收到连接但 TUN 或会话密钥尚未就绪: {}", remote);
+                }
             }
+            let reason = conn.closed().await;
+            info!("[隧道-Host] 连接结束 {}: {}", remote, reason);
         });
     }
 
@@ -568,6 +548,7 @@ pub async fn connect_relay_quic_host(
     stats_manager: Arc<StatsManager>,
     user_id: String,
     tun_bridge: Option<Arc<TunBridge>>,
+    peer_crypto: Option<Arc<crate::crypto::SessionCrypto>>,
 ) -> Result<quinn::Connection, String> {
     info!("[中继-Host] 连接到中继服务器 {}", relay_addr);
 
@@ -624,10 +605,10 @@ pub async fn connect_relay_quic_host(
 
     info!("[中继-Host] 配对成功，启动转发");
 
-    // 启动透明 PIP1 转发循环（类似 P2P Host，但从中继接收流）
+    // 接入数据面（与 P2P 直连同一套逻辑，中继只是盲转发器）
     let loop_conn = conn.clone();
     tokio::spawn(async move {
-        relay_host_pip1_loop(loop_conn, stats_manager, user_id, tun_bridge).await;
+        relay_host_datagram_loop(loop_conn, stats_manager, user_id, tun_bridge, peer_crypto).await;
     });
 
     Ok(conn)
@@ -698,49 +679,32 @@ pub async fn connect_relay_quic_guest(
     Ok(conn)
 }
 
-/// 中继 Host 侧透明 PIP1 转发循环
-async fn relay_host_pip1_loop(
+/// 中继 Host 侧数据面接入。
+///
+/// 与 P2P 直连完全一致：连接建立后即接入 TUN 桥，之后只等连接结束。
+/// 中继此时只是盲转发器——载荷由 overlay 层端到端加密，它看不到明文。
+async fn relay_host_datagram_loop(
     conn: quinn::Connection,
     stats_manager: Arc<StatsManager>,
     user_id: String,
     tun_bridge: Option<Arc<TunBridge>>,
+    peer_crypto: Option<Arc<crate::crypto::SessionCrypto>>,
 ) {
     spawn_quic_monitor(conn.clone(), stats_manager.clone(), user_id.clone());
-    loop {
-        match conn.accept_bi().await {
-            Ok((send, recv)) => {
-                debug!("[中继-Host] 新流");
-                let bridge = tun_bridge.clone();
-                tokio::spawn(async move {
-                    let mut prefix = [0u8; 4];
-                    let (mut send, mut recv) = (send, recv);
-                    if recv.read_exact(&mut prefix).await.is_err() {
-                        let _ = send.finish();
-                    } else if &prefix == b"PIP1" {
-                        if let Some(bridge) = bridge {
-                            if let Err(error) = bridge.handle_peer_stream(send, recv).await {
-                                warn!("[TUN] Relay Host PIP1 stream ended with error: {}", error);
-                            }
-                        } else {
-                            warn!("[TUN] Relay Host received PIP1 stream before TUN was ready");
-                            let _ = send.finish();
-                        }
-                    } else {
-                        warn!("[TUN] Relay Host rejected legacy port-proxy stream");
-                        let _ = send.finish();
-                    }
-                });
-            }
-            Err(quinn::ConnectionError::ApplicationClosed(_)) => {
-                info!("[中继-Host] 连接关闭");
-                break;
-            }
-            Err(e) => {
-                warn!("[中继-Host] 接受流失败: {}", e);
-                break;
+    match (tun_bridge, peer_crypto) {
+        (Some(bridge), Some(crypto)) => {
+            if let Err(e) = bridge.attach_peer(conn.clone(), crypto, None).await {
+                warn!("[TUN] 中继 Host 接入数据报通道失败: {}", e);
+                return;
             }
         }
+        _ => {
+            warn!("[TUN] 中继 Host 收到连接但 TUN 或会话密钥尚未就绪");
+            return;
+        }
     }
+    let reason = conn.closed().await;
+    info!("[中继-Host] 连接结束: {}", reason);
 }
 
 fn spawn_quic_monitor(conn: quinn::Connection, stats_manager: Arc<StatsManager>, user_id: String) {

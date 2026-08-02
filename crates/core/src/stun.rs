@@ -333,6 +333,58 @@ pub fn query_all_detailed(sock: &UdpSocket) -> Vec<StunServerSample> {
     samples
 }
 
+/// 用**服务端下发**的 STUN 列表在指定 socket 上采样。
+///
+/// 与旧的 [`query_all`] 有两点关键差别：
+/// 1. 服务器列表来自服务端下发（自建优先），客户端不内置任何地址——
+///    实测三台境外公共 STUN 曾在单次会话内全部超时，
+///    而 STUN 一失败就拿不到 srflx 候选，必然落中继；
+/// 2. **必须在同一个 socket 上顺序采样**，因为我们要观察的正是
+///    "同一源端口对不同目标的映射变化"——这是判定 NAT 分类的依据，
+///    换 socket 采样会让判定失去意义。
+pub fn query_all_on(sock: &UdpSocket, servers: &[(String, u16)]) -> Vec<StunMapping> {
+    let mut out = Vec::new();
+    if servers.is_empty() {
+        warn!("[STUN] 服务器列表为空（服务端尚未下发配置），无法探测映射");
+        return out;
+    }
+    info!("[STUN] 开始采样 {} 个服务器", servers.len());
+    for (host, port) in servers {
+        let Some(addr) = resolve_stun_addr(host, *port) else {
+            warn!("[STUN] 跳过 {}:{} (解析失败)", host, port);
+            continue;
+        };
+        match query_with_options(sock, addr, false, false) {
+            Some(r) => {
+                info!(
+                    "[STUN] ✅ {} → {}:{} ({}ms)",
+                    host, r.mapping.ip, r.mapping.port, r.rtt_ms
+                );
+                out.push(r.mapping);
+            }
+            None => warn!("[STUN] ❌ 查询失败: {} ({})", host, addr),
+        }
+    }
+    info!("[STUN] 采样完成，获得 {} 个映射", out.len());
+    out
+}
+
+/// 在指定 socket 上取第一个成功的映射（用于新建 socket 的快速探测）。
+///
+/// 策略候选阶段可能要为几十个 socket 各探一次映射，
+/// 逐个把整份列表跑完代价太高，命中一个即可。
+pub fn query_first_on(sock: &UdpSocket, servers: &[(String, u16)]) -> Option<StunMapping> {
+    for (host, port) in servers {
+        let Some(addr) = resolve_stun_addr(host, *port) else {
+            continue;
+        };
+        if let Some(r) = query_with_options(sock, addr, false, false) {
+            return Some(r.mapping);
+        }
+    }
+    None
+}
+
 /// 双 socket 检测结果
 pub struct DualStunResult {
     /// Socket A 的映射结果

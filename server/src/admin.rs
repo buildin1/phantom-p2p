@@ -131,7 +131,46 @@ fn build_router(state: AdminState) -> Router {
         .route("/", get(index_handler))
         .route("/api/login", post(login_handler))
         .route("/api/sessions", get(sessions_handler))
+        .route("/api/punch/stats", get(punch_stats_handler))
         .with_state(state)
+}
+
+/// 打洞看板数据。
+///
+/// 回答三个问题：整体 P2P 成功率是多少（北极星指标）、
+/// 每种 NAT 组合的成功率如何（策略调参的依据）、失败卡在哪个阶段。
+async fn punch_stats_handler(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !is_authorized(&state, &headers).await {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "unauthorized"})),
+        )
+            .into_response();
+    }
+    let Some(db) = crate::database::get_database() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "数据库不可用"})),
+        )
+            .into_response();
+    };
+    // 默认看最近 24 小时；样本太少时统计没有意义，前端据此提示
+    const WINDOW_HOURS: i64 = 24;
+    let overview = db.punch_overview(WINDOW_HOURS).ok();
+    let matrix = db.punch_success_matrix(WINDOW_HOURS).unwrap_or_default();
+    let failures = db.punch_failure_breakdown(WINDOW_HOURS).unwrap_or_default();
+    Json(json!({
+        "window_hours": WINDOW_HOURS,
+        "overview": overview,
+        "matrix": matrix,
+        "failures": failures.into_iter()
+            .map(|(k, v)| json!({"outcome": k, "count": v}))
+            .collect::<Vec<_>>(),
+    }))
+    .into_response()
 }
 
 async fn index_handler() -> impl IntoResponse {

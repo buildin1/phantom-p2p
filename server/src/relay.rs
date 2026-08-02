@@ -1,25 +1,25 @@
-//! 中继服务器 — QUIC + UDP 双通道中继
+//! 中继服务器 — 单端口 QUIC 中继
 //!
-//! 重要设计变更：从 1:1 token 配对改为 1:N 多路复用（类似 FRP 代理模型）。
+//! # 两级复用
 //!
-//! 旧模型：每对 Host↔Guest 使用独立 token，配对后 token 即消耗，仅支持 1v1。
-//! 新模型：一个 token 对应一个 Host 连接 + N 个 Guest 连接，
-//!         所有 Guest 的流通过共享的 Host 连接桥接，支持多玩家同时中继。
+//! 1. **房间内**：一个 token 对应一个 Host 连接 + N 个 Guest 连接，
+//!    所有 Guest 的流通过共享的 Host 连接桥接（FRP 代理模型）。
+//! 2. **房间间**：所有房间共用**同一个** QUIC 监听端口。
+//!    房间标识完全来自首流里的 token，端口从不参与路由——
+//!    QUIC 本就靠 Connection ID 而非四元组区分连接，
+//!    每房间一个端口是在浪费这个能力，还把并发上限锁死在端口数上。
 //!
-//! - QUIC → PIP1 透明三层中继（Guest TUN → Host TUN）
-//! - UDP → UDP 包转发中继
+//! 曾经存在的 UDP 裸转发路径已删除：它从未被生产代码启动过
+//! （唯一调用点在自己的单元测试里），而数据面统一走 QUIC 之后，
+//! 单独维护一条明文通道只会让两套逻辑的 bug 互相掩盖。
 
-use crate::port_pool::RelayPortPool;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::UdpSocket;
 use tokio::sync::{oneshot, Mutex};
 use tokio::time::{Duration, Instant};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
-/// UDP token 魔数
-const UDP_TOKEN_MAGIC: &[u8; 4] = b"PPTK";
 const PIP1_STREAM_MAGIC: &[u8; 4] = b"PIP1";
 
 fn is_pip1_stream(prefix: &[u8; 4]) -> bool {
@@ -82,12 +82,16 @@ fn resolve_room_token(
 /// - 一个 token 下最多有一个 host_connection
 /// - 一个 token 下可以有多个 guest_connection（pending 或已桥接）
 /// - token 在房间关闭前一直有效
+/// **所有房间共用一个 QUIC 端口。**
+///
+/// 房间路由完全靠首流里的 token（见 [`handle_quic_relay_conn`]），
+/// 监听端口从不参与识别。原先"每房间一个端口"是历史遗留的冗余维度，
+/// 还把并发上限人为限制在端口数上——而真实瓶颈是带宽，不是端口。
 pub struct RelayRegistry {
-    /// 端口池
-    port_pool: Arc<Mutex<RelayPortPool>>,
     /// token 有效期
+    #[allow(dead_code)]
     token_timeout: Duration,
-    /// 待配对的 token
+    /// 有效的房间 token
     pending: HashMap<String, PendingToken>,
     /// opaque guest ticket -> room token; guests never receive the host token
     guest_credentials: HashMap<String, String>,
@@ -97,68 +101,28 @@ pub struct RelayRegistry {
     /// 等待 Host 连接的 Guest waiter（token → [tx]）
     /// Guest 连接到达但 Host 未到时，通过 oneshot 等待通知
     guest_host_waiters: HashMap<String, Vec<oneshot::Sender<()>>>,
-    /// 已配对的 UDP 对端（token → 两端地址）
-    udp_pairs: HashMap<String, Vec<SocketAddr>>,
 }
 
 impl RelayRegistry {
-    pub fn new(port_pool: Arc<Mutex<RelayPortPool>>, token_ttl_secs: u64) -> Self {
+    pub fn new(token_ttl_secs: u64) -> Self {
         Self {
-            port_pool,
             token_timeout: Duration::from_secs(token_ttl_secs.max(1)),
             pending: HashMap::new(),
             guest_credentials: HashMap::new(),
             host_connections: HashMap::new(),
             guest_host_waiters: HashMap::new(),
-            udp_pairs: HashMap::new(),
         }
     }
 
-    /// 注册一个新 token（由信令服务器调用）
-    pub async fn register_token(&mut self, token: String) -> Option<u16> {
-        let mut pool = self.port_pool.lock().await;
-        let port = pool.allocate(&token)?;
-
+    /// 登记一个房间 token。不再分配端口——所有房间共用同一个监听端口。
+    pub fn register_token(&mut self, token: String) {
         self.pending.insert(
             token.clone(),
             PendingToken {
                 created_at: Instant::now(),
             },
         );
-
-        info!("[中继注册] token:{} 分配端口 {}", token, port);
-        Some(port)
-    }
-
-    /// 注册 token 并排除不可用端口
-    pub async fn register_token_excluding(
-        &mut self,
-        token: String,
-        excluded: &HashSet<u16>,
-    ) -> Option<u16> {
-        let mut pool = self.port_pool.lock().await;
-        let port = pool.allocate_excluding(&token, excluded)?;
-
-        self.pending.insert(
-            token.clone(),
-            PendingToken {
-                created_at: Instant::now(),
-            },
-        );
-
-        info!(
-            "[中继注册] token:{} 分配端口 {} (排除 {} 个端口)",
-            token,
-            port,
-            excluded.len()
-        );
-        Some(port)
-    }
-
-    /// 标记端口不可用
-    pub async fn mark_port_unavailable(&mut self, port: u16) -> bool {
-        let mut pool = self.port_pool.lock().await;
-        pool.remove_port(port)
+        info!("[中继注册] token:{} 已登记", token);
     }
 
     /// 检查 token 是否有效
@@ -166,7 +130,7 @@ impl RelayRegistry {
         self.pending.contains_key(token)
     }
 
-    /// 消耗 token（房间关闭时调用）
+    /// 释放 token（房间关闭，或全员已切到 P2P 直连时调用）
     pub async fn consume_token(&mut self, token: &str) {
         self.pending.remove(token);
         self.host_connections.remove(token);
@@ -175,10 +139,7 @@ impl RelayRegistry {
                 let _ = w.send(());
             }
         }
-        self.udp_pairs.remove(token);
         self.guest_credentials.retain(|_, room| room != token);
-        let mut pool = self.port_pool.lock().await;
-        pool.release(token);
     }
 
     pub fn register_guest_credential(&mut self, room_token: &str, credential: String) {
@@ -186,7 +147,12 @@ impl RelayRegistry {
             .insert(credential, room_token.to_string());
     }
 
-    /// 清理过期 token 并释放端口
+    /// 当前占用中继资源的房间数（容量观测用）
+    pub fn active_room_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// 清理过期 token
     pub async fn cleanup_expired(&mut self) {
         // Room tokens are leases, not short-lived handshakes. They are
         // released explicitly when the room closes so late joiners and
@@ -590,96 +556,6 @@ async fn relay_streams(
 }
 
 // ============================================================
-// UDP 中继（UDP 游戏）
-// ============================================================
-
-/// 启动 UDP 中继监听
-///
-/// UDP 中继也改为 1:N 模式：
-/// - 一个 token 下可以有多个 Host↔Guest 对
-/// - token 不因配对而消耗，直到房间关闭
-pub async fn start_udp_relay(bind_port: u16, registry: SharedRegistry) -> Result<(), String> {
-    let bind_addr: SocketAddr = format!("0.0.0.0:{}", bind_port).parse().unwrap();
-    let sock = UdpSocket::bind(bind_addr)
-        .await
-        .map_err(|e| format!("UDP 中继绑定 {} 失败: {}", bind_addr, e))?;
-
-    let sock = Arc::new(sock);
-    info!("[中继-UDP] 监听 {}", bind_addr);
-
-    // token → 对端地址列表（支持多个对端）
-    let token_clients: Arc<Mutex<HashMap<String, Vec<SocketAddr>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-    // 已配对的地址集合（用于转发）
-    let routes: Arc<Mutex<HashMap<SocketAddr, String>>> = Arc::new(Mutex::new(HashMap::new()));
-
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; 65536];
-        loop {
-            match sock.recv_from(&mut buf).await {
-                Ok((n, from)) => {
-                    // 检查是否是 token 首包
-                    if n > 4 && &buf[..4] == UDP_TOKEN_MAGIC {
-                        let token = String::from_utf8_lossy(&buf[4..n]).to_string();
-                        debug!("[中继-UDP] {} 提交 token: {}", from, token);
-
-                        // 验证 token
-                        {
-                            let reg = registry.lock().await;
-                            if !reg.is_valid(&token) {
-                                warn!("[中继-UDP] {} token 无效: {}", from, token);
-                                continue;
-                            }
-                        }
-
-                        let mut clients = token_clients.lock().await;
-                        let entry = clients.entry(token.clone()).or_insert_with(Vec::new);
-                        // 不重复添加
-                        if !entry.contains(&from) {
-                            entry.push(from);
-                        }
-
-                        // 只要 entry 数量 >= 2，本端就可以路由
-                        if entry.len() >= 2 {
-                            let mut r = routes.lock().await;
-                            r.insert(from, token.clone());
-                        }
-
-                        info!(
-                            "[中继-UDP] token:{} 注册客户端 {} (当前 {} 个客户端)",
-                            token,
-                            from,
-                            entry.len()
-                        );
-                        continue;
-                    }
-
-                    // 游戏数据帧：查找路由并广播给 token 下的所有其他客户端
-                    let r = routes.lock().await;
-                    if let Some(token) = r.get(&from) {
-                        let clients = token_clients.lock().await;
-                        if let Some(peers) = clients.get(token) {
-                            for &peer in peers {
-                                if peer != from {
-                                    if let Err(e) = sock.send_to(&buf[..n], peer).await {
-                                        warn!("[中继-UDP] 转发 {} → {} 失败: {}", from, peer, e);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("[中继-UDP] 接收失败: {}", e);
-                }
-            }
-        }
-    });
-
-    Ok(())
-}
-
-// ============================================================
 // 证书辅助
 // ============================================================
 
@@ -732,73 +608,5 @@ mod tests {
         assert!(is_pip1_stream(b"PIP1"));
         assert!(!is_pip1_stream(b"\0\0\x27\x15"));
         assert!(!is_pip1_stream(b"PIP2"));
-    }
-
-    /// End-to-end smoke test for the UDP relay's core forwarding path:
-    /// two "clients" bind real loopback sockets, perform the PPTK token
-    /// handshake against a live `start_udp_relay` instance, and exchange a
-    /// packet through it in both directions. This exercises the exact code
-    /// path `server/src/main.rs` wires up for real Host/Guest UDP sessions,
-    /// without needing a full client stack or TUN devices.
-    #[tokio::test]
-    async fn udp_relay_forwards_packets_between_registered_peers() {
-        let port_pool = Arc::new(Mutex::new(crate::port_pool::RelayPortPool::new(
-            40000, 40100,
-        )));
-        let mut registry = RelayRegistry::new(port_pool, 60);
-        registry
-            .register_token("smoke-token".to_string())
-            .await
-            .expect("port pool should have room for one token");
-        let registry: SharedRegistry = Arc::new(Mutex::new(registry));
-
-        // Bind the relay itself on an OS-assigned loopback port so the test
-        // cannot collide with another instance running concurrently.
-        let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let relay_port = probe.local_addr().unwrap().port();
-        drop(probe);
-        start_udp_relay(relay_port, registry.clone())
-            .await
-            .expect("relay should bind its UDP socket");
-        let relay_addr: SocketAddr = format!("127.0.0.1:{relay_port}").parse().unwrap();
-
-        let host_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let guest_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-
-        let mut token_packet = UDP_TOKEN_MAGIC.to_vec();
-        token_packet.extend_from_slice(b"smoke-token");
-
-        // Host registers first (alone in the token's client list, so it does
-        // not get a route yet), then the guest joins (crossing the >= 2
-        // threshold that unlocks routing for whoever sends after that
-        // point). Real clients keep resending this handshake packet as a
-        // keepalive, so the host re-sends once more to pick up its route --
-        // mirroring how the production Host/Guest UDP session comes up.
-        host_sock.send_to(&token_packet, relay_addr).await.unwrap();
-        guest_sock.send_to(&token_packet, relay_addr).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        host_sock.send_to(&token_packet, relay_addr).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        host_sock
-            .send_to(b"ping-payload", relay_addr)
-            .await
-            .unwrap();
-        let mut buf = [0u8; 128];
-        let (n, _) = tokio::time::timeout(Duration::from_secs(2), guest_sock.recv_from(&mut buf))
-            .await
-            .expect("guest did not receive the forwarded packet in time")
-            .unwrap();
-        assert_eq!(&buf[..n], b"ping-payload");
-
-        guest_sock
-            .send_to(b"pong-payload", relay_addr)
-            .await
-            .unwrap();
-        let (n, _) = tokio::time::timeout(Duration::from_secs(2), host_sock.recv_from(&mut buf))
-            .await
-            .expect("host did not receive the forwarded packet in time")
-            .unwrap();
-        assert_eq!(&buf[..n], b"pong-payload");
     }
 }

@@ -36,10 +36,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         "info"
     };
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new(filter))
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+    // 与桌面端一致的分层日志：按用途拆文件 + 按大小轮转 + 重复抑制，
+    // 这样 `log/` 目录可以直接打包上报给服务端聚合分析。
+    std::env::set_var("RUST_LOG", filter);
+    if let Err(e) = phantom_core::logging::init(&runtime::log_directory(), args.verbose) {
+        eprintln!("[日志] 分层日志初始化失败，仅输出到控制台: {}", e);
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new(filter))
+            .with(tracing_subscriber::fmt::layer())
+            .init();
+    }
 
     println!("PhantomP2P Linux Headless {}", env!("CARGO_PKG_VERSION"));
     println!("Linux TUN requires root or CAP_NET_ADMIN.");

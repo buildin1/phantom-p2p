@@ -1,6 +1,6 @@
 [package]
 name = "phantom-core"
-version = "2.7.7"
+version = "3.0.0"
 edition = "2021"
 
 [lib]
@@ -26,6 +26,15 @@ ipnetwork = "0.20"
 socket2 = { version = "0.5", features = ["all"] }
 ureq = { version = "2", features = ["json"] }
 serde_json = "1"
+# overlay 端到端加密：中继只做盲转发，永远看不到明文
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+# 日志包上传：打成 zip 便于人工排障时直接解压查看
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

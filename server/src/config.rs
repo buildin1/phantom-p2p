@@ -24,6 +24,59 @@ pub struct ServerConfig {
     pub port_allocation: PortAllocationConfig,
     #[serde(default)]
     pub admin: AdminConfig,
+    #[serde(default)]
+    pub stun: StunConfig,
+    #[serde(default)]
+    pub log_upload: LogUploadConfig,
+}
+
+/// 日志包接收服务配置。
+///
+/// 观测模型是集中式的——用户不会主动收集日志，排障靠客户端上报。
+#[derive(Debug, Clone, Deserialize)]
+pub struct LogUploadConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 监听地址
+    #[serde(default = "default_log_upload_bind")]
+    pub bind: String,
+    /// 下发给客户端的可访问基址（含协议与端口）。
+    /// 留空则用 `http://<relay.public_addr>:<bind 端口>` 推导。
+    #[serde(default)]
+    pub public_base: String,
+    /// 日志包落盘目录
+    #[serde(default = "default_log_store")]
+    pub store_dir: String,
+}
+
+/// 自建 STUN 服务配置。
+///
+/// 自建 STUN 是打洞链路的关键一环：公共 STUN 一旦不可用，
+/// 客户端就拿不到 srflx 候选，**必然落中继**。实测三台境外公共 STUN
+/// 曾在单次会话内全部超时。
+#[derive(Debug, Clone, Deserialize)]
+pub struct StunConfig {
+    /// 是否启用自建 STUN
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 主端口
+    #[serde(default = "default_stun_port")]
+    pub port: u16,
+    /// 备用端口。
+    ///
+    /// **判定 NAT 映射行为至少需要两个不同的目标端点**——
+    /// 客户端从同一个 socket 分别打这两个端口，
+    /// 比较返回的映射端口是否一致，才能区分锥形与对称。
+    /// 只有单端口时无法完成这个判定。
+    #[serde(default = "default_stun_alt_port")]
+    pub alt_port: u16,
+    /// 公网地址（下发给客户端）。留空则复用 `relay.public_addr`。
+    #[serde(default)]
+    pub public_addr: String,
+    /// 备用的第三方公共 STUN 服务器，自建不可用时兜底。
+    /// 格式 `"host:port"`。
+    #[serde(default)]
+    pub fallback_servers: Vec<String>,
 }
 
 /// 信令服务器配置
@@ -40,10 +93,16 @@ pub struct SignalConfig {
 pub struct RelayConfig {
     #[serde(default = "default_relay_addr")]
     pub public_addr: String,
-    #[serde(default = "default_relay_port_start")]
-    pub port_start: u16,
-    #[serde(default = "default_relay_port_end")]
-    pub port_end: u16,
+    /// **全局唯一的中继 QUIC 端口**。
+    ///
+    /// 所有房间共用这一个端口——房间路由靠流内 token，端口不参与识别，
+    /// 每房间一个端口是历史遗留的冗余维度，还把并发上限人为限制在端口数上。
+    ///
+    /// 默认 443/UDP：受限网络（企业、校园、酒店）普遍放行，
+    /// 而中继连不上就意味着彻底失败，穿透率在这里很关键。
+    /// 注意 TCP/443 与 UDP/443 是两套端口空间，不冲突。
+    #[serde(default = "default_relay_quic_port")]
+    pub quic_port: u16,
     #[serde(default = "default_token_ttl")]
     pub token_ttl_secs: u64,
 }
@@ -88,11 +147,20 @@ fn default_signal_port() -> u16 {
 fn default_relay_addr() -> String {
     "127.0.0.1".to_string()
 }
-fn default_relay_port_start() -> u16 {
-    10113
+fn default_relay_quic_port() -> u16 {
+    443
 }
-fn default_relay_port_end() -> u16 {
-    10213
+fn default_stun_port() -> u16 {
+    3478
+}
+fn default_stun_alt_port() -> u16 {
+    3479
+}
+fn default_log_upload_bind() -> String {
+    "0.0.0.0:10211".to_string()
+}
+fn default_log_store() -> String {
+    "log_uploads".to_string()
 }
 fn default_guest_port_start() -> u16 {
     25600
@@ -120,7 +188,37 @@ impl Default for ServerConfig {
             auth: AuthConfig::default(),
             port_allocation: PortAllocationConfig::default(),
             admin: AdminConfig::default(),
+            stun: StunConfig::default(),
+            log_upload: LogUploadConfig::default(),
         }
+    }
+}
+
+impl Default for LogUploadConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bind: default_log_upload_bind(),
+            public_base: String::new(),
+            store_dir: default_log_store(),
+        }
+    }
+}
+
+impl LogUploadConfig {
+    /// 下发给客户端的基址。未显式配置时按中继公网地址 + 监听端口推导，
+    /// 避免部署方漏配导致客户端拿到 `0.0.0.0` 这种传不上去的地址。
+    pub fn effective_base(&self, relay_addr: &str) -> String {
+        if !self.public_base.trim().is_empty() {
+            return self.public_base.trim_end_matches('/').to_string();
+        }
+        let port = self
+            .bind
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(10211);
+        format!("http://{}:{}", relay_addr, port)
     }
 }
 
@@ -137,9 +235,31 @@ impl Default for RelayConfig {
     fn default() -> Self {
         Self {
             public_addr: default_relay_addr(),
-            port_start: default_relay_port_start(),
-            port_end: default_relay_port_end(),
+            quic_port: default_relay_quic_port(),
             token_ttl_secs: default_token_ttl(),
+        }
+    }
+}
+
+impl Default for StunConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            port: default_stun_port(),
+            alt_port: default_stun_alt_port(),
+            public_addr: String::new(),
+            fallback_servers: Vec::new(),
+        }
+    }
+}
+
+impl StunConfig {
+    /// 对外公布的 STUN 地址，未单独配置时复用中继的公网地址
+    pub fn effective_addr(&self, relay_addr: &str) -> String {
+        if self.public_addr.trim().is_empty() {
+            relay_addr.to_string()
+        } else {
+            self.public_addr.clone()
         }
     }
 }
@@ -258,11 +378,36 @@ port = {}
 [relay]
 # 中继服务器公网地址（客户端连接用）
 public_addr = "{}"
-# 中继端口池范围（单池，按房间协议动态调度）
-port_start = {}
-port_end = {}
+# 全局唯一的中继 QUIC 端口，所有房间共用（房间靠流内 token 路由，端口不参与识别）。
+# 默认 443/UDP：受限网络普遍放行，中继连不上等于彻底失败，穿透率在这里很关键。
+# 注意 TCP/443 与 UDP/443 是两套端口空间，不冲突。
+quic_port = {}
 # 中继令牌有效期（秒）
 token_ttl_secs = {}
+
+[stun]
+# 是否启用自建 STUN。强烈建议开启——公共 STUN 一旦不可用，
+# 客户端拿不到 srflx 候选就必然落中继。
+enabled = {}
+# STUN 主端口
+port = {}
+# STUN 备用端口。判定 NAT 映射行为至少需要两个不同的目标端点，
+# 客户端分别打这两个端口比较映射是否一致，才能区分锥形与对称。
+alt_port = {}
+# 对外公布的 STUN 地址，留空则复用 relay.public_addr
+public_addr = "{}"
+# 第三方公共 STUN 兜底（格式 "host:port"），自建不可用时使用
+fallback_servers = []
+
+[log_upload]
+# 是否启用日志包接收服务（关掉就无法远程排障）
+enabled = {}
+# 接收服务监听地址
+bind = "{}"
+# 下发给客户端的可访问基址；留空则按 http://<relay.public_addr>:<端口> 推导
+public_base = "{}"
+# 日志包落盘目录，按 user_id 分子目录存放
+store_dir = "{}"
 
 [port_allocation]
 # 客人端口分配范围
@@ -283,9 +428,16 @@ bind = "{}"
         config.signal.bind,
         config.signal.port,
         config.relay.public_addr,
-        config.relay.port_start,
-        config.relay.port_end,
+        config.relay.quic_port,
         config.relay.token_ttl_secs,
+        config.stun.enabled,
+        config.stun.port,
+        config.stun.alt_port,
+        config.stun.public_addr,
+        config.log_upload.enabled,
+        config.log_upload.bind,
+        config.log_upload.public_base,
+        config.log_upload.store_dir,
         config.port_allocation.guest_port_start,
         config.port_allocation.guest_port_end,
         config.auth.enabled,

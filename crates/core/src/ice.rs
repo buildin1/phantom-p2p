@@ -44,6 +44,9 @@ pub fn ice_priority(ctype: CandidateType, local_preference: u16) -> u32 {
     let type_pref: u32 = match ctype {
         CandidateType::Host => 126,
         CandidateType::ServerReflexive => 100,
+        // 策略候选是预测/撒网出来的猜测地址，绝大多数不会命中，
+        // 优先级必须低于真实探测到的 srflx，但高于中继。
+        CandidateType::Strategy => 50,
         CandidateType::Relay => 0,
     };
     (1u32 << 24) * type_pref + (1u32 << 8) * (local_preference as u32) + 255
