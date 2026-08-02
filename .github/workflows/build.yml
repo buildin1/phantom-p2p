@@ -133,6 +133,13 @@ jobs:
             -DAPP_VERSION="$version" `
             build\windows-installer-arm64.nsi
           if ($LASTEXITCODE -ne 0) { throw "makensis 失败 (exit=$LASTEXITCODE)" }
+      - name: Remove raw DLLs from the release folder
+        shell: pwsh
+        run: |
+          # 发布包只留三个成品：exe、server、setup.exe。
+          # wintun.dll 和 WebView2Loader.dll 已被 setup 打进安装器，
+          # 不需要再以裸文件形式随发布包分发。
+          Remove-Item build\release\windows-arm64\wintun.dll,build\release\windows-arm64\WebView2Loader.dll -Force
       - uses: actions/upload-artifact@v4
         with:
           name: phantom-p2p-windows-arm64
