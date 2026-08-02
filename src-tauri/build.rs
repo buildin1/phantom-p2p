@@ -25,9 +25,9 @@ fn main() {
         if !dest.exists() {
             panic!(
                 "缺少特权 TUN 提权 helper（{}）。请先编译：\n  \
-                 cargo build --release -p macos-helper --target {target}\n  \
+                 cargo build --release -p macos-helper\n  \
                  mkdir -p src-tauri/binaries\n  \
-                 cp target/{target}/release/macos-helper {}",
+                 cp target/release/macos-helper {}",
                 dest.display(),
                 dest.display(),
             );
