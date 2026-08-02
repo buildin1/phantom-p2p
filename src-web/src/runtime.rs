@@ -384,14 +384,14 @@ impl HeadlessRuntime {
             ServerMessage::PunchStart {
                 peer_session_id,
                 peer_candidates,
-                start_at_ms,
+                start_delay_ms,
                 ..
             } => {
                 let runtime = self.clone();
                 let peer_id = peer_session_id.clone();
                 let task = tokio::spawn(async move {
                     runtime
-                        .handle_punch_start(peer_session_id, peer_candidates, start_at_ms)
+                        .handle_punch_start(peer_session_id, peer_candidates, start_delay_ms)
                         .await;
                 });
                 if self.state.lock().await.is_host {
@@ -443,14 +443,20 @@ impl HeadlessRuntime {
     /// 取服务端下发的 STUN 列表（自建优先）。
     /// 客户端不内置任何地址——公共 STUN 不可用时会直接导致拿不到 srflx 候选而落中继。
     async fn stun_servers(&self) -> Vec<(String, u16)> {
-        match self.signal.network_config().await {
+        // 必须等配置到位再探测：拿空列表跑完只会得到 class=Unknown、
+        // 没有 srflx 候选，打洞从一开始就注定失败
+        match self
+            .signal
+            .wait_for_network_config(std::time::Duration::from_secs(5))
+            .await
+        {
             Some(cfg) => cfg
                 .stun_servers
                 .iter()
                 .map(|s| (s.host.clone(), s.port))
                 .collect(),
             None => {
-                tracing::warn!("[打洞] 服务端尚未下发 STUN 配置");
+                tracing::warn!("[打洞] 服务端未下发 STUN 配置，无法获得公网映射");
                 Vec::new()
             }
         }
@@ -604,7 +610,7 @@ impl HeadlessRuntime {
         self: Arc<Self>,
         peer_session_id: String,
         peer_candidates: Vec<IceCandidate>,
-        start_at_ms: u64,
+        start_delay_ms: u32,
     ) {
         let key = self.session_key(&peer_session_id).await;
         let (is_host, room_code) = {
@@ -630,7 +636,7 @@ impl HeadlessRuntime {
         };
 
         self.emit("punch:phase", puncher::PunchPhase::Punching);
-        let outcome = session.run(peer_candidates, start_at_ms, ctx).await;
+        let outcome = session.run(peer_candidates, start_delay_ms, ctx).await;
 
         // 成败都上报——失败样本对分析 NAT 组合成功率同样重要
         if let Err(e) = self

@@ -489,12 +489,14 @@ fn is_permanent_failure(e: &std::io::Error) -> bool {
 /// * `sockets` —— 本端所有可用 socket；`sockets[0]` 是主探测 socket，
 ///   其余是策略新建的（原则 B：对称侧靠 socket 数量堆概率）。
 /// * `targets` —— 由 [`build_targets`] 生成的目标地址表。
-/// * `start_at_ms` —— 服务端下发的统一起始时刻，双方对齐后同时开打。
+/// * `start_delay_ms` —— 服务端为本端算好的起跑等待时长（已扣除本端单程延迟）。
+///
+/// 返回 `(成功结果, 实际等待的毫秒数)`，后者用于遥测核对同步质量。
 pub async fn execute(
     sockets: Vec<Arc<UdpSocket>>,
     targets: Vec<SocketAddr>,
     params: PunchParams,
-    start_at_ms: u64,
+    start_delay_ms: u32,
 ) -> (Option<PunchSuccess>, i32) {
     if sockets.is_empty() || targets.is_empty() {
         warn!("[打洞] socket 或目标为空，放弃");
@@ -508,20 +510,27 @@ pub async fn execute(
         network::tune_punch_socket(s);
     }
 
+    // 打洞 socket 是 AF_INET6 双栈的，**不能直接接收 IPv4 的 sockaddr_in**——
+    // 传原始 IPv4 地址会让 send_to 返回 WSAEFAULT(10014) 而不是发出去。
+    // 必须先转成 IPv4-mapped（::ffff:a.b.c.d）。
+    // 漏掉这一步会让所有 IPv4 目标 100% 发送失败，而 IPv6 目标照常工作，
+    // 于是只有纯 IPv4 环境会静默退化到中继。
+    let reference = &sockets[0];
     let mut targets: Vec<Target> = targets
         .into_iter()
         .map(|addr| Target {
-            addr,
+            addr: network::compatible_socket_addr(reference, addr),
             ctype: CandidateType::Strategy,
             dead: false,
         })
         .collect();
 
-    // 对齐到服务端下发的起始时刻
-    let now = now_ms();
-    let skew_ms = start_at_ms as i64 - now as i64;
-    if skew_ms > 0 && skew_ms <= 5_000 {
-        tokio::time::sleep(Duration::from_millis(skew_ms as u64)).await;
+    // 等待服务端为本端计算好的起跑时长。
+    // 用相对延迟而非绝对时间戳：后者要求两端与服务端墙钟一致，
+    // 客户端时钟偏差会等量地破坏同步（实测偏差曾达 3.5 秒）。
+    let waited = start_delay_ms.min(5_000);
+    if waited > 0 {
+        tokio::time::sleep(Duration::from_millis(waited as u64)).await;
     }
 
     info!(
@@ -551,7 +560,7 @@ pub async fn execute(
                 alive,
                 targets.len()
             );
-            return (None, skew_ms as i32);
+            return (None, waited as i32);
         }
 
         // ── 发送 ────────────────────────────────────────────────
@@ -629,7 +638,7 @@ pub async fn execute(
                                     rtt_ms: rtt,
                                     ctype,
                                 }),
-                                skew_ms as i32,
+                                waited as i32,
                             );
                         }
                     }
@@ -818,7 +827,7 @@ impl Session {
     pub async fn run(
         &mut self,
         peer_candidates: Vec<IceCandidate>,
-        start_at_ms: u64,
+        start_delay_ms: u32,
         ctx: RecordContext,
     ) -> SessionOutcome {
         let Some(plan) = self.plan.take() else {
@@ -845,7 +854,7 @@ impl Session {
         let targets = build_targets(plan.params, &plan.peer_profile, &peer_candidates);
         let punch_started = Instant::now();
         let (success, skew) =
-            execute(self.sockets.clone(), targets, plan.params, start_at_ms).await;
+            execute(self.sockets.clone(), targets, plan.params, start_delay_ms).await;
         let establish_ms = punch_started.elapsed().as_millis() as u32;
 
         let profile = self.profile.clone().unwrap_or_else(placeholder_profile);
@@ -1147,6 +1156,40 @@ mod tests {
         assert!(is_ack(&ack));
         // 应答必须回显对端的时间戳，否则算不出真实 RTT
         assert_eq!(&ack[4..12], &probe[4..12]);
+    }
+
+    /// 双栈 socket 必须把 IPv4 目标转成 IPv4-mapped 才能发出去。
+    ///
+    /// 回归测试：曾经漏掉这一步，导致 `send_to` 对每个 IPv4 目标都返回
+    /// `WSAEFAULT(10014)`，纯 IPv4 环境 100% 打洞失败并静默退化到中继；
+    /// 而 IPv6 目标不需要转换，所以有 IPv6 的环境把问题完全掩盖了。
+    #[test]
+    fn ipv4_targets_are_mapped_for_dual_stack_sockets() {
+        let sock = network::bind_dual_stack_udp(0).expect("bind dual-stack");
+        assert!(
+            sock.local_addr().unwrap().is_ipv6(),
+            "打洞 socket 应为 AF_INET6 双栈"
+        );
+
+        let v4: SocketAddr = "192.168.1.100:59854".parse().unwrap();
+        let mapped = network::compatible_socket_addr(&sock, v4);
+        assert!(
+            mapped.is_ipv6(),
+            "IPv4 目标必须转成 IPv4-mapped，否则 send_to 会 WSAEFAULT"
+        );
+        assert_eq!(mapped.port(), 59854, "端口不能在转换中丢失");
+        match mapped.ip() {
+            IpAddr::V6(v6) => assert_eq!(
+                v6.to_ipv4_mapped(),
+                Some("192.168.1.100".parse().unwrap()),
+                "映射后应能还原出原始 IPv4"
+            ),
+            _ => panic!("期望 IPv6 形式"),
+        }
+
+        // IPv6 目标必须原样保留
+        let v6: SocketAddr = "[2001:db8::1]:1234".parse().unwrap();
+        assert_eq!(network::compatible_socket_addr(&sock, v6), v6);
     }
 
     #[test]

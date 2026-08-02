@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 /// 客户端在 [`ClientMessage::Auth`] 中声明，服务端不匹配则回
 /// [`ServerMessage::VersionMismatch`]。**任何消息结构变更都必须递增此值**，
 /// 否则会出现难以定位的反序列化失败。
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 // ============================================================
 // ICE 候选
@@ -727,15 +727,22 @@ pub enum ServerMessage {
         needs_strategy_candidates: bool,
     },
 
-    /// **阶段三**：下发对端完整候选与统一起始时刻，双方同时开打
+    /// **阶段三**：下发对端完整候选，双方同时开打
     #[serde(rename = "punch_start")]
     PunchStart {
         peer_session_id: String,
         attempt_id: String,
         peer_candidates: Vec<IceCandidate>,
-        /// Unix 毫秒时间戳。由服务端按双方实测信令 RTT 计算，
-        /// 而非固定偏移——固定 200ms 在跨省链路上等于没有同步。
-        start_at_ms: u64,
+        /// **收到本消息后再等多少毫秒开始打洞**。
+        ///
+        /// 不用绝对时间戳：那要求两端与服务端的墙钟一致，而客户端时钟
+        /// 偏差会**直接等量地破坏同步**——实测偏差曾达 3.5 秒，
+        /// 远超同步窗口本身。
+        ///
+        /// 服务端为每一端单独计算：从统一的目标时刻减去**该端自己的**
+        /// 单程延迟（RTT/2），于是 RTT 大的一方等得少、小的一方等得多，
+        /// 两端实际起跑时刻对齐，且完全不依赖任何一方的时钟。
+        start_delay_ms: u32,
     },
 
     /// 请求客户端上传完整日志包（排障用，走独立 HTTP POST）

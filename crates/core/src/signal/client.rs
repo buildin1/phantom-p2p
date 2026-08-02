@@ -121,6 +121,25 @@ impl SignalClient {
         self.network_config.read().await.clone()
     }
 
+    /// 等待服务端下发网络配置，最多等 `timeout`。
+    ///
+    /// 探测 NAT 画像**必须**先拿到 STUN 列表，否则会以空列表跑完探测、
+    /// 得到 `class=Unknown` 且没有 srflx 候选，打洞从一开始就注定失败。
+    /// 实测这个竞态确实会发生：配置未到时探测只花 4ms 就"完成"了。
+    pub async fn wait_for_network_config(&self, timeout: Duration) -> Option<NetworkConfig> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(cfg) = self.network_config.read().await.clone() {
+                return Some(cfg);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                warn!("[信令] 等待网络配置超时，STUN 列表为空将导致打洞失败");
+                return None;
+            }
+            time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// 获取当前连接状态
     pub async fn get_state(&self) -> ConnectionState {
         self.state.read().await.clone()
@@ -204,9 +223,12 @@ impl SignalClient {
                         let (tx, mut cmd_rx) = mpsc::unbounded_channel::<ClientMessage>();
                         *cmd_tx.lock().await = Some(tx);
 
-                        // 心跳定时器
+                        // 心跳定时器。
+                        // **不 reset**：首个 tick 立即触发，让 RTT 尽早测出来。
+                        // 之前 reset 后要等满 15 秒，而打洞往往在连上几秒内就发起，
+                        // 于是画像里带的是 signal_rtt_ms=0，服务端据此算出的
+                        // 同步窗口完全失真。
                         let mut heartbeat_interval = time::interval(Duration::from_secs(15));
-                        heartbeat_interval.reset(); // 避免立即触发
 
                         // 消息循环
                         loop {

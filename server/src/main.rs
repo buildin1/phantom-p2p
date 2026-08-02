@@ -1096,17 +1096,27 @@ async fn guest_relay_credential(registry: &relay::SharedRegistry, room_token: &s
     credential
 }
 
-/// 计算打洞的**自适应同步窗口**。
+/// 计算双方各自的**起跑等待时长**。
 ///
-/// 旧实现固定 `now + 200ms`：一旦信令 RTT 超过 200ms（跨省/跨运营商很常见），
-/// 时间戳到达客户端时已成过去，客户端不会等待，同步形同虚设。
-/// 这里按双方实测 RTT 取较大者放大后作为提前量，并夹在 [500ms, 3s]。
-fn compute_start_at_ms(host_rtt_ms: u32, guest_rtt_ms: u32) -> u64 {
-    const MIN_LEAD_MS: u64 = 500;
-    const MAX_LEAD_MS: u64 = 3_000;
-    let worst = host_rtt_ms.max(guest_rtt_ms) as u64;
+/// 返回 `(host 等待毫秒, guest 等待毫秒)`。
+///
+/// 不下发绝对时间戳：那要求两端与服务端的墙钟一致，而客户端时钟偏差会
+/// **等量地破坏同步**——实测偏差达 3.5 秒，比同步窗口本身还大。
+///
+/// 改成"收到后再等 N 毫秒"，并为每端减去**它自己的**单程延迟（RTT/2）：
+/// 消息晚到的一方等得少，早到的一方等得多，两端实际起跑时刻因而对齐，
+/// 且完全不依赖任何一方的时钟。
+fn compute_start_delays(host_rtt_ms: u32, guest_rtt_ms: u32) -> (u32, u32) {
+    const MIN_LEAD_MS: u32 = 500;
+    const MAX_LEAD_MS: u32 = 3_000;
+    // 统一的目标提前量按较慢一方决定，保证两端都来得及
+    let worst = host_rtt_ms.max(guest_rtt_ms);
     let lead = (worst * 3 / 2 + 200).clamp(MIN_LEAD_MS, MAX_LEAD_MS);
-    now_ms() + lead
+    // 各自扣掉自己的单程延迟；saturating_sub 保证不会因 RTT 异常大而下溢
+    (
+        lead.saturating_sub(host_rtt_ms / 2),
+        lead.saturating_sub(guest_rtt_ms / 2),
+    )
 }
 
 /// **阶段一**：收到一端的 NAT 画像与基础候选。
@@ -1363,18 +1373,20 @@ async fn try_advance_punch(room_code: &str, guest_sid: &str, state: &SharedState
                 sess.attempt_id.clone(),
                 sess.host.all_candidates(),
                 sess.guest.all_candidates(),
-                compute_start_at_ms(host_rtt, guest_rtt),
+                compute_start_delays(host_rtt, guest_rtt),
             ))
         }
     };
 
-    if let Some((host_sid, attempt_id, host_cands, guest_cands, start_at_ms)) = start {
+    if let Some((host_sid, attempt_id, host_cands, guest_cands, (host_delay, guest_delay))) = start
+    {
         info!(
-            "[打洞] 房间 {} 配对 {}↔{} 同步启动: start_at={} host候选={} guest候选={}",
+            "[打洞] 房间 {} 配对 {}↔{} 同步启动: 等待 host={}ms guest={}ms, host候选={} guest候选={}",
             room_code,
             host_sid,
             guest_sid,
-            start_at_ms,
+            host_delay,
+            guest_delay,
             host_cands.len(),
             guest_cands.len()
         );
@@ -1384,7 +1396,7 @@ async fn try_advance_punch(room_code: &str, guest_sid: &str, state: &SharedState
                 peer_session_id: guest_sid.to_string(),
                 attempt_id: attempt_id.clone(),
                 peer_candidates: guest_cands,
-                start_at_ms,
+                start_delay_ms: host_delay,
             });
         }
         if let Some(s) = st.sessions.get(guest_sid) {
@@ -1392,7 +1404,7 @@ async fn try_advance_punch(room_code: &str, guest_sid: &str, state: &SharedState
                 peer_session_id: host_sid.clone(),
                 attempt_id,
                 peer_candidates: host_cands,
-                start_at_ms,
+                start_delay_ms: guest_delay,
             });
         }
     }
@@ -2286,5 +2298,47 @@ async fn main() {
                 warn!("[连接] accept 失败: {}", e);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod sync_window_tests {
+    use super::compute_start_delays;
+
+    /// 两端实际起跑时刻必须对齐。
+    ///
+    /// 消息晚到的一方（RTT 大）等得少，早到的一方等得多，
+    /// 两者相加后落在同一时刻。回归测试：早先下发的是绝对时间戳，
+    /// 客户端拿自己的墙钟去比，时钟偏差直接等量破坏同步，实测偏差 3.5 秒。
+    #[test]
+    fn both_sides_start_at_the_same_moment() {
+        let (host, guest) = compute_start_delays(400, 40);
+        // host 单程 200ms、guest 单程 20ms，各自等待加上单程延迟应相等
+        assert_eq!(host + 200, guest + 20, "两端起跑时刻应对齐");
+    }
+
+    /// RTT 差异越大，等待时长差异越大，方向必须正确
+    #[test]
+    fn slower_peer_waits_less() {
+        let (slow, fast) = compute_start_delays(600, 20);
+        assert!(slow < fast, "RTT 大的一方消息到得晚，应该等更短");
+    }
+
+    #[test]
+    fn lead_is_clamped_to_sane_bounds() {
+        // RTT 为 0 时也要留出最小提前量，否则等于没有同步
+        let (h, g) = compute_start_delays(0, 0);
+        assert_eq!((h, g), (500, 500));
+
+        // RTT 极大时提前量封顶，不能让用户干等
+        let (h, g) = compute_start_delays(10_000, 10_000);
+        assert!(h <= 3_000 && g <= 3_000, "提前量必须封顶");
+    }
+
+    /// RTT 异常大于提前量时不能下溢成巨值
+    #[test]
+    fn extreme_rtt_does_not_underflow() {
+        let (h, g) = compute_start_delays(60_000, 0);
+        assert!(h <= 3_000 && g <= 3_000, "saturating_sub 应防住下溢");
     }
 }

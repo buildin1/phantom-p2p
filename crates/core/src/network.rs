@@ -82,7 +82,24 @@ fn disable_udp_conn_reset(sock: &UdpSocket) {
     }
 }
 
-/// 枚举本机所有非回环 IPv4 地址（排除本产品自己的 overlay 网卡）
+/// 该 IPv4 地址是否**不可能**成为有效的打洞候选。
+///
+/// 私有网段（10/8、172.16/12、192.168/16）**必须保留**——同一局域网内
+/// 直连正是靠它们。这里只剔除那些拿去打洞纯属浪费对端发包预算的地址：
+///
+/// * `169.254/16` 链路本地（APIPA）：DHCP 失败时的自动地址，永不可路由。
+///   实测一台机器上报了 4 个，把候选表撑到 6 个而其中只有 1 个有用。
+/// * `198.18/15` RFC 2544 基准测试段：正常网络不会出现，
+///   实测是代理软件 fake-IP 模式的虚拟网卡。
+fn is_useless_ipv4_candidate(ip: &std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    ip.is_link_local() || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+}
+
+/// 枚举本机所有可用作候选的 IPv4 地址。
+///
+/// 排除本产品自己的 overlay 网卡（否则会把虚拟地址当候选上报），
+/// 以及 [`is_useless_ipv4_candidate`] 判定为无效的地址。
 pub fn local_ipv4_addrs() -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     if let Ok(list) = local_ip_address::list_afinet_netifas() {
@@ -90,11 +107,13 @@ pub fn local_ipv4_addrs() -> Vec<String> {
             if is_overlay_interface(&name) {
                 continue;
             }
-            if ip.is_ipv4() && !ip.is_loopback() && !ip.is_unspecified() {
-                let v = ip.to_string();
-                if !out.contains(&v) {
-                    out.push(v);
-                }
+            let IpAddr::V4(v4) = ip else { continue };
+            if v4.is_loopback() || v4.is_unspecified() || is_useless_ipv4_candidate(&v4) {
+                continue;
+            }
+            let v = v4.to_string();
+            if !out.contains(&v) {
+                out.push(v);
             }
         }
     }
@@ -249,5 +268,53 @@ pub fn detect_local_network() -> LocalNetworkInfo {
         local_ip,
         ipv6_available,
         ipv6_addr,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    /// 私有网段必须保留：同一局域网内的直连完全依赖它们
+    #[test]
+    fn private_addresses_remain_valid_candidates() {
+        for ip in ["192.168.1.100", "10.0.0.5", "172.16.3.9"] {
+            let v4: Ipv4Addr = ip.parse().unwrap();
+            assert!(
+                !is_useless_ipv4_candidate(&v4),
+                "{ip} 是私有地址，同网段直连要用，不能过滤"
+            );
+        }
+    }
+
+    /// 链路本地（APIPA）永不可路由，实测单机上报了 4 个把候选表撑满
+    #[test]
+    fn link_local_addresses_are_filtered() {
+        for ip in ["169.254.209.7", "169.254.130.17", "169.254.1.1"] {
+            let v4: Ipv4Addr = ip.parse().unwrap();
+            assert!(is_useless_ipv4_candidate(&v4), "{ip} 应被过滤");
+        }
+    }
+
+    /// RFC 2544 基准段，实测是代理软件 fake-IP 模式的虚拟网卡
+    #[test]
+    fn rfc2544_benchmark_range_is_filtered() {
+        for ip in ["198.18.0.1", "198.18.0.68", "198.19.255.254"] {
+            let v4: Ipv4Addr = ip.parse().unwrap();
+            assert!(is_useless_ipv4_candidate(&v4), "{ip} 应被过滤");
+        }
+        // 相邻网段不能误伤
+        assert!(!is_useless_ipv4_candidate(&"198.17.0.1".parse().unwrap()));
+        assert!(!is_useless_ipv4_candidate(&"198.20.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn overlay_interfaces_are_excluded() {
+        assert!(is_overlay_interface("PhantomP2P"));
+        assert!(is_overlay_interface("PhantomP2P-172-16-1-2"));
+        assert!(is_overlay_interface("phantomp2p-test"));
+        assert!(!is_overlay_interface("Ethernet"));
+        assert!(!is_overlay_interface("WLAN"));
     }
 }
