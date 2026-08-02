@@ -116,6 +116,23 @@ jobs:
           Copy-Item target\release\phantom-p2p.exe build\release\windows-arm64\
           Copy-Item target\release\phantom-server.exe build\release\windows-arm64\
           Copy-Item build\wintun.dll,build\WebView2Loader.dll build\release\windows-arm64\
+      - name: Install NSIS
+        shell: pwsh
+        run: choco install nsis --no-progress --yes
+      - name: Build ARM64 NSIS installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = node tools\version.mjs current
+          if (-not $version) { throw "无法读取版本号" }
+          $nsis = Join-Path ${env:PROGRAMFILES(x86)} 'NSIS\makensis.exe'
+          if (-not (Test-Path $nsis)) { $nsis = 'makensis.exe' }
+          & $nsis -INPUTCHARSET UTF8 `
+            -DSTAGING_DIR="$PWD\build\release\windows-arm64" `
+            -DOUTPUT_DIR="$PWD\build\release\windows-arm64" `
+            -DAPP_VERSION="$version" `
+            build\windows-installer-arm64.nsi
+          if ($LASTEXITCODE -ne 0) { throw "makensis 失败 (exit=$LASTEXITCODE)" }
       - uses: actions/upload-artifact@v4
         with:
           name: phantom-p2p-windows-arm64
