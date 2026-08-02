@@ -361,6 +361,10 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          # 这个 job 不 checkout（只需要 artifact），而 gh 默认从 git remote
+          # 推断仓库，没有 .git 就会报 "not a git repository"。显式指定即可，
+          # 不必为了发个 release 把整个仓库再 clone 一遍。
+          GH_REPO: ${{ github.repository }}
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
           NOTES="phantom-p2p $TAG 发布。请按平台选择对应文件，服务端单独部署（不包含在安装包内）。"
