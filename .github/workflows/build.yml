@@ -185,9 +185,13 @@ jobs:
       - name: Build privileged TUN-provisioning helper (sidecar)
         run: |
           set -euxo pipefail
-          cargo build --locked --release -p macos-helper --target ${{ matrix.target }}
+          # 不加 --target：runner 本身就是对应架构的原生机，显式 triple 只会
+          # 把产物放进 target/<triple>/，与后面 tauri build / phantom-server
+          # 用的 target/release/ 互不共享，导致 phantom-core 那棵依赖树在同一
+          # 台机器上被完整编译两遍。sidecar 文件名仍需带 triple 后缀。
+          cargo build --locked --release -p macos-helper
           mkdir -p src-tauri/binaries
-          cp "target/${{ matrix.target }}/release/macos-helper" \
+          cp "target/release/macos-helper" \
              "src-tauri/binaries/phantom-macos-helper-${{ matrix.target }}"
       - name: Build app and server
         run: |

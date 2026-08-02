@@ -57,9 +57,12 @@ echo ""
 echo "[3.5/5] 编译特权 TUN 提权 helper..."
 cd "$PROJECT_ROOT"
 HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
-cargo build --release -p macos-helper --target "$HOST_TARGET"
+# 不传 --target：显式 triple 会把产物放进 target/$HOST_TARGET/，与后面
+# tauri build 使用的 target/release/ 互不共享，phantom-core 那棵依赖树会被
+# 完整编译两遍。sidecar 文件名仍需带 triple 后缀（见 src-tauri/build.rs）。
+cargo build --release -p macos-helper
 mkdir -p "$PROJECT_ROOT/src-tauri/binaries"
-cp "$PROJECT_ROOT/target/$HOST_TARGET/release/macos-helper" \
+cp "$PROJECT_ROOT/target/release/macos-helper" \
    "$PROJECT_ROOT/src-tauri/binaries/phantom-macos-helper-$HOST_TARGET"
 echo "✅ helper 编译完成（target=$HOST_TARGET）"
 
