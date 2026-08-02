@@ -3,6 +3,8 @@ name: Build PhantomP2P
 on:
   push:
     branches: [main]
+    # 打 v* 标签触发发布：构建全部平台并自动发 GitHub Release
+    tags: ['v*']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -210,9 +212,12 @@ jobs:
           npm ci
           npm run build
           cargo build --locked --release -p phantom-p2p-web
+          cargo build --locked --release -p phantom-server
           mkdir -p build/release/linux-x64
           cp target/release/phantom-p2p build/release/linux-x64/
           chmod +x build/release/linux-x64/phantom-p2p
+          cp target/release/phantom-server build/release/linux-x64/
+          chmod +x build/release/linux-x64/phantom-server
       - uses: actions/upload-artifact@v4
         with:
           name: phantom-p2p-linux-x64
@@ -245,11 +250,74 @@ jobs:
           npm ci
           npm run build
           cargo build --locked --release --target aarch64-unknown-linux-gnu -p phantom-p2p-web
+          cargo build --locked --release --target aarch64-unknown-linux-gnu -p phantom-server
           mkdir -p build/release/linux-arm64
           cp target/aarch64-unknown-linux-gnu/release/phantom-p2p build/release/linux-arm64/
           chmod +x build/release/linux-arm64/phantom-p2p
+          cp target/aarch64-unknown-linux-gnu/release/phantom-server build/release/linux-arm64/
+          chmod +x build/release/linux-arm64/phantom-server
       - uses: actions/upload-artifact@v4
         with:
           name: phantom-p2p-linux-arm64
           path: build/release/linux-arm64/
           if-no-files-found: error
+
+  # 发布：仅在 push v* tag 时运行。下载六个平台产物，
+  # 按发布命名规范整理后创建 GitHub Release。
+  release:
+    name: Publish Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows-x64, windows-arm64, macos, linux-x64, linux-arm64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: phantom-p2p-windows-x64, path: dist/windows-x64 }
+      - uses: actions/download-artifact@v4
+        with: { name: phantom-p2p-windows-arm64, path: dist/windows-arm64 }
+      - uses: actions/download-artifact@v4
+        with: { name: phantom-p2p-macos-x64, path: dist/macos-x64 }
+      - uses: actions/download-artifact@v4
+        with: { name: phantom-p2p-macos-arm64, path: dist/macos-arm64 }
+      - uses: actions/download-artifact@v4
+        with: { name: phantom-p2p-linux-x64, path: dist/linux-x64 }
+      - uses: actions/download-artifact@v4
+        with: { name: phantom-p2p-linux-arm64, path: dist/linux-arm64 }
+
+      - name: Stage release assets with canonical names
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p assets
+
+          # Windows：setup 安装包保留原名，server 按平台标注
+          cp dist/windows-x64/*_setup.exe assets/
+          cp dist/windows-arm64/*_setup.exe assets/
+          cp dist/windows-x64/phantom-server.exe assets/phantom-server-x64.exe
+          cp dist/windows-arm64/phantom-server.exe assets/phantom-server-arm.exe
+
+          # macOS：dmg 保留原名，server 标注架构
+          cp dist/macos-x64/*.dmg assets/
+          cp dist/macos-arm64/*.dmg assets/
+          cp dist/macos-x64/phantom-server assets/phantom-server-macos-x64
+          cp dist/macos-arm64/phantom-server assets/phantom-server-macos-arm
+          chmod +x assets/phantom-server-macos-*
+
+          # Linux：客户端与 server 都标注架构
+          cp dist/linux-x64/phantom-p2p assets/phantom-p2p-linux-x64
+          cp dist/linux-arm64/phantom-p2p assets/phantom-p2p-linux-arm
+          cp dist/linux-x64/phantom-server assets/phantom-server-linux-x64
+          cp dist/linux-arm64/phantom-server assets/phantom-server-linux-arm
+          chmod +x assets/phantom-*-linux-*
+
+          echo "=== 待发布资产 ==="
+          ls -la assets/
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          NOTES="phantom-p2p $TAG 发布。请按平台选择对应文件，服务端单独部署（不包含在安装包内）。"
+          gh release create "$TAG" assets/* --title "$TAG" --notes "$NOTES"
