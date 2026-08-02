@@ -355,6 +355,12 @@ jobs:
           stage dist/linux-arm64 'phantom-server' phantom-server-linux-arm
           chmod +x assets/phantom-*-linux-*
 
+          # 全平台合集：转发时给一个链接就够，不必让人从十二个文件里挑。
+          # 先打到 assets/ 外面，否则 zip 会把正在写的自己也收进去。
+          ALL="PhantomP2P_${VERSION}_all.zip"
+          (cd assets && zip -r -q "../$ALL" .)
+          mv "$ALL" assets/
+
           echo "=== 待发布资产 ==="
           ls -la assets/
 
@@ -367,5 +373,11 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
-          NOTES="phantom-p2p $TAG 发布。请按平台选择对应文件，服务端单独部署（不包含在安装包内）。"
-          gh release create "$TAG" assets/* --title "$TAG" --notes "$NOTES"
+          NOTES="phantom-p2p $TAG 发布。全部文件已打包为 _all.zip，也可按平台单独下载；服务端单独部署（不包含在安装包内）。"
+          # release job 重跑时 release 已经存在，create 会直接失败；
+          # 这种情况改为覆盖上传，让重跑总能收敛到同一结果。
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" assets/* --clobber
+          else
+            gh release create "$TAG" assets/* --title "$TAG" --notes "$NOTES"
+          fi
