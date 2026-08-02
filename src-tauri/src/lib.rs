@@ -14,7 +14,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 mod config;
 use phantom_core::{
-    identity, nat, network, network_info, puncher, signal, stats, stun, tun_bridge, tunnel,
+    identity, nat, network, network_info, punch, puncher, signal, stats, stun, tun_bridge, tunnel,
 };
 use std::sync::atomic::AtomicBool;
 
@@ -35,6 +35,72 @@ struct HostPeer {
     endpoint: Option<quinn::Endpoint>,
 }
 
+/// 客户端日志目录。
+///
+/// 与启动时 `logging::init` 用的是同一处，"打包整个目录上报"才对得上。
+/// 优先放在安装目录（便携部署好找），不可写时退回用户数据目录。
+fn client_log_dir() -> std::path::PathBuf {
+    let install = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+        .filter(|dir| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join(".write-probe"))
+                .is_ok()
+        });
+    match install {
+        Some(dir) => dir.join("log"),
+        None => dirs::data_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("phantom-p2p")
+            .join("log"),
+    }
+}
+
+/// 主动上报日志（前端"反馈问题"按钮调用）。
+///
+/// 只是向服务端要一个一次性上传凭据；真正的打包与上传在收到
+/// `RequestLogUpload` 后进行。
+#[tauri::command]
+async fn report_problem(
+    signal_state: tauri::State<'_, SignalState>,
+    reason: String,
+) -> Result<(), String> {
+    signal_state
+        .client
+        .send(ClientMessage::RequestLogUpload { reason })
+        .await
+}
+
+/// 打洞会话的键：Guest 端只有一个对端（Host），Host 端按 Guest 区分
+fn punch_session_key(is_host: bool, peer_session_id: &str) -> String {
+    if is_host {
+        peer_session_id.to_string()
+    } else {
+        "__host__".to_string()
+    }
+}
+
+/// 取服务端下发的 STUN 列表（自建优先）。
+///
+/// 客户端不内置任何 STUN 地址——公共 STUN 不可用时会直接导致
+/// 拿不到 srflx 候选，进而必然落中继。
+async fn stun_servers_from(client: &Arc<signal::client::SignalClient>) -> Vec<(String, u16)> {
+    match client.network_config().await {
+        Some(cfg) => cfg
+            .stun_servers
+            .iter()
+            .map(|s| (s.host.clone(), s.port))
+            .collect(),
+        None => {
+            tracing::warn!("[打洞] 服务端尚未下发 STUN 配置");
+            Vec::new()
+        }
+    }
+}
+
 /// 打洞状态（通过 Tauri State 管理）
 struct PunchState {
     /// 当前打洞用的 UDP socket（STUN 探测和打洞共用）
@@ -43,8 +109,14 @@ struct PunchState {
     punch_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// 是否为 Host（创建房间的一方）
     is_host: tokio::sync::RwLock<bool>,
-    /// 本端收集的 ICE 候选（gather_ice_candidates 后存入）
+    /// 本端收集的 ICE 候选（阶段一探测后存入）
     local_ice_candidates: tokio::sync::Mutex<Vec<IceCandidate>>,
+    /// 打洞会话：Guest 端键为 `__host__`，Host 端每个 Guest 一个。
+    /// 三阶段状态机在 phantom-core，两个客户端共用同一份实现。
+    punch_sessions: tokio::sync::Mutex<std::collections::HashMap<String, punch::Session>>,
+    /// 打洞阶段协商出的 overlay 会话密钥。
+    /// P2P 与中继两条路径共用同一份——中继只做盲转发，看不到明文。
+    peer_crypto: tokio::sync::Mutex<Option<Arc<phantom_core::crypto::SessionCrypto>>>,
     /// 预分配的中继信息（RelayPreAllocated 到达时存入）
     relay_prealloc: tokio::sync::Mutex<Option<RelayPreAllocInfo>>,
     /// Guest 侧隧道连接管理器（支持静默升级）
@@ -169,6 +241,10 @@ async fn reset_connection_runtime(punch_state: &PunchState) {
     *punch_state.socket.lock().await = None;
     *punch_state.local_ice_candidates.lock().await = Vec::new();
     *punch_state.relay_prealloc.lock().await = None;
+    // 会话密钥与本轮打洞绑定，重置时必须一并清掉——
+    // 复用上一轮的密钥会导致 nonce 计数器与对端不一致
+    punch_state.punch_sessions.lock().await.clear();
+    *punch_state.peer_crypto.lock().await = None;
     if let Some(mgr) = punch_state.conn_manager.lock().await.take() {
         mgr.close().await;
     }
@@ -376,7 +452,9 @@ async fn connect_signal(
             while let Some(server_msg) = event_rx.recv().await {
                 let event_name = match &server_msg {
                     ServerMessage::Welcome { .. } => "signal:welcome",
-                    ServerMessage::Pong => "signal:pong",
+                    ServerMessage::Pong { .. } => "signal:pong",
+                    ServerMessage::VersionMismatch { .. } => "signal:version_mismatch",
+                    ServerMessage::NetworkConfigUpdate { .. } => "signal:network_config",
                     ServerMessage::RoomCreated { .. } => "signal:room_created",
                     ServerMessage::JoinOk { .. } => "signal:join_ok",
                     ServerMessage::JoinFailed { .. } => "signal:join_failed",
@@ -390,7 +468,9 @@ async fn connect_signal(
                     ServerMessage::AuthFailed { .. } => "signal:auth_failed",
                     ServerMessage::RelayReady { .. } => "signal:relay_ready",
                     ServerMessage::RelayPreAllocated { .. } => "signal:relay_pre_allocated",
-                    ServerMessage::PeerCandidates { .. } => "signal:peer_candidates",
+                    ServerMessage::PunchPlan { .. } => "signal:punch_plan",
+                    ServerMessage::PunchStart { .. } => "signal:punch_start",
+                    ServerMessage::RequestLogUpload { .. } => "signal:request_log_upload",
                 };
 
                 if let Ok(json_value) = serde_json::to_value(&server_msg) {
@@ -478,6 +558,30 @@ async fn connect_signal(
                             }
                         }
                     }
+                    // 收到上传凭据：打包整个 log/ 目录并上传。
+                    // 打包与 HTTP 传输都是阻塞操作，放到 blocking 线程池，
+                    // 避免拖住信令消息循环。
+                    ServerMessage::RequestLogUpload { upload_url, reason } => {
+                        let url = upload_url.clone();
+                        let why = reason.clone();
+                        let app_for_upload = app_for_task.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let dir = client_log_dir();
+                            let uploader = phantom_core::log_upload::LogUploader::new(&dir);
+                            // 先补投历史失败的包——它们往往正是"网络有问题"那次的日志
+                            uploader.flush_pending();
+                            match uploader.upload_now(&url, &why) {
+                                Ok(bytes) => {
+                                    tracing::info!("[日志上报] 已上传 {} 字节", bytes);
+                                    let _ = app_for_upload.emit("log:uploaded", bytes);
+                                }
+                                Err(e) => {
+                                    tracing::warn!("[日志上报] {}", e);
+                                    let _ = app_for_upload.emit("log:upload_failed", e);
+                                }
+                            }
+                        });
+                    }
                     ServerMessage::RelayPreAllocated {
                         room_code,
                         relay_addr,
@@ -493,57 +597,156 @@ async fn connect_signal(
                         *ps.relay_prealloc.lock().await = Some(prealloc);
                         tracing::info!("[ICE] 中继预分配就绪 (QUIC port={})", relay_quic_port);
                     }
-                    ServerMessage::PeerCandidates {
+                    // ── 阶段二：收到策略计划，按需新建 socket 并回报候选 ──
+                    ServerMessage::PunchPlan {
                         peer_session_id,
-                        candidates,
-                        peer_ufrag: _,
-                        peer_pwd: _,
-                        peer_nat_type,
+                        attempt_id,
+                        strategy,
+                        params,
+                        peer_profile,
+                        ..
+                    } => {
+                        let ps = app_for_task.state::<PunchState>();
+                        let is_host = *ps.is_host.read().await;
+                        let key = punch_session_key(is_host, peer_session_id);
+                        let stun = stun_servers_from(&client_clone).await;
+
+                        let extra = {
+                            let mut sessions = ps.punch_sessions.lock().await;
+                            match sessions.get_mut(&key) {
+                                // Host 恒为 initiator：双方必须得出相反的角色，
+                                // 否则会各自用同一把密钥发送，导致 nonce 复用
+                                Some(s) => s.on_plan(
+                                    attempt_id.clone(),
+                                    *strategy,
+                                    *params,
+                                    peer_profile.clone(),
+                                    &stun,
+                                    is_host,
+                                ),
+                                None => {
+                                    tracing::warn!("[打洞] 收到计划但会话不存在: {}", key);
+                                    Vec::new()
+                                }
+                            }
+                        };
+
+                        if !extra.is_empty() {
+                            let _ = client_clone
+                                .send(ClientMessage::StrategyCandidates {
+                                    target_peer_session_id: peer_session_id.clone(),
+                                    attempt_id: attempt_id.clone(),
+                                    candidates: extra,
+                                })
+                                .await;
+                        }
+                    }
+                    // ── 阶段三：统一起始时刻，执行打洞 ──────────────
+                    ServerMessage::PunchStart {
+                        peer_session_id,
+                        peer_candidates,
                         start_at_ms,
+                        ..
                     } => {
                         let app_for_ice = app_for_task.clone();
                         let peer_session_id = peer_session_id.clone();
                         let task_peer_id = peer_session_id.clone();
-                        let candidates = candidates.clone();
-                        let peer_nat_type = peer_nat_type.clone();
+                        let candidates = peer_candidates.clone();
                         let start_at_ms = *start_at_ms;
                         let stats_for_ice = stats_mgr.clone();
                         let signal_client_for_ice = client_clone.clone();
 
                         let ice_task = tokio::spawn(async move {
                             let ps = app_for_ice.state::<PunchState>();
-
                             let is_host = *ps.is_host.read().await;
-                            let sock = if is_host {
-                                ps.host_peers
-                                    .lock()
-                                    .await
-                                    .get(&peer_session_id)
-                                    .map(|peer| peer.socket.clone())
-                            } else {
-                                ps.socket.lock().await.clone()
-                            };
+                            let key = punch_session_key(is_host, &peer_session_id);
 
-                            let Some(sock) = sock else {
-                                let _ = app_for_ice.emit(
-                                    "punch:phase",
-                                    puncher::PunchPhase::Failed {
-                                        reason: "ICE socket 未初始化".into(),
-                                    },
-                                );
-                                return;
+                            let mut session = {
+                                let mut sessions = ps.punch_sessions.lock().await;
+                                match sessions.remove(&key) {
+                                    Some(s) => s,
+                                    None => {
+                                        let _ = app_for_ice.emit(
+                                            "punch:phase",
+                                            puncher::PunchPhase::Failed {
+                                                reason: "打洞会话未就绪".into(),
+                                            },
+                                        );
+                                        return;
+                                    }
+                                }
                             };
 
                             let _ = app_for_ice.emit("punch:phase", puncher::PunchPhase::Punching);
-                            tracing::info!(
-                                "[ICE] 开始连通性检测: {} 个候选, NAT={}, start_at={}ms",
-                                candidates.len(),
-                                peer_nat_type,
-                                start_at_ms
-                            );
 
-                            let result =
-                                puncher::do_ice_punch(sock.clone(), candidates, start_at_ms).await;
+                            let room_code = signal_client_for_ice
+                                .get_room_code()
+                                .await
+                                .unwrap_or_default();
+                            let ctx = punch::RecordContext::new(
+                                room_code,
+                                peer_session_id.clone(),
+                                is_host,
+                            );
+                            let outcome = session.run(candidates, start_at_ms, ctx).await;
+
+                            // 成败都上报——失败样本对分析 NAT 组合成功率同样重要
+                            let _ = signal_client_for_ice
+                                .send(ClientMessage::PunchReport {
+                                    record: outcome.record.clone(),
+                                })
+                                .await;
+
+                            let result = match (&outcome.success, &outcome.socket) {
+                                (Some(s), Some(_)) => puncher::PunchResult {
+                                    success: true,
+                                    peer_addr: s.peer_addr.to_string(),
+                                    latency_ms: s.rtt_ms,
+                                    reason: String::new(),
+                                },
+                                _ => puncher::PunchResult {
+                                    success: false,
+                                    peer_addr: String::new(),
+                                    latency_ms: 0,
+                                    reason: format!("{:?}", outcome.record.outcome),
+                                },
+                            };
+
+                            // 数据面必须用这把密钥；没有它就只能明文，宁可不建隧道
+                            *ps.peer_crypto.lock().await = outcome.crypto.clone();
+
+                            // 打通的正是这个 socket 的映射，隧道必须复用它
+                            let sock = match outcome.socket.clone() {
+                                Some(s) => s,
+                                None => {
+                                    let _ = app_for_ice.emit(
+                                        "punch:phase",
+                                        puncher::PunchPhase::Failed {
+                                            reason: result.reason.clone(),
+                                        },
+                                    );
+                                    if is_host {
+                                        if let Some(peer) =
+                                            ps.host_peers.lock().await.remove(&peer_session_id)
+                                        {
+                                            if let Some(endpoint) = peer.endpoint {
+                                                endpoint.close(0u32.into(), b"punch failed");
+                                            }
+                                        }
+                                    }
+                                    return;
+                                }
+                            };
+                            if is_host {
+                                if let Some(peer) =
+                                    ps.host_peers.lock().await.get_mut(&peer_session_id)
+                                {
+                                    peer.socket = sock.clone();
+                                }
+                            } else {
+                                *ps.socket.lock().await = Some(sock.clone());
+                            }
+
                             if result.success {
                                 let _ = app_for_ice.emit(
                                     "punch:phase",
@@ -584,12 +787,14 @@ async fn connect_signal(
                                                 )]),
                                             ));
                                             let tun = ps.tun_bridge.lock().await.clone();
+                                            let crypto = ps.peer_crypto.lock().await.clone();
                                             tokio::spawn(async move {
                                                 let _ = tunnel::start_host_tunnel(
                                                     ep_for_task,
                                                     sf,
                                                     peer_map,
                                                     tun,
+                                                    crypto,
                                                 )
                                                 .await;
                                             });
@@ -806,7 +1011,12 @@ async fn close_room(
     state.client.send(ClientMessage::CloseRoom).await
 }
 
-/// 开始打洞（ICE 版：STUN 探测 → 收集所有候选 → 上报 IceCandidates → 自动等待 PeerCandidates）
+/// **阶段一**：探测 NAT 画像并上报，等待服务端下发策略计划。
+///
+/// 与旧实现的关键差别：此处**只产出 host + srflx 基础候选**。
+/// 预测/撒网候选属于阶段二——那时才从服务端拿到对端的 NAT 类型，
+/// 才谈得上"按 NAT 配对选择打洞方向"。旧实现在这里就把候选定死了，
+/// 所以策略矩阵在旧时序下根本无法实现。
 ///
 /// Host 多人优化：若 Host 已采集过候选，直接复用已有 socket + 候选，
 /// 不再 reset 现有连接，保证已连接的 guest 不受影响。
@@ -819,20 +1029,14 @@ async fn start_punch(
 ) -> Result<(), String> {
     let client = &signal_state.client;
     let is_dev = DEV_MODE.load(Ordering::Relaxed);
+    let is_host = *punch_state.is_host.read().await;
 
-    if *punch_state.is_host.read().await {
+    if is_host {
         let peer_id = peer_session_id.ok_or("Host ICE requires peer_session_id")?;
         if punch_state.host_peers.lock().await.contains_key(&peer_id) {
             return Ok(());
         }
-        let (sock, candidates) = tokio::task::spawn_blocking(|| {
-            let sock = network::bind_dual_stack_udp(0)
-                .map_err(|e| format!("per-peer ICE socket bind failed: {}", e))?;
-            let (candidates, _, _, _) = puncher::gather_ice_candidates(&sock);
-            Ok::<_, String>((Arc::new(sock), candidates))
-        })
-        .await
-        .map_err(|e| e.to_string())??;
+        let (profile, candidates, sock, session) = probe_for_punch(client, is_dev, &app).await?;
         punch_state.host_peers.lock().await.insert(
             peer_id.clone(),
             HostPeer {
@@ -840,97 +1044,94 @@ async fn start_punch(
                 endpoint: None,
             },
         );
+        punch_state
+            .punch_sessions
+            .lock()
+            .await
+            .insert(punch_session_key(true, &peer_id), session);
         client
-            .send(ClientMessage::IceCandidates {
+            .send(ClientMessage::NatProfileReport {
                 target_peer_session_id: Some(peer_id),
-                candidates,
-                ufrag: String::new(),
-                pwd: String::new(),
-                nat_type: String::new(),
+                profile,
+                base_candidates: candidates,
             })
             .await?;
         let _ = app.emit("punch:phase", puncher::PunchPhase::WaitingPeer);
         return Ok(());
     }
 
-    // ── Host 多人复用分支 ────────────────────────────────────────────
-    // 若已经是 Host 且 socket/候选都已就绪，直接复用，避免 reset 摧毁已建立的连接
-    {
-        let is_host = *punch_state.is_host.read().await;
-        if is_host {
-            let existing_candidates = punch_state.local_ice_candidates.lock().await.clone();
-            let socket_ready = punch_state.socket.lock().await.is_some();
-
-            if socket_ready && !existing_candidates.is_empty() {
-                tracing::info!("[ICE] Host 复用已有候选上报（多人模式，跳过 reset）");
-                if is_dev {
-                    let _ = app.emit("dev:log", "[ICE] Host 复用候选（多人模式）");
-                }
-                client
-                    .send(ClientMessage::IceCandidates {
-                        target_peer_session_id: None,
-                        candidates: existing_candidates,
-                        ufrag: String::new(),
-                        pwd: String::new(),
-                        nat_type: String::new(),
-                    })
-                    .await?;
-                let _ = app.emit("punch:phase", puncher::PunchPhase::WaitingPeer);
-                return Ok(());
-            }
-        }
-    }
-
     // TUN belongs to the room and must survive connection setup/retries.
     reset_connection_runtime(&punch_state).await;
 
-    // 通知前端：正在探测
+    let (profile, candidates, sock, session) = probe_for_punch(client, is_dev, &app).await?;
+
+    *punch_state.socket.lock().await = Some(sock);
+    *punch_state.local_ice_candidates.lock().await = candidates.clone();
+    punch_state
+        .punch_sessions
+        .lock()
+        .await
+        .insert(punch_session_key(false, ""), session);
+
+    client
+        .send(ClientMessage::NatProfileReport {
+            target_peer_session_id: None,
+            profile,
+            base_candidates: candidates,
+        })
+        .await?;
+
+    let _ = app.emit("punch:phase", puncher::PunchPhase::WaitingPeer);
+    tracing::info!("[打洞] 已上报 NAT 画像，等待服务端下发策略...");
+    Ok(())
+}
+
+/// 执行阶段一探测，返回 (画像, 基础候选, 主 socket, 会话)
+async fn probe_for_punch(
+    client: &Arc<signal::client::SignalClient>,
+    is_dev: bool,
+    app: &AppHandle,
+) -> Result<
+    (
+        phantom_protocol::NatProfile,
+        Vec<IceCandidate>,
+        Arc<UdpSocket>,
+        punch::Session,
+    ),
+    String,
+> {
     let _ = app.emit("punch:phase", puncher::PunchPhase::Probing);
     if is_dev {
-        let _ = app.emit("dev:log", "[ICE] 开始收集候选地址...");
+        let _ = app.emit("dev:log", "[打洞] 开始探测 NAT 画像...");
     }
 
-    // Step 1: 绑定 UDP socket，在阻塞线程中做 STUN 探测 + ICE 候选收集
-    let gather_result = tokio::task::spawn_blocking(|| {
-        let sock = network::bind_dual_stack_udp(0)
-            .map_err(|e| format!("绑定 IPv4/IPv6 双栈 UDP socket 失败: {}", e))?;
-        let (candidates, _ufrag, _pwd, _nat_type_key) = puncher::gather_ice_candidates(&sock);
-        Ok::<_, String>((sock, candidates))
+    let stun = stun_servers_from(client).await;
+    let rtt = client.signal_rtt_ms();
+
+    let identity = client.identity();
+    let (session, profile, candidates) = tokio::task::spawn_blocking(move || {
+        let mut session = punch::Session::new();
+        let (profile, candidates) = session.probe(&stun, rtt, &identity)?;
+        Ok::<_, String>((session, profile, candidates))
     })
     .await
-    .map_err(|e| format!("ICE 候选收集任务失败: {}", e))??;
+    .map_err(|e| format!("NAT 探测任务失败: {}", e))??;
 
-    let (sock, candidates) = gather_result;
-    let sock = Arc::new(sock);
+    let sock = session
+        .primary_socket()
+        .ok_or_else(|| "打洞 socket 未就绪".to_string())?;
 
     if is_dev {
         let _ = app.emit(
             "dev:log",
-            format!("[ICE] 收集完成: {} 个候选", candidates.len(),),
+            format!(
+                "[打洞] NAT={:?} 基础候选 {} 个",
+                profile.class,
+                candidates.len()
+            ),
         );
     }
-
-    // 保存 socket 和候选到状态
-    *punch_state.socket.lock().await = Some(sock.clone());
-    *punch_state.local_ice_candidates.lock().await = candidates.clone();
-
-    // Step 2: 上报 IceCandidates
-    client
-        .send(ClientMessage::IceCandidates {
-            target_peer_session_id: None,
-            candidates,
-            ufrag: String::new(),
-            pwd: String::new(),
-            nat_type: String::new(),
-        })
-        .await?;
-
-    // 通知前端：等待对端候选
-    let _ = app.emit("punch:phase", puncher::PunchPhase::WaitingPeer);
-
-    tracing::info!("[ICE] 已上报候选，等待对端候选...");
-
-    Ok(())
+    Ok((profile, candidates, sock, session))
 }
 
 /// 获取隧道统计数据
@@ -1038,18 +1239,16 @@ async fn start_relay_tunnel(
         let user_for_host = user_id.clone();
         let app_clone = app.clone();
         tokio::spawn(async move {
-            let tun = app_clone
-                .state::<PunchState>()
-                .tun_bridge
-                .lock()
-                .await
-                .clone();
+            let ps = app_clone.state::<PunchState>();
+            let tun = ps.tun_bridge.lock().await.clone();
+            let crypto = ps.peer_crypto.lock().await.clone();
             match tunnel::connect_relay_quic_host(
                 relay_addr_resolved,
                 token_host.clone(),
                 stats_for_host,
                 user_for_host,
                 tun,
+                crypto,
             )
             .await
             {
@@ -1213,9 +1412,17 @@ async fn start_tun_bridge(
     // 启动 TUN 桥接
     let virtual_ip = punch_state.virtual_ip.read().await.clone();
     let host_virtual_ip = punch_state.host_virtual_ip.read().await.clone();
-    let bridge = tun_bridge::TunBridge::start(&subnet, &virtual_ip, &host_virtual_ip, quic_conn)
+    // 没有会话密钥就不建隧道——绝不退回明文传输
+    let crypto = punch_state
+        .peer_crypto
+        .lock()
         .await
-        .map_err(|e| format!("启动 TUN 桥接失败: {}", e))?;
+        .clone()
+        .ok_or("overlay 会话密钥尚未协商完成")?;
+    let bridge =
+        tun_bridge::TunBridge::start(&subnet, &virtual_ip, &host_virtual_ip, quic_conn, crypto)
+            .await
+            .map_err(|e| format!("启动 TUN 桥接失败: {}", e))?;
 
     *punch_state.tun_bridge.lock().await = Some(bridge);
     punch_state
@@ -1462,30 +1669,19 @@ pub fn run(dev_mode: bool) {
     let install_dir = std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(std::path::Path::to_path_buf));
-    let log_dir = install_dir
-        .filter(|dir| {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(dir.join("phantom-p2p.log"))
-                .is_ok()
-        })
-        .unwrap_or_else(|| app_data_dir.clone());
-    let _ = std::fs::create_dir_all(&log_dir);
-    let file_appender = tracing_appender::rolling::never(&log_dir, "phantom-p2p.log");
-    let (file_writer, _log_guard) = tracing_appender::non_blocking(file_appender);
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| default_filter.into());
-    use tracing_subscriber::prelude::*;
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(tracing_subscriber::fmt::layer())
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_ansi(false)
-                .with_writer(file_writer),
-        )
-        .init();
+    // 日志按用途分文件（ice / signal / tunnel / app）并按大小轮转。
+    // 旧实现是单个 phantom-p2p.log：实测 8 小时会话 48,736 行 / 6 MB，
+    // 其中 91.4% 是每秒一条、数值相同的心跳 DEBUG，
+    // 真正有用的打洞过程被完全淹没，也没法上报给服务端做聚合。
+    let _ = install_dir;
+    let log_dir = client_log_dir();
+    let _ = std::env::var("RUST_LOG").or_else(|_| {
+        std::env::set_var("RUST_LOG", default_filter);
+        Ok::<String, std::env::VarError>(default_filter.to_string())
+    });
+    if let Err(e) = phantom_core::logging::init(&log_dir, dev_mode) {
+        eprintln!("[日志] 分层日志初始化失败，仅输出到控制台: {}", e);
+    }
 
     if dev_mode {
         tracing::info!("[DEV] 开发者模式已启用");
@@ -1516,6 +1712,8 @@ pub fn run(dev_mode: bool) {
             punch_task: tokio::sync::Mutex::new(None),
             is_host: tokio::sync::RwLock::new(false),
             local_ice_candidates: tokio::sync::Mutex::new(Vec::new()),
+            punch_sessions: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            peer_crypto: tokio::sync::Mutex::new(None),
             relay_prealloc: tokio::sync::Mutex::new(None),
             conn_manager: tokio::sync::Mutex::new(None),
             ice_task: tokio::sync::Mutex::new(None),
@@ -1588,6 +1786,7 @@ pub fn run(dev_mode: bool) {
             request_relay,
             get_tunnel_stats,
             reset_tunnel_stats,
+            report_problem,
             config::load_config,
             config::save_config,
             config::get_config_path,

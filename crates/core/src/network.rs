@@ -15,6 +15,122 @@ pub fn bind_dual_stack_udp(port: u16) -> std::io::Result<UdpSocket> {
     Ok(socket)
 }
 
+/// 调优打洞 socket。
+///
+/// **放大接收缓冲区**是关键：撒网策略下瞬时到达速率很高，
+/// 默认 64KB 缓冲区会在不到一秒内被填满，真正的应答包随之丢失。
+///
+/// Windows 上还必须关闭 `SIO_UDP_CONNRESET`——否则向不存在的端口发包
+/// 收到 ICMP Port Unreachable 后，**后续的 `recv_from` 会返回 `WSAECONNRESET`**
+/// 而不是正常数据，把接收路径彻底堵死。撒网场景下这几乎必然发生。
+pub fn tune_punch_socket(sock: &UdpSocket) {
+    const RECV_BUF: usize = 8 * 1024 * 1024;
+    let s = socket2::SockRef::from(sock);
+    if let Err(e) = s.set_recv_buffer_size(RECV_BUF) {
+        tracing::debug!("[网络] 设置接收缓冲区失败: {}", e);
+    }
+    if let Err(e) = s.set_send_buffer_size(2 * 1024 * 1024) {
+        tracing::debug!("[网络] 设置发送缓冲区失败: {}", e);
+    }
+    #[cfg(windows)]
+    disable_udp_conn_reset(sock);
+}
+
+/// 关闭 Windows 的 `SIO_UDP_CONNRESET` 行为。
+///
+/// 默认情况下，未连接的 UDP socket 在收到 ICMP Port Unreachable 之后，
+/// 下一次 `recvfrom` 会返回 `WSAECONNRESET (10054)` 而不是数据。
+/// 打洞时我们会大量向不存在的端口发包，若不关掉这个行为，
+/// 接收路径会被 ICMP 错误淹没。
+#[cfg(windows)]
+fn disable_udp_conn_reset(sock: &UdpSocket) {
+    use std::os::windows::io::AsRawSocket;
+    const SIO_UDP_CONNRESET: u32 = 0x9800000C;
+
+    #[link(name = "ws2_32")]
+    extern "system" {
+        fn WSAIoctl(
+            s: usize,
+            dwIoControlCode: u32,
+            lpvInBuffer: *const std::ffi::c_void,
+            cbInBuffer: u32,
+            lpvOutBuffer: *mut std::ffi::c_void,
+            cbOutBuffer: u32,
+            lpcbBytesReturned: *mut u32,
+            lpOverlapped: *mut std::ffi::c_void,
+            lpCompletionRoutine: *mut std::ffi::c_void,
+        ) -> i32;
+    }
+
+    let mut enable: u32 = 0; // FALSE = 禁用该行为
+    let mut returned: u32 = 0;
+    let rc = unsafe {
+        WSAIoctl(
+            sock.as_raw_socket() as usize,
+            SIO_UDP_CONNRESET,
+            &mut enable as *mut u32 as *const std::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if rc != 0 {
+        tracing::debug!("[网络] 关闭 SIO_UDP_CONNRESET 失败, rc={}", rc);
+    }
+}
+
+/// 枚举本机所有非回环 IPv4 地址（排除本产品自己的 overlay 网卡）
+pub fn local_ipv4_addrs() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Ok(list) = local_ip_address::list_afinet_netifas() {
+        for (name, ip) in list {
+            if is_overlay_interface(&name) {
+                continue;
+            }
+            if ip.is_ipv4() && !ip.is_loopback() && !ip.is_unspecified() {
+                let v = ip.to_string();
+                if !out.contains(&v) {
+                    out.push(v);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 枚举本机所有全局 IPv6 地址（排除链路本地、回环、组播与 overlay 网卡）
+pub fn global_ipv6_addrs() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Ok(list) = local_ip_address::list_afinet_netifas() {
+        for (name, ip) in list {
+            if is_overlay_interface(&name) {
+                continue;
+            }
+            let IpAddr::V6(v6) = ip else { continue };
+            if v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || v6.is_unicast_link_local()
+            {
+                continue;
+            }
+            let v = v6.to_string();
+            if !out.contains(&v) {
+                out.push(v);
+            }
+        }
+    }
+    out
+}
+
+/// 是否为本产品自己创建的 overlay 网卡（必须排除，否则会把虚拟地址当候选上报）
+pub fn is_overlay_interface(name: &str) -> bool {
+    name.to_ascii_lowercase().starts_with("phantomp2p")
+}
+
 /// Convert an IPv4 destination for an AF_INET6 dual-stack socket.
 pub fn compatible_socket_addr(socket: &UdpSocket, addr: SocketAddr) -> SocketAddr {
     if socket.local_addr().map(|a| a.is_ipv6()).unwrap_or(false) {

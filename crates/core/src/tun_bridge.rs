@@ -1,101 +1,86 @@
-//! Virtual L3 overlay over QUIC.
+//! Virtual L3 overlay over QUIC **datagrams**.
 //!
 //! The bridge transports complete IPv4 packets. TCP state, UDP state and
 //! checksums therefore remain the responsibility of the host OS instead of
 //! being reimplemented in an application-level port proxy.
+//!
+//! 传输语义是 **不可靠、无序的数据报**（RFC 9221），不是可靠有序流。
+//! 三层隧道用可靠流是错的：一个丢包会阻塞后续所有流量、
+//! 过期的实时包仍被重传、内层 TCP 与外层重传叠加会导致吞吐崩塌。
+//! 内层协议自己负责可靠性——TCP 本就会重传，UDP 本就允许丢。
 
+use crate::crypto::SessionCrypto;
 use crate::tun::{Ipv4Header, TunDevice, TunError};
-use quinn::{Connection, RecvStream, SendStream};
+use quinn::Connection;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::io::AsyncReadExt;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
-const STREAM_MAGIC: &[u8; 4] = b"PIP1";
 const MAX_PACKET: usize = 65535;
 
-/// Time budget for a single QUIC write to a peer's overlay stream. QUIC
-/// congestion / flow control can stall `write_all` indefinitely; without a
-/// timeout one slow/wedged peer would block the single TUN read loop and
-/// starve every other peer sharing this bridge (this is the relay-mode
-/// freeze this module used to suffer from).
-const PEER_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// TUN 设备 MTU。
+///
+/// 必须留出 QUIC DATAGRAM 的空间：QUIC 为避免 IP 分片会把数据报限制在
+/// 保守的路径 MTU（典型 ~1200 字节）以内，还要再扣掉 overlay 加密的
+/// [`crate::crypto::OVERHEAD`]（8 字节计数器 + 16 字节认证标签）。
+///
+/// `1200 - 24 = 1176`，向下取整留一点余量。**不能直接取 1200**——
+/// 那样每个满载包加密后都会超限被拒发，而这种故障只在真实链路上才暴露，
+/// 本地环回测不出来。`full_mtu_packet_still_fits_in_a_quic_datagram` 用断言钉死了这个关系。
+pub const TUN_MTU: u16 = 1160;
 
-/// Bounded per-peer outbound queue. Packets read from the TUN device are
-/// handed off here without waiting on the peer's QUIC stream; a dedicated
-/// task per peer performs the actual (potentially slow) write. Bounded so a
-/// permanently wedged peer applies backpressure only to itself (the queue
-/// fills and new packets for that peer are dropped) instead of unbounded
-/// memory growth.
-const PEER_QUEUE_DEPTH: usize = 256;
-
-/// A handle to a peer's dedicated forwarding task: send IP packets here and
-/// they will be written to the peer's QUIC SendStream by that task, with a
-/// bounded write timeout so a stalled peer cannot block anyone else.
+/// 一个对端的转发句柄。
+///
+/// 数据面走 **QUIC DATAGRAM**（RFC 9221）而非可靠有序流。对三层隧道而言
+/// 可靠流是错的：一个丢包会阻塞后续**所有**流量（队头阻塞）；
+/// 迟到 200ms 的实时包早已无用却仍被重传；内层 TCP 叠加外层重传更会
+/// 让退避相互作用、吞吐崩塌。
+///
+/// 附带的结构性好处：`send_datagram` 是**同步非阻塞**的，
+/// 要么入队要么立刻报错，不会像 `write_all` 那样被拥塞卡住。
+/// 因此原先"每对端一条 channel + 专用任务 + 写超时"的整套机制不再需要——
+/// 那套机制本就是为了绕开流写入会阻塞 TUN 读循环的问题。
 #[derive(Clone)]
 struct PeerForwarder {
-    tx: mpsc::Sender<Vec<u8>>,
+    conn: Connection,
+    /// overlay 端到端加密。中继模式下 QUIC 是逐跳的，中继能看到明文，
+    /// 机密性必须由这一层保证。
+    crypto: Arc<SessionCrypto>,
 }
 
 impl PeerForwarder {
-    /// Best-effort enqueue; if the queue is full or the task has exited the
-    /// packet is dropped (never blocks the caller).
+    /// 加密并投递一个 IP 包。永不阻塞调用方。
     fn try_forward(&self, packet: &[u8]) -> bool {
-        match self.tx.try_send(packet.to_vec()) {
+        let sealed = match self.crypto.seal(packet) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("[TUN] overlay 加密失败: {}", e);
+                return false;
+            }
+        };
+        // 超出对端通告的数据报上限时直接拒发——发出去也会被丢，
+        // 而且这说明 TUN_MTU 相对当前路径设得过大，值得记一笔。
+        if let Some(limit) = self.conn.max_datagram_size() {
+            if sealed.len() > limit {
+                warn!(
+                    "[TUN] 包过大无法作为数据报发送: {} > {}（考虑下调 TUN MTU）",
+                    sealed.len(),
+                    limit
+                );
+                return false;
+            }
+        }
+        match self.conn.send_datagram(sealed.into()) {
             Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                warn!("[TUN] peer queue full, dropping packet");
+            Err(e) => {
+                debug!("[TUN] 数据报发送失败: {}", e);
                 false
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
     }
-}
-
-/// Spawn the task that owns a peer's SendStream and performs writes off the
-/// TUN read loop's critical path.
-fn spawn_peer_forwarder(sender: Arc<Mutex<SendStream>>) -> PeerForwarder {
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(PEER_QUEUE_DEPTH);
-    tokio::spawn(async move {
-        while let Some(packet) = rx.recv().await {
-            let len = packet.len() as u16;
-            let mut stream = sender.lock().await;
-            let write = async {
-                stream.write_all(&len.to_be_bytes()).await?;
-                stream.write_all(&packet).await
-            };
-            match tokio::time::timeout(PEER_WRITE_TIMEOUT, write).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    warn!(
-                        "[TUN] peer stream write failed ({} bytes): {}",
-                        packet.len(),
-                        e
-                    );
-                    // The stream is likely broken beyond recovery; stop this
-                    // forwarder so future sends are dropped immediately
-                    // instead of queueing behind a dead connection.
-                    break;
-                }
-                Err(_) => {
-                    warn!(
-                        "[TUN] peer stream write timed out after {:?} ({} bytes); dropping packet",
-                        PEER_WRITE_TIMEOUT,
-                        packet.len()
-                    );
-                    // Keep the forwarder alive: a single stalled write (e.g.
-                    // transient congestion) shouldn't necessarily kill the
-                    // peer, but repeated timeouts will keep dropping packets
-                    // rather than backing up the queue indefinitely.
-                }
-            }
-        }
-    });
-    PeerForwarder { tx }
 }
 
 type PeerSenders = Arc<Mutex<HashMap<Ipv4Addr, PeerForwarder>>>;
@@ -120,6 +105,7 @@ impl TunBridge {
         virtual_ip: &str,
         host_virtual_ip: &str,
         quic_conn: Connection,
+        crypto: Arc<SessionCrypto>,
     ) -> Result<Arc<Self>, TunError> {
         let my_ip: Ipv4Addr = virtual_ip
             .parse()
@@ -135,12 +121,12 @@ impl TunBridge {
         }
         let tun_name = adapter_name(my_ip);
         let tun =
-            TunDevice::create(&tun_name, my_ip, Ipv4Addr::new(255, 255, 255, 0), 1500).await?;
+            TunDevice::create(&tun_name, my_ip, Ipv4Addr::new(255, 255, 255, 0), TUN_MTU).await?;
         if !same_prefix24(host_ip, guest_network) {
             tun.add_route(host_ip, 32).await?;
         }
         let bridge = Self::from_tun(tun, host_ip, my_ip, guest_network, false);
-        bridge.attach_peer(quic_conn, None).await?;
+        bridge.attach_peer(quic_conn, crypto, None).await?;
         Ok(bridge)
     }
 
@@ -157,7 +143,7 @@ impl TunBridge {
         } else {
             Ipv4Addr::new(255, 255, 255, 0)
         };
-        let tun = TunDevice::create(&tun_name, my_ip, netmask, 1500).await?;
+        let tun = TunDevice::create(&tun_name, my_ip, netmask, TUN_MTU).await?;
         if fixed_host {
             tun.add_route(guest_network, 24).await?;
         }
@@ -189,27 +175,26 @@ impl TunBridge {
         bridge
     }
 
-    /// Attach a peer's QUIC connection. The optional hint is used until the
-    /// first packet reveals the guest virtual source address.
+    /// 接入一个对端的 QUIC 连接。
+    ///
+    /// `crypto` 是与该对端协商好的 overlay 会话密钥；
+    /// `peer_hint` 在首包揭示对端虚拟源地址之前用于路由。
     pub async fn attach_peer(
         &self,
         conn: Connection,
+        crypto: Arc<SessionCrypto>,
         peer_hint: Option<Ipv4Addr>,
     ) -> Result<(), TunError> {
-        let (mut send, mut recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| TunError::WriteFailed(format!("打开 TUN QUIC 流失败: {}", e)))?;
-        send.write_all(STREAM_MAGIC)
-            .await
-            .map_err(|e| TunError::WriteFailed(format!("写入 TUN 流头失败: {}", e)))?;
-        let send = Arc::new(Mutex::new(send));
-        let forwarder = spawn_peer_forwarder(send);
+        let forwarder = PeerForwarder {
+            conn: conn.clone(),
+            crypto,
+        };
         tracing::info!(
-            "[TUN] PIP1 stream opened (local={}, peer_hint={:?}, host={})",
+            "[TUN] 数据报通道就绪 (local={}, peer_hint={:?}, host={}, max_datagram={:?})",
             self.my_vip,
             peer_hint,
-            self.is_host
+            self.is_host,
+            conn.max_datagram_size()
         );
         if let Some(ip) = peer_hint {
             self.peers.lock().await.insert(ip, forwarder.clone());
@@ -227,52 +212,13 @@ impl TunBridge {
         let host_vip = self.host_vip;
         let guest_network = self.guest_network;
         tokio::spawn(async move {
-            if let Err(e) = receive_frames(
-                &mut recv,
-                tun,
-                peers,
-                sender,
-                is_host,
-                host_vip,
-                guest_network,
-            )
-            .await
+            if let Err(e) =
+                receive_datagrams(conn, tun, peers, sender, is_host, host_vip, guest_network).await
             {
-                debug!("TUN peer stream ended: {}", e);
+                debug!("[TUN] 对端数据报循环结束: {}", e);
             }
         });
         Ok(())
-    }
-
-    /// Handle a stream accepted by the Host QUIC endpoint after its magic has
-    /// already been consumed by the tunnel dispatcher.
-    pub async fn handle_peer_stream(
-        &self,
-        send: SendStream,
-        mut recv: RecvStream,
-    ) -> Result<(), TunError> {
-        let sender = spawn_peer_forwarder(Arc::new(Mutex::new(send)));
-        tracing::info!(
-            "[TUN] PIP1 stream accepted (local={}, host={})",
-            self.my_vip,
-            self.is_host
-        );
-        let mut default = self.default_peer.lock().await;
-        if !self.is_host && default.is_none() {
-            *default = Some(sender.clone());
-        }
-        drop(default);
-        receive_frames(
-            &mut recv,
-            self.tun.clone(),
-            self.peers.clone(),
-            sender,
-            self.is_host,
-            self.host_vip,
-            self.guest_network,
-        )
-        .await
-        .map_err(TunError::ReadFailed)
     }
 
     async fn tun_read_loop(self: Arc<Self>) {
@@ -354,8 +300,13 @@ impl TunBridge {
     }
 }
 
-async fn receive_frames(
-    recv: &mut RecvStream,
+/// 接收对端数据报，解密后写入 TUN。
+///
+/// 与旧的流式实现相比，这里**丢包不影响后续包**——数据报之间彼此独立，
+/// 不存在队头阻塞，也不会为早已过期的实时流量做重传。
+/// 单个包解密失败只丢它自己，循环继续。
+async fn receive_datagrams(
+    conn: Connection,
     tun: Arc<TunDevice>,
     peers: PeerSenders,
     sender: PeerForwarder,
@@ -364,14 +315,22 @@ async fn receive_frames(
     guest_network: Ipv4Addr,
 ) -> Result<(), String> {
     loop {
-        let len = recv.read_u16().await.map_err(|e| e.to_string())? as usize;
+        let datagram = conn.read_datagram().await.map_err(|e| e.to_string())?;
+
+        // 解密失败不是致命错误：可能是重放、乱序过旧、或途中损坏。
+        // 丢弃这一个包继续跑，绝不能因此中断整条隧道。
+        let packet = match sender.crypto.open(&datagram) {
+            Ok(p) => p,
+            Err(e) => {
+                debug!("[TUN] 丢弃无法解密的数据报: {}", e);
+                continue;
+            }
+        };
+        let len = packet.len();
         if !(20..=MAX_PACKET).contains(&len) {
-            return Err(format!("invalid packet length {}", len));
+            debug!("[TUN] 丢弃长度异常的包: {}", len);
+            continue;
         }
-        let mut packet = vec![0u8; len];
-        recv.read_exact(&mut packet)
-            .await
-            .map_err(|e| e.to_string())?;
         let Some(header) = Ipv4Header::from_bytes(&packet) else {
             continue;
         };
@@ -510,48 +469,33 @@ mod tests {
         assert!(!same_prefix24(Ipv4Addr::new(172, 24, 0, 1), guest_network));
     }
 
-    // Regression tests for the relay-mode freeze: forwarding to one peer
-    // must never block or fail forwarding to another peer. `PeerForwarder`
-    // is exercised directly against a bare mpsc channel here (rather than a
-    // real QUIC SendStream) so the non-blocking/backpressure contract can be
-    // verified without a network stack.
-
-    #[tokio::test]
-    async fn try_forward_is_non_blocking_when_queue_is_full() {
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1);
-        let forwarder = PeerForwarder { tx };
-
-        // Fill the bounded queue.
-        assert!(forwarder.try_forward(b"first"));
-        // The queue is now full; try_forward must return immediately with
-        // `false` instead of blocking the caller (this is what previously
-        // starved every other peer sharing the single TUN read loop).
-        assert!(!forwarder.try_forward(b"second"));
-
-        let received = rx.recv().await.expect("first packet should be queued");
-        assert_eq!(received, b"first");
+    /// 一个满 MTU 的包加上 overlay 加密开销后，必须仍能塞进 QUIC 数据报。
+    ///
+    /// QUIC 为避免 IP 分片会把数据报限制在保守的路径 MTU 内（典型 1200 左右）。
+    /// 这个关系一旦破坏，**每一个满载包都会被拒发**——而且只在真实链路上
+    /// 才暴露，本地环回测不出来，所以在这里用断言钉死。
+    #[test]
+    fn full_mtu_packet_still_fits_in_a_quic_datagram() {
+        // QUIC 在 IPv6 最小 MTU(1280) 下扣掉包头后的保守可用值
+        const CONSERVATIVE_QUIC_DATAGRAM_LIMIT: usize = 1200;
+        let worst_case = TUN_MTU as usize + crate::crypto::OVERHEAD;
+        assert!(
+            worst_case <= CONSERVATIVE_QUIC_DATAGRAM_LIMIT,
+            "TUN_MTU({}) + 加密开销({}) = {} 超出 QUIC 数据报保守上限 {}",
+            TUN_MTU,
+            crate::crypto::OVERHEAD,
+            worst_case,
+            CONSERVATIVE_QUIC_DATAGRAM_LIMIT
+        );
     }
 
-    #[tokio::test]
-    async fn try_forward_reports_false_once_receiver_is_gone() {
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(4);
-        drop(rx);
-        let forwarder = PeerForwarder { tx };
-        assert!(!forwarder.try_forward(b"packet"));
-    }
-
-    #[tokio::test]
-    async fn independent_peer_queues_do_not_block_each_other() {
-        // Two peers sharing a bridge: one has a full/stalled queue, the
-        // other must still accept packets without waiting.
-        let (stalled_tx, _stalled_rx) = mpsc::channel::<Vec<u8>>(1);
-        let stalled = PeerForwarder { tx: stalled_tx };
-        assert!(stalled.try_forward(b"a")); // fills the only slot
-        assert!(!stalled.try_forward(b"b")); // now full, must not block
-
-        let (healthy_tx, mut healthy_rx) = mpsc::channel::<Vec<u8>>(4);
-        let healthy = PeerForwarder { tx: healthy_tx };
-        assert!(healthy.try_forward(b"c"));
-        assert_eq!(healthy_rx.recv().await.unwrap(), b"c");
+    /// MTU 也不能定得过小，否则每个 IP 包都要被内层协议分片，白白浪费带宽
+    #[test]
+    fn tun_mtu_is_large_enough_to_be_useful() {
+        assert!(
+            TUN_MTU >= 1000,
+            "MTU {} 过小会导致大量分片，严重拖累吞吐",
+            TUN_MTU
+        );
     }
 }

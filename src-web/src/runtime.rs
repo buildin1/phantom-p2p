@@ -1,7 +1,10 @@
 use phantom_core::{
-    config::ClientConfig, identity::Identity, network, puncher, signal, stats, tun_bridge, tunnel,
+    config::ClientConfig, identity::Identity, network, punch, puncher, signal, stats, tun_bridge,
+    tunnel,
 };
-use phantom_protocol::{ClientMessage, IceCandidate, ServerMessage};
+use phantom_protocol::{
+    ClientMessage, IceCandidate, NatProfile, PunchParams, PunchStrategy, ServerMessage,
+};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -9,6 +12,15 @@ use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, watch, Mutex, RwLock};
+
+/// 日志目录。与桌面端一致放在配置目录下的 `log/`，
+/// 这样"打包整个目录上报"的逻辑两端可以共用。
+pub fn log_directory() -> std::path::PathBuf {
+    ClientConfig::config_path()
+        .parent()
+        .map(|d| d.join("log"))
+        .unwrap_or_else(|| std::path::PathBuf::from("log"))
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct UiEvent {
@@ -29,6 +41,9 @@ struct HostPeer {
     endpoint: Option<quinn::Endpoint>,
 }
 
+/// 每个对端一套打洞会话（三阶段状态机在 phantom-core 里，两个客户端共用）
+type PunchSessions = HashMap<String, punch::Session>;
+
 struct RuntimeState {
     authenticated_user: Option<String>,
     fixed_host_ip: Option<String>,
@@ -39,6 +54,12 @@ struct RuntimeState {
     host_virtual_ip: String,
     socket: Option<Arc<UdpSocket>>,
     local_candidates: Vec<IceCandidate>,
+    /// 打洞会话：Guest 端只有一个（键为 Host 的 session_id），
+    /// Host 端每个 Guest 一个
+    punch_sessions: PunchSessions,
+    /// 打洞阶段协商出的 overlay 会话密钥。
+    /// P2P 与中继两条路径共用同一份——中继只做盲转发，看不到明文。
+    peer_crypto: Option<Arc<phantom_core::crypto::SessionCrypto>>,
     relay: Option<RelayInfo>,
     conn_manager: Option<Arc<tunnel::TunnelConnManager>>,
     host_endpoint: Option<quinn::Endpoint>,
@@ -60,6 +81,8 @@ impl Default for RuntimeState {
             host_virtual_ip: String::new(),
             socket: None,
             local_candidates: Vec::new(),
+            punch_sessions: HashMap::new(),
+            peer_crypto: None,
             relay: None,
             conn_manager: None,
             host_endpoint: None,
@@ -347,10 +370,20 @@ impl HeadlessRuntime {
                     self.emit("tunnel:failed", json!({"mode": "Relay", "reason": error}));
                 }
             }
-            ServerMessage::PeerCandidates {
+            ServerMessage::PunchPlan {
                 peer_session_id,
-                candidates,
-                peer_nat_type,
+                attempt_id,
+                strategy,
+                params,
+                peer_profile,
+                ..
+            } => {
+                self.handle_punch_plan(peer_session_id, attempt_id, strategy, params, peer_profile)
+                    .await;
+            }
+            ServerMessage::PunchStart {
+                peer_session_id,
+                peer_candidates,
                 start_at_ms,
                 ..
             } => {
@@ -358,17 +391,15 @@ impl HeadlessRuntime {
                 let peer_id = peer_session_id.clone();
                 let task = tokio::spawn(async move {
                     runtime
-                        .handle_peer_candidates(
-                            peer_session_id,
-                            candidates,
-                            peer_nat_type,
-                            start_at_ms,
-                        )
+                        .handle_punch_start(peer_session_id, peer_candidates, start_at_ms)
                         .await;
                 });
                 if self.state.lock().await.is_host {
                     self.state.lock().await.host_ice_tasks.insert(peer_id, task);
                 }
+            }
+            ServerMessage::RequestLogUpload { upload_url, reason } => {
+                self.upload_logs(upload_url, reason).await;
             }
             ServerMessage::RoomClosed { .. } => self.reset_room().await,
             _ => {}
@@ -376,7 +407,112 @@ impl HeadlessRuntime {
         self.emit_status().await;
     }
 
+    /// 收到上传凭据后打包并上传日志。
+    ///
+    /// 打包与 HTTP 传输都是阻塞操作，放到 blocking 线程池，
+    /// 避免拖住信令消息循环。
+    async fn upload_logs(&self, upload_url: String, reason: String) {
+        let dir = log_directory();
+        let result = tokio::task::spawn_blocking(move || {
+            let uploader = phantom_core::log_upload::LogUploader::new(&dir);
+            // 先补投历史失败的包——它们往往正是"网络有问题"那次的日志
+            uploader.flush_pending();
+            uploader.upload_now(&upload_url, &reason)
+        })
+        .await;
+
+        match result {
+            Ok(Ok(bytes)) => {
+                self.emit("log:uploaded", json!({"bytes": bytes}));
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("[日志上报] {}", e);
+                self.emit("log:upload_failed", json!({"reason": e}));
+            }
+            Err(e) => tracing::warn!("[日志上报] 任务失败: {}", e),
+        }
+    }
+
+    /// 主动请求上传日志（用户点击"反馈问题"）
+    pub async fn request_log_upload(&self, reason: String) -> Result<(), String> {
+        self.signal
+            .send(ClientMessage::RequestLogUpload { reason })
+            .await
+    }
+
+    /// 取服务端下发的 STUN 列表（自建优先）。
+    /// 客户端不内置任何地址——公共 STUN 不可用时会直接导致拿不到 srflx 候选而落中继。
+    async fn stun_servers(&self) -> Vec<(String, u16)> {
+        match self.signal.network_config().await {
+            Some(cfg) => cfg
+                .stun_servers
+                .iter()
+                .map(|s| (s.host.clone(), s.port))
+                .collect(),
+            None => {
+                tracing::warn!("[打洞] 服务端尚未下发 STUN 配置");
+                Vec::new()
+            }
+        }
+    }
+
+    /// **阶段一**：探测 NAT 画像并上报（Guest 侧，或 Host 面向单个 Guest）。
+    async fn begin_punch(&self, target_peer: Option<String>) -> Result<(), String> {
+        let stun = self.stun_servers().await;
+        let rtt = self.signal.signal_rtt_ms();
+        // 会话键：Guest 用 None（对端就是 Host），Host 用具体的 Guest id
+        let key = target_peer
+            .clone()
+            .unwrap_or_else(|| "__host__".to_string());
+
+        self.emit("punch:phase", puncher::PunchPhase::Probing);
+
+        let identity = self.signal.identity();
+        let (mut session, profile, candidates) = tokio::task::spawn_blocking(move || {
+            let mut session = punch::Session::new();
+            let (profile, candidates) = session.probe(&stun, rtt, &identity)?;
+            Ok::<_, String>((session, profile, candidates))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+
+        let socket = session
+            .primary_socket()
+            .ok_or_else(|| "打洞 socket 未就绪".to_string())?;
+
+        {
+            let mut state = self.state.lock().await;
+            if let Some(peer) = &target_peer {
+                state.host_peers.insert(
+                    peer.clone(),
+                    HostPeer {
+                        socket: socket.clone(),
+                        endpoint: None,
+                    },
+                );
+            } else {
+                state.socket = Some(socket);
+                state.local_candidates = candidates.clone();
+            }
+            state
+                .punch_sessions
+                .insert(key, std::mem::take(&mut session));
+        }
+
+        self.signal
+            .send(ClientMessage::NatProfileReport {
+                target_peer_session_id: target_peer,
+                profile,
+                base_candidates: candidates,
+            })
+            .await?;
+        self.emit("punch:phase", puncher::PunchPhase::WaitingPeer);
+        Ok(())
+    }
+
     async fn start_punch(&self) -> Result<(), String> {
+        // Host 的 socket 是长期存活的，已有候选就直接复用重报，
+        // 不要重新探测——否则会毁掉已经建立的连接
         let existing = {
             let state = self.state.lock().await;
             if state.is_host && !state.local_candidates.is_empty() {
@@ -385,45 +521,11 @@ impl HeadlessRuntime {
                 None
             }
         };
-        if let Some(candidates) = existing {
-            self.signal
-                .send(ClientMessage::IceCandidates {
-                    target_peer_session_id: None,
-                    candidates,
-                    ufrag: String::new(),
-                    pwd: String::new(),
-                    nat_type: String::new(),
-                })
-                .await?;
+        if existing.is_some() {
             self.emit("punch:phase", puncher::PunchPhase::WaitingPeer);
             return Ok(());
         }
-
-        self.emit("punch:phase", puncher::PunchPhase::Probing);
-        let (socket, candidates) = tokio::task::spawn_blocking(|| {
-            let socket =
-                network::bind_dual_stack_udp(0).map_err(|e| format!("bind ICE socket: {}", e))?;
-            let (candidates, _, _, _) = puncher::gather_ice_candidates(&socket);
-            Ok::<_, String>((Arc::new(socket), candidates))
-        })
-        .await
-        .map_err(|e| e.to_string())??;
-        {
-            let mut state = self.state.lock().await;
-            state.socket = Some(socket);
-            state.local_candidates = candidates.clone();
-        }
-        self.signal
-            .send(ClientMessage::IceCandidates {
-                target_peer_session_id: None,
-                candidates,
-                ufrag: String::new(),
-                pwd: String::new(),
-                nat_type: String::new(),
-            })
-            .await?;
-        self.emit("punch:phase", puncher::PunchPhase::WaitingPeer);
-        Ok(())
+        self.begin_punch(None).await
     }
 
     async fn start_host_punch_for_peer(&self, peer_session_id: &str) -> Result<(), String> {
@@ -436,81 +538,123 @@ impl HeadlessRuntime {
         {
             return Ok(());
         }
-        let (socket, candidates) = tokio::task::spawn_blocking(|| {
-            let socket = network::bind_dual_stack_udp(0)
-                .map_err(|e| format!("bind per-peer ICE socket: {}", e))?;
-            let (candidates, _, _, _) = puncher::gather_ice_candidates(&socket);
-            Ok::<_, String>((Arc::new(socket), candidates))
-        })
-        .await
-        .map_err(|e| e.to_string())??;
-        self.state.lock().await.host_peers.insert(
-            peer_session_id.to_string(),
-            HostPeer {
-                socket: socket.clone(),
-                endpoint: None,
-            },
-        );
-        self.signal
-            .send(ClientMessage::IceCandidates {
-                target_peer_session_id: Some(peer_session_id.to_string()),
-                candidates,
-                ufrag: String::new(),
-                pwd: String::new(),
-                nat_type: String::new(),
-            })
-            .await?;
-        self.emit("punch:phase", puncher::PunchPhase::WaitingPeer);
-        Ok(())
+        self.begin_punch(Some(peer_session_id.to_string())).await
     }
 
-    async fn handle_peer_candidates(
+    /// **阶段二**：收到服务端下发的策略计划。
+    ///
+    /// 需要新建 socket 的策略（对称 NAT 侧）在这里创建并探测它们的映射，
+    /// 回报给对端；快速通道策略无需二次交换，此处不会产生候选。
+    async fn handle_punch_plan(
+        &self,
+        peer_session_id: String,
+        attempt_id: String,
+        strategy: PunchStrategy,
+        params: PunchParams,
+        peer_profile: NatProfile,
+    ) {
+        let key = self.session_key(&peer_session_id).await;
+        let stun = self.stun_servers().await;
+
+        let extra = {
+            let mut state = self.state.lock().await;
+            // Host 恒为 initiator：双方必须得出相反的角色，
+            // 否则会各自用同一把密钥发送，导致 nonce 复用
+            let is_initiator = state.is_host;
+            let Some(session) = state.punch_sessions.get_mut(&key) else {
+                tracing::warn!("[打洞] 收到计划但会话不存在: {}", key);
+                return;
+            };
+            session.on_plan(
+                attempt_id.clone(),
+                strategy,
+                params,
+                peer_profile,
+                &stun,
+                is_initiator,
+            )
+        };
+
+        if !extra.is_empty() {
+            if let Err(e) = self
+                .signal
+                .send(ClientMessage::StrategyCandidates {
+                    target_peer_session_id: peer_session_id,
+                    attempt_id,
+                    candidates: extra,
+                })
+                .await
+            {
+                tracing::warn!("[打洞] 上报策略候选失败: {}", e);
+            }
+        }
+    }
+
+    /// Guest 侧只有一个会话；Host 侧按 Guest 的 session_id 分别持有
+    async fn session_key(&self, peer_session_id: &str) -> String {
+        if self.state.lock().await.is_host {
+            peer_session_id.to_string()
+        } else {
+            "__host__".to_string()
+        }
+    }
+
+    /// **阶段三**：按计划执行打洞，无论成败都上报结构化遥测。
+    async fn handle_punch_start(
         self: Arc<Self>,
         peer_session_id: String,
-        candidates: Vec<IceCandidate>,
-        peer_nat_type: String,
+        peer_candidates: Vec<IceCandidate>,
         start_at_ms: u64,
     ) {
-        let (socket, is_host) = {
+        let key = self.session_key(&peer_session_id).await;
+        let (is_host, room_code) = {
             let state = self.state.lock().await;
-            let socket = if state.is_host {
-                state
-                    .host_peers
-                    .get(&peer_session_id)
-                    .map(|peer| peer.socket.clone())
-            } else {
-                state.socket.clone()
-            };
-            (socket, state.is_host)
+            (state.is_host, state.room_code.clone().unwrap_or_default())
         };
-        let Some(socket) = socket else {
-            self.emit(
-                "punch:phase",
-                puncher::PunchPhase::Failed {
-                    reason: "ICE socket is not ready".into(),
-                },
-            );
-            return;
+        let ctx = punch::RecordContext::new(room_code, peer_session_id.clone(), is_host);
+
+        let mut session = {
+            let mut state = self.state.lock().await;
+            match state.punch_sessions.remove(&key) {
+                Some(s) => s,
+                None => {
+                    self.emit(
+                        "punch:phase",
+                        puncher::PunchPhase::Failed {
+                            reason: "打洞会话未就绪".into(),
+                        },
+                    );
+                    return;
+                }
+            }
         };
-        tracing::info!(
-            "[ICE] checking {} candidates, NAT={}",
-            candidates.len(),
-            peer_nat_type
-        );
+
         self.emit("punch:phase", puncher::PunchPhase::Punching);
-        let result = puncher::do_ice_punch(socket.clone(), candidates, start_at_ms).await;
-        if !result.success {
+        let outcome = session.run(peer_candidates, start_at_ms, ctx).await;
+
+        // 成败都上报——失败样本对分析 NAT 组合成功率同样重要
+        if let Err(e) = self
+            .signal
+            .send(ClientMessage::PunchReport {
+                record: outcome.record.clone(),
+            })
+            .await
+        {
+            tracing::warn!("[打洞] 遥测上报失败: {}", e);
+        }
+
+        let Some(success) = outcome.success else {
             if is_host {
                 if let Some(peer) = self.state.lock().await.host_peers.remove(&peer_session_id) {
                     if let Some(endpoint) = peer.endpoint {
-                        endpoint.close(0u32.into(), b"ICE failed");
+                        endpoint.close(0u32.into(), b"punch failed");
                     }
                 }
             }
             self.emit(
                 "punch:phase",
                 puncher::PunchPhase::Failed {
-                    reason: result.reason,
+                    reason: format!("{:?}", outcome.record.outcome),
                 },
             );
             if let Some(relay) = self.state.lock().await.relay.clone() {
@@ -519,7 +663,46 @@ impl HeadlessRuntime {
                 }
             }
             return;
+        };
+
+        // 打通的正是这个 socket 的映射，隧道必须复用它，换 socket 等于白打
+        let Some(socket) = outcome.socket else {
+            self.emit(
+                "punch:phase",
+                puncher::PunchPhase::Failed {
+                    reason: "命中的 socket 丢失".into(),
+                },
+            );
+            return;
+        };
+        {
+            let mut state = self.state.lock().await;
+            // 数据面必须用这把密钥；没有它就只能明文，宁可不建隧道
+            state.peer_crypto = outcome.crypto.clone();
+            if is_host {
+                if let Some(peer) = state.host_peers.get_mut(&peer_session_id) {
+                    peer.socket = socket.clone();
+                }
+            } else {
+                state.socket = Some(socket.clone());
+            }
         }
+        if outcome.crypto.is_none() {
+            self.emit(
+                "punch:phase",
+                puncher::PunchPhase::Failed {
+                    reason: "overlay 会话密钥协商失败".into(),
+                },
+            );
+            return;
+        }
+
+        let result = puncher::PunchResult {
+            success: true,
+            peer_addr: success.peer_addr.to_string(),
+            latency_ms: success.rtt_ms,
+            reason: String::new(),
+        };
 
         self.emit(
             "punch:phase",
@@ -541,13 +724,15 @@ impl HeadlessRuntime {
                     let task_endpoint = endpoint.clone();
                     let stats = self.stats.clone();
                     let tun = state.tun_bridge.clone();
+                    let crypto = state.peer_crypto.clone();
                     let peer_map = Arc::new(Mutex::new(HashMap::from([(
                         result.peer_addr.clone(),
                         peer_session_id.clone(),
                     )])));
                     tokio::spawn(async move {
                         let _ =
-                            tunnel::start_host_tunnel(task_endpoint, stats, peer_map, tun).await;
+                            tunnel::start_host_tunnel(task_endpoint, stats, peer_map, tun, crypto)
+                                .await;
                     });
                     if let Some(peer) = state.host_peers.get_mut(&peer_session_id) {
                         peer.endpoint = Some(endpoint);
@@ -605,9 +790,13 @@ impl HeadlessRuntime {
 
     async fn start_relay(&self, relay: RelayInfo) -> Result<(), String> {
         let address = resolve_ipv4(&relay.relay_addr, relay.relay_quic_port).await?;
-        let (is_host, tun) = {
+        let (is_host, tun, crypto) = {
             let state = self.state.lock().await;
-            (state.is_host, state.tun_bridge.clone())
+            (
+                state.is_host,
+                state.tun_bridge.clone(),
+                state.peer_crypto.clone(),
+            )
         };
         let user = self
             .stats
@@ -624,6 +813,7 @@ impl HeadlessRuntime {
                 self.stats.clone(),
                 user,
                 tun,
+                crypto,
             )
             .await?;
             self.state.lock().await.relay_host_conn = Some(connection);
@@ -647,7 +837,7 @@ impl HeadlessRuntime {
     }
 
     async fn start_guest_tun(&self) -> Result<(), String> {
-        let (subnet, virtual_ip, host_ip, connection, already_started) = {
+        let (subnet, virtual_ip, host_ip, connection, already_started, crypto) = {
             let state = self.state.lock().await;
             let connection = match &state.conn_manager {
                 Some(manager) => manager.get_conn().await,
@@ -659,15 +849,19 @@ impl HeadlessRuntime {
                 state.host_virtual_ip.clone(),
                 connection,
                 state.tun_bridge.is_some(),
+                state.peer_crypto.clone(),
             )
         };
         if already_started {
             return Ok(());
         }
         let connection = connection.ok_or("QUIC connection is not ready")?;
-        let bridge = tun_bridge::TunBridge::start(&subnet, &virtual_ip, &host_ip, connection)
-            .await
-            .map_err(|e| e.to_string())?;
+        // 没有会话密钥就不建隧道——绝不退回明文传输
+        let crypto = crypto.ok_or("overlay 会话密钥尚未协商完成")?;
+        let bridge =
+            tun_bridge::TunBridge::start(&subnet, &virtual_ip, &host_ip, connection, crypto)
+                .await
+                .map_err(|e| e.to_string())?;
         self.state.lock().await.tun_bridge = Some(bridge);
         self.emit(
             "tun:ready",
@@ -897,7 +1091,9 @@ fn required_string(payload: &Value, key: &str) -> Result<String, String> {
 fn server_event_name(message: &ServerMessage) -> &'static str {
     match message {
         ServerMessage::Welcome { .. } => "signal:welcome",
-        ServerMessage::Pong => "signal:pong",
+        ServerMessage::Pong { .. } => "signal:pong",
+        ServerMessage::VersionMismatch { .. } => "signal:version_mismatch",
+        ServerMessage::NetworkConfigUpdate { .. } => "signal:network_config",
         ServerMessage::RoomCreated { .. } => "signal:room_created",
         ServerMessage::JoinOk { .. } => "signal:join_ok",
         ServerMessage::JoinFailed { .. } => "signal:join_failed",
@@ -911,7 +1107,9 @@ fn server_event_name(message: &ServerMessage) -> &'static str {
         ServerMessage::AuthFailed { .. } => "signal:auth_failed",
         ServerMessage::RelayReady { .. } => "signal:relay_ready",
         ServerMessage::RelayPreAllocated { .. } => "signal:relay_pre_allocated",
-        ServerMessage::PeerCandidates { .. } => "signal:peer_candidates",
+        ServerMessage::PunchPlan { .. } => "signal:punch_plan",
+        ServerMessage::PunchStart { .. } => "signal:punch_start",
+        ServerMessage::RequestLogUpload { .. } => "signal:request_log_upload",
     }
 }
 

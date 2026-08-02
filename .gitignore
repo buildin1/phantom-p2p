@@ -31,3 +31,13 @@ android/app/src/main/jniLibs/**/*.so
 android-logs/
 ._*
 **/._*
+
+# 逆向分析产物：第三方商业二进制，体积大且不应入库
+反编译/
+
+# 本地运行日志目录
+log/
+
+# 文档一律不入库，仅保留 README
+*.md
+!README.md

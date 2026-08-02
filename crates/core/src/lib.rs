@@ -29,11 +29,15 @@ pub fn ensure_rustls_crypto_provider() -> Result<(), String> {
 }
 
 pub mod config;
+pub mod crypto;
 pub mod ice;
 pub mod identity;
+pub mod log_upload;
+pub mod logging;
 pub mod nat;
 pub mod network;
 pub mod network_info;
+pub mod punch;
 pub mod puncher;
 pub mod signal;
 pub mod stats;

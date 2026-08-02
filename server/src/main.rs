@@ -28,8 +28,9 @@ use uuid::Uuid;
 mod admin;
 mod config;
 mod database;
-mod port_pool;
+mod log_upload;
 mod relay;
+mod stun_server;
 
 // ============================================================
 // 数据结构
@@ -94,10 +95,74 @@ enum RoomState {
     },
 }
 
-/// ICE 候选缓存条目
+/// 一端在打洞会话中的状态
+#[derive(Clone, Default)]
+struct PunchSide {
+    /// 阶段一上报的 NAT 画像
+    profile: Option<phantom_protocol::NatProfile>,
+    /// 阶段一的基础候选（host + srflx）
+    base_candidates: Vec<phantom_protocol::IceCandidate>,
+    /// 阶段二的策略候选（预测/撒网目标、新建 socket 的映射）
+    strategy_candidates: Vec<phantom_protocol::IceCandidate>,
+    /// 是否需要走阶段二；由策略决定
+    needs_strategy: bool,
+    /// 阶段二是否已上报
+    strategy_reported: bool,
+}
+
+impl PunchSide {
+    /// 该端的候选是否已集齐，可以进入阶段三
+    fn ready_for_start(&self) -> bool {
+        self.profile.is_some() && (!self.needs_strategy || self.strategy_reported)
+    }
+
+    /// 下发给对端的完整候选集
+    fn all_candidates(&self) -> Vec<phantom_protocol::IceCandidate> {
+        let mut v = self.base_candidates.clone();
+        v.extend(self.strategy_candidates.iter().cloned());
+        v
+    }
+}
+
+/// 一对 Host↔Guest 的打洞会话（三阶段状态机）
+///
+/// ```text
+/// 阶段一  双方 NatProfileReport  →  服务端选策略  →  下发 PunchPlan
+/// 阶段二  需要新建 socket 的一方上报 StrategyCandidates（简单组合跳过）
+/// 阶段三  双方候选集齐  →  下发 PunchStart（统一起始时刻）
+/// ```
 #[derive(Clone)]
-struct IceCandidateEntry {
-    candidates: Vec<phantom_protocol::IceCandidate>,
+struct PunchSession {
+    /// 本次尝试的唯一 ID，贯穿遥测
+    attempt_id: String,
+    host: PunchSide,
+    guest: PunchSide,
+    /// 计划是否已下发（避免重复下发）
+    plan_sent: bool,
+    /// 是否已下发 PunchStart（避免重复触发）
+    started: bool,
+    created_at: std::time::Instant,
+}
+
+impl PunchSession {
+    fn new() -> Self {
+        Self {
+            attempt_id: Uuid::new_v4().to_string(),
+            host: PunchSide::default(),
+            guest: PunchSide::default(),
+            plan_sent: false,
+            started: false,
+            created_at: std::time::Instant::now(),
+        }
+    }
+
+    fn side_mut(&mut self, is_host: bool) -> &mut PunchSide {
+        if is_host {
+            &mut self.host
+        } else {
+            &mut self.guest
+        }
+    }
 }
 
 /// 一个房间
@@ -116,10 +181,8 @@ struct Room {
     created_at: std::time::Instant,
     /// 房间状态
     state: RoomState,
-    /// ICE 候选缓存：等双方都提交后再同步触发（session_id → 候选条目）
-    ice_candidate_cache: HashMap<String, IceCandidateEntry>,
-    /// ICE 鉴权信息缓存（session_id → (ufrag, pwd, nat_type)）
-    ice_auth_info: HashMap<String, (String, String, String)>,
+    /// 打洞会话：key 为 guest_session_id（一个 Host 对多个 Guest，各自独立一套）
+    punch_sessions: HashMap<String, PunchSession>,
 }
 
 /// 全局共享状态
@@ -140,8 +203,8 @@ struct AppState {
     rate_limit_connections: HashMap<String, u32>,
     /// 中继注册表
     relay_registry: relay::SharedRegistry,
-    /// 已启动的 QUIC 中继监听端口
-    relay_quic_listener_ports: HashSet<u16>,
+    /// 日志上传凭据注册表（未启用时为 None）
+    log_uploads: Option<log_upload::UploadRegistry>,
     /// 运行时配置
     config: Arc<config::ServerConfig>,
 }
@@ -164,7 +227,11 @@ const SESSION_HEARTBEAT_TIMEOUT_SECS: u64 = 90;
 const SESSION_SWEEP_INTERVAL_SECS: u64 = 5;
 
 impl AppState {
-    fn new(relay_registry: relay::SharedRegistry, config: Arc<config::ServerConfig>) -> Self {
+    fn new(
+        relay_registry: relay::SharedRegistry,
+        log_uploads: Option<log_upload::UploadRegistry>,
+        config: Arc<config::ServerConfig>,
+    ) -> Self {
         Self {
             sessions: HashMap::new(),
             rooms: HashMap::new(),
@@ -174,7 +241,7 @@ impl AppState {
             rate_limit_create: HashMap::new(),
             rate_limit_connections: HashMap::new(),
             relay_registry,
-            relay_quic_listener_ports: HashSet::new(),
+            log_uploads,
             config,
         }
     }
@@ -280,6 +347,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: SharedSta
     // 发送 Welcome
     let welcome = ServerMessage::Welcome {
         session_id: session_id.clone(),
+        protocol_version: phantom_protocol::PROTOCOL_VERSION,
     };
     match phantom_protocol::serialize(&welcome) {
         Ok(bytes) => {
@@ -406,18 +474,41 @@ where
 async fn handle_client_message(session_id: &str, msg: ClientMessage, state: &SharedState) {
     match msg {
         // Ping 和 Auth 不需要认证
-        ClientMessage::Ping => {
-            handle_ping(session_id, state).await;
+        ClientMessage::Ping { client_time_ms } => {
+            handle_ping(session_id, client_time_ms, state).await;
         }
         ClientMessage::Auth {
             public_key,
             signature,
+            protocol_version,
+            client_version,
         } => {
+            // 协议不做向后兼容：版本不符直接拒绝并要求升级，
+            // 而不是让后续消息以各种诡异的反序列化失败告终。
+            if protocol_version != phantom_protocol::PROTOCOL_VERSION {
+                warn!(
+                    "[鉴权] {} 协议版本不匹配：客户端 {} / 服务端 {} (client_version={})",
+                    session_id,
+                    protocol_version,
+                    phantom_protocol::PROTOCOL_VERSION,
+                    client_version
+                );
+                let st = state.lock().await;
+                if let Some(session) = st.sessions.get(session_id) {
+                    let _ = session.sender.send(ServerMessage::VersionMismatch {
+                        server_protocol_version: phantom_protocol::PROTOCOL_VERSION,
+                        client_protocol_version: protocol_version,
+                        message: "客户端版本过旧，请升级后再使用".to_string(),
+                    });
+                }
+                return;
+            }
             info!(
-                "[鉴权] {} 收到 Auth 响应，公钥前4字节: {:?}, 签名长度: {}",
+                "[鉴权] {} 收到 Auth 响应，公钥前4字节: {:?}, 签名长度: {}, 客户端版本: {}",
                 session_id,
                 &public_key[..4.min(public_key.len())],
-                signature.len()
+                signature.len(),
+                client_version
             );
             handle_auth(session_id, public_key, signature, state).await;
         }
@@ -477,23 +568,40 @@ async fn handle_client_message(session_id: &str, msg: ClientMessage, state: &Sha
                 ClientMessage::ReportConnectionMode { mode } => {
                     handle_report_connection_mode(session_id, mode, state).await;
                 }
-                ClientMessage::IceCandidates {
+                // ── 打洞三阶段 ──────────────────────────────────
+                ClientMessage::NatProfileReport {
                     target_peer_session_id,
-                    candidates,
-                    ufrag,
-                    pwd,
-                    nat_type,
+                    profile,
+                    base_candidates,
                 } => {
-                    handle_ice_candidates(
+                    handle_nat_profile(
                         session_id,
                         target_peer_session_id,
-                        candidates,
-                        ufrag,
-                        pwd,
-                        nat_type,
+                        profile,
+                        base_candidates,
                         state,
                     )
                     .await;
+                }
+                ClientMessage::StrategyCandidates {
+                    target_peer_session_id,
+                    attempt_id,
+                    candidates,
+                } => {
+                    handle_strategy_candidates(
+                        session_id,
+                        target_peer_session_id,
+                        attempt_id,
+                        candidates,
+                        state,
+                    )
+                    .await;
+                }
+                ClientMessage::PunchReport { record } => {
+                    handle_punch_report(session_id, record, state).await;
+                }
+                ClientMessage::RequestLogUpload { reason } => {
+                    handle_request_log_upload(session_id, reason, state).await;
                 }
                 _ => {} // Ping/Auth 已在上面处理
             }
@@ -509,6 +617,8 @@ async fn handle_auth(
     state: &SharedState,
 ) {
     let mut st = state.lock().await;
+    // 先克隆配置：下面会持有 sessions 的可变借用，届时无法再读 st.config
+    let server_cfg = st.config.clone();
     let session = match st.sessions.get_mut(session_id) {
         Some(s) => s,
         None => return,
@@ -581,14 +691,192 @@ async fn handle_auth(
         enabled: fixed_host_ip.is_some(),
         virtual_ip: fixed_host_ip,
     });
+    // 鉴权后立即下发网络配置——客户端不内置任何 STUN 地址与端口常量，
+    // 拿不到这份配置就无法探测 NAT 画像。
+    let _ = session.sender.send(ServerMessage::NetworkConfigUpdate {
+        config: build_network_config(&server_cfg),
+    });
+}
+
+/// 组装下发给客户端的网络配置。
+///
+/// 自建 STUN 排在最前——公共 STUN 不可用时客户端拿不到 srflx 候选，
+/// 会直接导致打洞不可能成功而落中继。
+fn build_network_config(cfg: &config::ServerConfig) -> phantom_protocol::NetworkConfig {
+    let mut stun_servers = Vec::new();
+    if cfg.stun.enabled {
+        let addr = cfg.stun.effective_addr(&cfg.relay.public_addr);
+        stun_servers.push(phantom_protocol::StunServerInfo {
+            host: addr.clone(),
+            port: cfg.stun.port,
+            is_self_hosted: true,
+        });
+        // 备用端口不是冗余：判定 NAT 映射行为需要至少两个不同的目标端点，
+        // 客户端比较两次映射是否一致才能区分锥形与对称。
+        stun_servers.push(phantom_protocol::StunServerInfo {
+            host: addr,
+            port: cfg.stun.alt_port,
+            is_self_hosted: true,
+        });
+    }
+    for s in &cfg.stun.fallback_servers {
+        if let Some((host, port)) = s.rsplit_once(':') {
+            if let Ok(port) = port.parse::<u16>() {
+                stun_servers.push(phantom_protocol::StunServerInfo {
+                    host: host.to_string(),
+                    port,
+                    is_self_hosted: false,
+                });
+            } else {
+                warn!("[配置] 忽略无法解析的 fallback STUN: {}", s);
+            }
+        }
+    }
+    phantom_protocol::NetworkConfig {
+        stun_servers,
+        relay_addr: cfg.relay.public_addr.clone(),
+        relay_quic_port: cfg.relay.quic_port,
+    }
 }
 
 /// 记录客户端上报的最终连接模式（p2p / relay），仅供管理面板只读展示。
+/// 接收客户端上报的结构化打洞记录（成功失败都会上报）。
+///
+/// 这是 NAT 组合成功率分析的唯一数据来源——没有它，
+/// 策略参数（撒网宽度、socket 数量、预测深度）只能靠猜。
+async fn handle_punch_report(
+    session_id: &str,
+    record: phantom_protocol::PunchRecord,
+    state: &SharedState,
+) {
+    info!(
+        "[打洞遥测] {} attempt={} 策略={} 结果={:?} NAT={:?}→{:?} 建连={}ms 总计={}ms 偏差={}ms",
+        session_id,
+        record.attempt_id,
+        record.strategy.as_str(),
+        record.outcome,
+        record.local_nat_class,
+        record.remote_nat_class,
+        record.p2p_establish_ms,
+        record.total_ms,
+        record.punch_start_skew_ms
+    );
+
+    let user_id = {
+        let st = state.lock().await;
+        st.sessions
+            .get(session_id)
+            .and_then(|s| s.user_id.clone())
+            .unwrap_or_else(|| session_id.to_string())
+    };
+
+    if let Some(db) = database::get_database() {
+        if let Err(e) = db.insert_punch_record(&user_id, &record) {
+            warn!("[打洞遥测] 落库失败: {}", e);
+        }
+    }
+}
+
+/// 签发一次性日志上传凭据。
+///
+/// 用户主动"反馈问题"时触发。凭据绑定 user_id 并有过期时间——
+/// 这样落盘时能按用户归类，也不必信任客户端自报的身份。
+async fn handle_request_log_upload(session_id: &str, reason: String, state: &SharedState) {
+    let (sender, user_id, registry) = {
+        let st = state.lock().await;
+        let Some(session) = st.sessions.get(session_id) else {
+            return;
+        };
+        (
+            session.sender.clone(),
+            session.user_id.clone(),
+            st.log_uploads.clone(),
+        )
+    };
+
+    let Some(registry) = registry else {
+        let _ = sender.send(ServerMessage::Error {
+            message: "服务端未启用日志上报".to_string(),
+        });
+        return;
+    };
+    // 未鉴权用户不签发：否则无法归类，也会成为磁盘灌满的入口
+    let Some(user_id) = user_id else {
+        let _ = sender.send(ServerMessage::Error {
+            message: "需要先完成鉴权才能上报日志".to_string(),
+        });
+        return;
+    };
+
+    let url = registry.issue(&user_id, &reason).await;
+    info!(
+        "[日志上报] 已为 {} 签发上传凭据 (原因: {})",
+        user_id, reason
+    );
+    let _ = sender.send(ServerMessage::RequestLogUpload {
+        upload_url: url,
+        reason,
+    });
+}
+
+/// 上报最终连接模式。
+///
+/// **P2P 成功时必须释放预分配的中继槽位。**
+/// 旧实现只记了个字段，导致中继消耗量等于房间总数而非失败房间数——
+/// 这是中继资源被打爆的直接原因，与打洞成功率无关。
 async fn handle_report_connection_mode(session_id: &str, mode: String, state: &SharedState) {
-    let mut st = state.lock().await;
-    if let Some(session) = st.sessions.get_mut(session_id) {
+    let release_target = {
+        let mut st = state.lock().await;
+        let Some(session) = st.sessions.get_mut(session_id) else {
+            return;
+        };
         info!("[连接模式] {} 上报: {}", session_id, mode);
-        session.connection_mode = Some(mode);
+        session.connection_mode = Some(mode.clone());
+        let room_code = session.room_code.clone();
+
+        if mode != "p2p" {
+            None
+        } else {
+            // 仅当该房间所有在场成员都已上报 p2p 时才释放：
+            // 多人房间里只要还有一个人走中继，槽位就不能回收。
+            room_code.and_then(|code| {
+                let room = st.rooms.get(&code)?;
+                let token = match &room.state {
+                    RoomState::Relaying { token, .. } => token.clone(),
+                    _ => return None,
+                };
+                let mut members = vec![room.host_session_id.clone()];
+                members.extend(room.guests.iter().cloned());
+                let all_p2p = members.iter().all(|sid| {
+                    st.sessions
+                        .get(sid)
+                        .map(|s| s.connection_mode.as_deref() == Some("p2p"))
+                        .unwrap_or(false)
+                });
+                if all_p2p {
+                    Some((code, token))
+                } else {
+                    None
+                }
+            })
+        }
+    };
+
+    if let Some((room_code, token)) = release_target {
+        let registry = {
+            let st = state.lock().await;
+            st.relay_registry.clone()
+        };
+        registry.lock().await.consume_token(&token).await;
+        let mut st = state.lock().await;
+        if let Some(room) = st.rooms.get_mut(&room_code) {
+            // 房间仍然存活，只是不再占用中继资源
+            room.state = RoomState::WaitingGuest;
+        }
+        info!(
+            "[中继回收] 房间 {} 全员 P2P 直连，已释放中继槽位 (token={})",
+            room_code, token
+        );
     }
 }
 
@@ -735,8 +1023,8 @@ fn hot_reconfigure_host_ip(
             .ok_or_else(|| "The active room no longer exists".to_string())?;
         room.host_virtual_ip = new_host_ip.to_string();
         room.state = RoomState::Created;
-        room.ice_candidate_cache.clear();
-        room.ice_auth_info.clear();
+        // Host 地址变了，之前所有打洞会话的候选全部作废
+        room.punch_sessions.clear();
         (
             room.subnet.clone(),
             room.guests.iter().cloned().collect::<Vec<_>>(),
@@ -776,61 +1064,27 @@ fn hot_reconfigure_host_ip(
     Ok(())
 }
 
+/// 为房间登记一个中继 token。
+///
+/// 不再分配端口——所有房间共用启动时就绪的那一个 QUIC 监听端口，
+/// 房间路由完全靠首流里的 token。原先的"分配端口 → 起监听 → 失败重试"
+/// 那一整套逻辑随之消失，容量上限也不再由端口数决定。
 async fn allocate_relay_slot(
     state: &SharedState,
     relay_registry: &relay::SharedRegistry,
     room_code: &str,
 ) -> Result<(String, u16), String> {
-    const MAX_ATTEMPTS: usize = 8;
-
-    for _ in 0..MAX_ATTEMPTS {
-        let token = Uuid::new_v4().to_string();
-        let excluded_ports = {
-            let st = state.lock().await;
-            st.relay_quic_listener_ports.clone()
-        };
-        let relay_port = {
-            let mut reg = relay_registry.lock().await;
-            match reg
-                .register_token_excluding(token.clone(), &excluded_ports)
-                .await
-            {
-                Some(port) => port,
-                None => return Err("中继服务器端口资源不足，请稍后再试".to_string()),
-            }
-        };
-
-        let need_start = {
-            let st = state.lock().await;
-            !st.relay_quic_listener_ports.contains(&relay_port)
-        };
-
-        if need_start {
-            let start_result = relay::start_quic_relay(relay_port, relay_registry.clone()).await;
-
-            if let Err(e) = start_result {
-                error!(
-                    "[中继] 房间 {} 监听端口 {} 启动失败: {}",
-                    room_code, relay_port, e
-                );
-                let mut reg = relay_registry.lock().await;
-                reg.consume_token(&token).await;
-                reg.mark_port_unavailable(relay_port).await;
-                continue;
-            }
-
-            let mut st = state.lock().await;
-            st.relay_quic_listener_ports.insert(relay_port);
-            info!(
-                "[中继] 房间 {} 新增 QUIC 监听端口 {}",
-                room_code, relay_port
-            );
-        }
-
-        return Ok((token, relay_port));
-    }
-
-    Err("中继端口池无可用端口（监听初始化失败）".to_string())
+    let quic_port = {
+        let st = state.lock().await;
+        st.config.relay.quic_port
+    };
+    let token = Uuid::new_v4().to_string();
+    relay_registry.lock().await.register_token(token.clone());
+    info!(
+        "[中继] 房间 {} 登记 token（共用端口 {}）",
+        room_code, quic_port
+    );
+    Ok((token, quic_port))
 }
 
 async fn guest_relay_credential(registry: &relay::SharedRegistry, room_token: &str) -> String {
@@ -842,182 +1096,323 @@ async fn guest_relay_credential(registry: &relay::SharedRegistry, room_token: &s
     credential
 }
 
-/// 处理 ICE 候选上报：
+/// 计算打洞的**自适应同步窗口**。
 ///
-/// 核心改进：**双边同步触发**。
-/// 服务端收到第一方候选时先缓存，等双方都提交后，
-/// 用同一个 start_at_ms 同时向双方下发对端候选，
-/// 确保两端精确同步开始连通性检测，避免单边打洞失败。
-async fn handle_ice_candidates(
+/// 旧实现固定 `now + 200ms`：一旦信令 RTT 超过 200ms（跨省/跨运营商很常见），
+/// 时间戳到达客户端时已成过去，客户端不会等待，同步形同虚设。
+/// 这里按双方实测 RTT 取较大者放大后作为提前量，并夹在 [500ms, 3s]。
+fn compute_start_at_ms(host_rtt_ms: u32, guest_rtt_ms: u32) -> u64 {
+    const MIN_LEAD_MS: u64 = 500;
+    const MAX_LEAD_MS: u64 = 3_000;
+    let worst = host_rtt_ms.max(guest_rtt_ms) as u64;
+    let lead = (worst * 3 / 2 + 200).clamp(MIN_LEAD_MS, MAX_LEAD_MS);
+    now_ms() + lead
+}
+
+/// **阶段一**：收到一端的 NAT 画像与基础候选。
+///
+/// 双方都到齐后计算策略并下发 [`ServerMessage::PunchPlan`]；
+/// 若双方都不需要新建 socket（快速通道），紧接着直接下发 PunchStart。
+async fn handle_nat_profile(
     session_id: &str,
     target_peer_session_id: Option<String>,
-    candidates: Vec<phantom_protocol::IceCandidate>,
-    ufrag: String,
-    pwd: String,
-    nat_type: String,
+    profile: phantom_protocol::NatProfile,
+    base_candidates: Vec<phantom_protocol::IceCandidate>,
     state: &SharedState,
 ) {
-    // ── Step 1: 写入缓存，并检查是否双方均已就绪 ────────────────────
-    let (room_code, relay_addr, relay_registry, trigger_pairs) = {
-        let mut st = state.lock().await;
-
-        // 先克隆不需要可变借用的字段
-        let relay_addr = st.config.relay.public_addr.clone();
-        let relay_registry = st.relay_registry.clone();
-
-        let session = match st.sessions.get(session_id) {
-            Some(s) => s,
-            None => return,
-        };
-        let room_code = match &session.room_code {
-            Some(c) => c.clone(),
-            None => {
-                let _ = session.sender.send(ServerMessage::Error {
-                    message: "你不在房间中".to_string(),
-                });
-                return;
-            }
-        };
-        let room = match st.rooms.get_mut(&room_code) {
-            Some(r) => r,
-            None => return,
-        };
-
-        // 写入本方候选缓存
-        let host_sid = room.host_session_id.clone();
-        let cache_key = if session_id == host_sid {
-            target_peer_session_id
-                .as_deref()
-                .filter(|peer| room.guests.contains(*peer))
-                .map(|peer| format!("{}::{}", session_id, peer))
-                .unwrap_or_else(|| session_id.to_string())
-        } else {
-            session_id.to_string()
-        };
-        room.ice_candidate_cache.insert(
-            cache_key.clone(),
-            IceCandidateEntry {
-                candidates: candidates.clone(),
-            },
-        );
-        // 缓存鉴权信息（ufrag/pwd/nat_type）
-        room.ice_auth_info
-            .insert(cache_key, (ufrag.clone(), pwd.clone(), nat_type.clone()));
-
-        // 检查 host 和所有 guest 是否都已提交
-        let host_sid = room.host_session_id.clone();
-        let guests: Vec<String> = room.guests.iter().cloned().collect();
-
-        // 收集所有已缓存的 guest 候选及鉴权信息
-        let ready_guests: Vec<(
-            String,
-            IceCandidateEntry,
-            (String, String, String),
-            IceCandidateEntry,
-            (String, String, String),
-        )> = guests
-            .iter()
-            .filter_map(|g| {
-                let guest_entry = room.ice_candidate_cache.get(g).cloned()?;
-                let guest_auth = room.ice_auth_info.get(g).cloned()?;
-                let scoped_key = format!("{}::{}", host_sid, g);
-                let host_entry = room
-                    .ice_candidate_cache
-                    .get(&scoped_key)
-                    .or_else(|| room.ice_candidate_cache.get(&host_sid))
-                    .cloned()?;
-                let host_auth = room
-                    .ice_auth_info
-                    .get(&scoped_key)
-                    .or_else(|| room.ice_auth_info.get(&host_sid))
-                    .cloned()?;
-                Some((g.clone(), host_entry, host_auth, guest_entry, guest_auth))
-            })
-            .collect();
-
-        // trigger_pairs: (host_sid, host_entry, host_auth, ready_guests)
-        // 只有 host 和至少一个 guest 都就绪时才触发
-        let trigger_pairs = if !ready_guests.is_empty() {
-            // Keep the Host candidate set. A Host socket is long-lived
-            // and must be reusable for every later Guest. Removing it
-            // here creates a race where a Guest joins after the first
-            // timeout and no second ICE check is ever triggered.
-            for (gsid, _, _, _, _) in &ready_guests {
-                room.ice_candidate_cache.remove(gsid);
-                room.ice_auth_info.remove(gsid);
-                let scoped_key = format!("{}::{}", host_sid, gsid);
-                room.ice_candidate_cache.remove(&scoped_key);
-                room.ice_auth_info.remove(&scoped_key);
-            }
-            Some((host_sid.clone(), ready_guests))
-        } else {
-            None
-        };
-
-        (room_code.clone(), relay_addr, relay_registry, trigger_pairs)
+    let Some((room_code, guest_sid, is_host)) =
+        resolve_punch_pair(session_id, target_peer_session_id.as_deref(), state).await
+    else {
+        return;
     };
 
     info!(
-        "[ICE] {} 上报 {} 个候选, NAT={}",
+        "[打洞] {} 上报 NAT 画像: class={:?} detail={} base_port={} step={} ipv6={} 候选={} 个",
         session_id,
-        candidates.len(),
-        nat_type,
+        profile.class,
+        profile.detail,
+        profile.base_port,
+        profile.step,
+        profile.has_ipv6,
+        base_candidates.len()
     );
 
-    // ── Step 2: 双边同步下发（仅在双方均就绪时执行）────────────────
-    if let Some((host_sid, ready_guests)) = trigger_pairs {
-        // 用同一个 start_at_ms，给双方 200ms 窗口同步启动
-        let start_at_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64
-            + 200;
-
-        let st = state.lock().await;
-
-        for (guest_sid, host_entry, host_auth, guest_entry, guest_auth) in &ready_guests {
-            let (host_ufrag, host_pwd, host_nat_type) = host_auth;
-            let (guest_ufrag, guest_pwd, guest_nat_type) = guest_auth;
-            // 向 Guest 发送 Host 的候选
-            if let Some(guest_sess) = st.sessions.get(guest_sid) {
-                let _ = guest_sess.sender.send(ServerMessage::PeerCandidates {
-                    peer_session_id: host_sid.clone(),
-                    candidates: host_entry.candidates.clone(),
-                    peer_ufrag: host_ufrag.clone(),
-                    peer_pwd: host_pwd.clone(),
-                    peer_nat_type: host_nat_type.clone(),
-                    start_at_ms,
-                });
-            }
-            // 向 Host 发送该 Guest 的候选
-            if let Some(host_sess) = st.sessions.get(&host_sid) {
-                let _ = host_sess.sender.send(ServerMessage::PeerCandidates {
-                    peer_session_id: guest_sid.clone(),
-                    candidates: guest_entry.candidates.clone(),
-                    peer_ufrag: guest_ufrag.clone(),
-                    peer_pwd: guest_pwd.clone(),
-                    peer_nat_type: guest_nat_type.clone(),
-                    start_at_ms,
-                });
-            }
+    {
+        let mut st = state.lock().await;
+        let Some(room) = st.rooms.get_mut(&room_code) else {
+            return;
+        };
+        let sess = room
+            .punch_sessions
+            .entry(guest_sid.clone())
+            .or_insert_with(PunchSession::new);
+        // 同一端重新上报画像视为重新发起一轮，重置该轮状态
+        if sess.started {
+            *sess = PunchSession::new();
         }
-
-        info!(
-            "[ICE] 房间 {} 双边同步触发: start_at_ms={}, {} 对",
-            room_code,
-            start_at_ms,
-            ready_guests.len()
-        );
-    } else {
-        info!(
-            "[ICE] 房间 {} 缓存 {} 的候选，等待对端提交...",
-            room_code, session_id
-        );
+        let side = sess.side_mut(is_host);
+        side.profile = Some(profile);
+        side.base_candidates = base_candidates;
+        side.strategy_candidates.clear();
+        side.strategy_reported = false;
     }
 
-    // ── Step 3: 后台预分配中继（不阻塞当前处理）─────────────────────
+    try_advance_punch(&room_code, &guest_sid, state).await;
+    spawn_relay_preallocation(&room_code, state).await;
+}
+
+/// **阶段二**：收到一端按策略生成的候选（新建 socket 的映射等）
+async fn handle_strategy_candidates(
+    session_id: &str,
+    target_peer_session_id: String,
+    attempt_id: String,
+    candidates: Vec<phantom_protocol::IceCandidate>,
+    state: &SharedState,
+) {
+    let Some((room_code, guest_sid, is_host)) =
+        resolve_punch_pair(session_id, Some(&target_peer_session_id), state).await
+    else {
+        return;
+    };
+
+    {
+        let mut st = state.lock().await;
+        let Some(room) = st.rooms.get_mut(&room_code) else {
+            return;
+        };
+        let Some(sess) = room.punch_sessions.get_mut(&guest_sid) else {
+            warn!("[打洞] {} 上报策略候选，但会话不存在，丢弃", session_id);
+            return;
+        };
+        // attempt_id 不匹配说明是上一轮的迟到消息，丢弃以免污染本轮
+        if sess.attempt_id != attempt_id {
+            warn!(
+                "[打洞] {} 的策略候选 attempt_id 过期（{} != {}），丢弃",
+                session_id, attempt_id, sess.attempt_id
+            );
+            return;
+        }
+        info!(
+            "[打洞] {} 上报 {} 个策略候选 (attempt={})",
+            session_id,
+            candidates.len(),
+            attempt_id
+        );
+        let side = sess.side_mut(is_host);
+        side.strategy_candidates = candidates;
+        side.strategy_reported = true;
+    }
+
+    try_advance_punch(&room_code, &guest_sid, state).await;
+}
+
+/// 定位本次上报属于哪个房间的哪一对 Host↔Guest。
+///
+/// 返回 `(room_code, guest_session_id, 本端是否为 Host)`。
+async fn resolve_punch_pair(
+    session_id: &str,
+    target_peer_session_id: Option<&str>,
+    state: &SharedState,
+) -> Option<(String, String, bool)> {
+    let st = state.lock().await;
+    let session = st.sessions.get(session_id)?;
+    let room_code = match &session.room_code {
+        Some(c) => c.clone(),
+        None => {
+            let _ = session.sender.send(ServerMessage::Error {
+                message: "你不在房间中".to_string(),
+            });
+            return None;
+        }
+    };
+    let room = st.rooms.get(&room_code)?;
+    let is_host = session_id == room.host_session_id;
+    let guest_sid = if is_host {
+        // Host 必须指明是对哪个 Guest，否则无法区分多人场景
+        let target = target_peer_session_id?;
+        if !room.guests.contains(target) {
+            return None;
+        }
+        target.to_string()
+    } else {
+        session_id.to_string()
+    };
+    Some((room_code, guest_sid, is_host))
+}
+
+/// 推进打洞状态机：够条件就下发 PunchPlan / PunchStart。
+async fn try_advance_punch(room_code: &str, guest_sid: &str, state: &SharedState) {
+    // ── 阶段一 → 下发 PunchPlan ────────────────────────────────
+    let plan = {
+        let mut st = state.lock().await;
+        let Some(room) = st.rooms.get_mut(room_code) else {
+            return;
+        };
+        let host_sid = room.host_session_id.clone();
+        let Some(sess) = room.punch_sessions.get_mut(guest_sid) else {
+            return;
+        };
+
+        match (&sess.host.profile, &sess.guest.profile) {
+            (Some(h), Some(g)) if !sess.plan_sent => {
+                let ipv6_both = h.has_ipv6 && g.has_ipv6;
+                let same_public_ip = match (&h.public_ip, &g.public_ip) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => false,
+                };
+                let host_strategy = phantom_protocol::PunchStrategy::select(
+                    h.class,
+                    g.class,
+                    ipv6_both,
+                    same_public_ip,
+                );
+                let guest_strategy = phantom_protocol::PunchStrategy::select(
+                    g.class,
+                    h.class,
+                    ipv6_both,
+                    same_public_ip,
+                );
+                let host_params = phantom_protocol::PunchParams::for_strategy(host_strategy);
+                let guest_params = phantom_protocol::PunchParams::for_strategy(guest_strategy);
+
+                sess.host.needs_strategy = host_strategy.needs_strategy_candidates();
+                sess.guest.needs_strategy = guest_strategy.needs_strategy_candidates();
+                sess.plan_sent = true;
+
+                Some((
+                    host_sid,
+                    sess.attempt_id.clone(),
+                    host_strategy,
+                    host_params,
+                    h.clone(),
+                    sess.host.needs_strategy,
+                    guest_strategy,
+                    guest_params,
+                    g.clone(),
+                    sess.guest.needs_strategy,
+                ))
+            }
+            _ => None,
+        }
+    };
+
+    if let Some((
+        host_sid,
+        attempt_id,
+        host_strategy,
+        host_params,
+        host_profile,
+        host_needs,
+        guest_strategy,
+        guest_params,
+        guest_profile,
+        guest_needs,
+    )) = plan
+    {
+        info!(
+            "[打洞] 房间 {} 配对 {}↔{}: 策略 host={} guest={} (attempt={})",
+            room_code,
+            host_sid,
+            guest_sid,
+            host_strategy.as_str(),
+            guest_strategy.as_str(),
+            attempt_id
+        );
+        let st = state.lock().await;
+        if let Some(s) = st.sessions.get(&host_sid) {
+            let _ = s.sender.send(ServerMessage::PunchPlan {
+                peer_session_id: guest_sid.to_string(),
+                attempt_id: attempt_id.clone(),
+                strategy: host_strategy,
+                params: host_params,
+                // 下发给 Host 的是 Guest 的画像
+                peer_profile: guest_profile,
+                needs_strategy_candidates: host_needs,
+            });
+        }
+        if let Some(s) = st.sessions.get(guest_sid) {
+            let _ = s.sender.send(ServerMessage::PunchPlan {
+                peer_session_id: host_sid.clone(),
+                attempt_id,
+                strategy: guest_strategy,
+                params: guest_params,
+                peer_profile: host_profile,
+                needs_strategy_candidates: guest_needs,
+            });
+        }
+    }
+
+    // ── 阶段三 → 双方候选集齐后下发 PunchStart ──────────────────
+    let start = {
+        let mut st = state.lock().await;
+        let Some(room) = st.rooms.get_mut(room_code) else {
+            return;
+        };
+        let host_sid = room.host_session_id.clone();
+        let Some(sess) = room.punch_sessions.get_mut(guest_sid) else {
+            return;
+        };
+        if sess.started || !sess.host.ready_for_start() || !sess.guest.ready_for_start() {
+            None
+        } else {
+            sess.started = true;
+            let host_rtt = sess.host.profile.as_ref().map_or(0, |p| p.signal_rtt_ms);
+            let guest_rtt = sess.guest.profile.as_ref().map_or(0, |p| p.signal_rtt_ms);
+            Some((
+                host_sid,
+                sess.attempt_id.clone(),
+                sess.host.all_candidates(),
+                sess.guest.all_candidates(),
+                compute_start_at_ms(host_rtt, guest_rtt),
+            ))
+        }
+    };
+
+    if let Some((host_sid, attempt_id, host_cands, guest_cands, start_at_ms)) = start {
+        info!(
+            "[打洞] 房间 {} 配对 {}↔{} 同步启动: start_at={} host候选={} guest候选={}",
+            room_code,
+            host_sid,
+            guest_sid,
+            start_at_ms,
+            host_cands.len(),
+            guest_cands.len()
+        );
+        let st = state.lock().await;
+        if let Some(s) = st.sessions.get(&host_sid) {
+            let _ = s.sender.send(ServerMessage::PunchStart {
+                peer_session_id: guest_sid.to_string(),
+                attempt_id: attempt_id.clone(),
+                peer_candidates: guest_cands,
+                start_at_ms,
+            });
+        }
+        if let Some(s) = st.sessions.get(guest_sid) {
+            let _ = s.sender.send(ServerMessage::PunchStart {
+                peer_session_id: host_sid.clone(),
+                attempt_id,
+                peer_candidates: host_cands,
+                start_at_ms,
+            });
+        }
+    }
+}
+
+/// 后台预分配中继（不阻塞打洞流程）。
+///
+/// 预分配本身是合理的加速手段——省掉打洞失败后再申请的往返。
+/// 但**必须配合回收**：见 [`handle_report_connection_mode`]，
+/// 客户端上报 `"p2p"` 时释放槽位，否则中继消耗量会等于房间总数。
+async fn spawn_relay_preallocation(room_code: &str, state: &SharedState) {
+    let (relay_addr, relay_registry) = {
+        let st = state.lock().await;
+        (
+            st.config.relay.public_addr.clone(),
+            st.relay_registry.clone(),
+        )
+    };
     let state_clone = state.clone();
-    let room_code_clone = room_code.clone();
+    let room_code_clone = room_code.to_string();
     tokio::spawn(async move {
         // 检查是否已有有效中继分配
         let already_allocated = {
@@ -1275,13 +1670,28 @@ async fn handle_relay_request(session_id: &str, state: &SharedState) {
 }
 
 /// 处理 Ping
-async fn handle_ping(session_id: &str, state: &SharedState) {
+///
+/// 回显客户端时间戳，使客户端能只用本机时钟测出信令 RTT
+/// （不依赖两端时钟同步）。该 RTT 随 NatProfile 上报回服务端，
+/// 用于计算打洞的自适应同步窗口。
+async fn handle_ping(session_id: &str, client_time_ms: u64, state: &SharedState) {
     let mut st = state.lock().await;
     if let Some(session) = st.sessions.get_mut(session_id) {
         // 更新最后活动时间
         session.last_activity = tokio::time::Instant::now();
-        let _ = session.sender.send(ServerMessage::Pong);
+        let _ = session.sender.send(ServerMessage::Pong {
+            client_time_ms,
+            server_time_ms: now_ms(),
+        });
     }
+}
+
+/// 当前 Unix 毫秒时间戳
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// 处理创建房间
@@ -1381,8 +1791,7 @@ async fn handle_create_room(session_id: &str, state: &SharedState) {
         guests: HashSet::new(),
         created_at: std::time::Instant::now(),
         state: RoomState::Created,
-        ice_candidate_cache: HashMap::new(),
-        ice_auth_info: HashMap::new(),
+        punch_sessions: HashMap::new(),
     };
     st.rooms.insert(code.clone(), room);
 
@@ -1584,11 +1993,8 @@ fn do_leave_room(session_id: &str, st: &mut AppState) {
             // Guest 离开
             if let Some(room) = st.rooms.get_mut(&room_code) {
                 room.guests.remove(session_id);
-                room.ice_candidate_cache.remove(session_id);
-                room.ice_auth_info.remove(session_id);
-                let scoped_key = format!("{}::{}", room.host_session_id, session_id);
-                room.ice_candidate_cache.remove(&scoped_key);
-                room.ice_auth_info.remove(&scoped_key);
+                // 打洞会话以 guest_session_id 为键，一次移除即可
+                room.punch_sessions.remove(session_id);
                 let guest_count = room.guests.len();
 
                 // 房间内无 Guest 时回到待加入状态，避免复用过期中继 token
@@ -1797,30 +2203,67 @@ async fn main() {
 
     let cfg = config::load_config();
     info!(
-        "[配置] 信令={}:{}, 中继端口池={}-{}, 中继地址={}",
+        "[配置] 信令={}:{}, 中继={}:{}(单端口), STUN={}/{}",
         cfg.signal.bind,
         cfg.signal.port,
-        cfg.relay.port_start,
-        cfg.relay.port_end,
         cfg.relay.public_addr,
+        cfg.relay.quic_port,
+        cfg.stun.port,
+        cfg.stun.alt_port,
     );
 
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("安装 CryptoProvider 失败");
 
-    let relay_port_pool = Arc::new(Mutex::new(port_pool::RelayPortPool::new(
-        cfg.relay.port_start,
-        cfg.relay.port_end,
-    )));
     let relay_registry = Arc::new(Mutex::new(relay::RelayRegistry::new(
-        relay_port_pool,
         cfg.relay.token_ttl_secs,
     )));
     relay::start_cleanup_task(relay_registry.clone());
 
+    // 中继监听器在启动时起一次即可：房间路由靠流内 token，
+    // 端口不参与识别，所有房间共用同一个端口。
+    if let Err(e) = relay::start_quic_relay(cfg.relay.quic_port, relay_registry.clone()).await {
+        error!("[中继] 启动失败: {}", e);
+    }
+
+    // 自建 STUN：打洞链路上不可绕过的一环，公共 STUN 失效就必然落中继
+    if cfg.stun.enabled {
+        if let Err(e) = stun_server::start(&cfg.signal.bind, cfg.stun.port, cfg.stun.alt_port).await
+        {
+            error!("[STUN] 启动失败: {}（客户端将只能使用兜底服务器）", e);
+        }
+    } else {
+        warn!("[STUN] 自建 STUN 已禁用，客户端将依赖第三方公共服务器");
+    }
+
+    // 日志包接收服务：观测模型是集中式的，排障靠客户端上报
+    let log_uploads = if cfg.log_upload.enabled {
+        let base = cfg.log_upload.effective_base(&cfg.relay.public_addr);
+        let reg = log_upload::UploadRegistry::new(
+            std::path::PathBuf::from(&cfg.log_upload.store_dir),
+            base.clone(),
+        );
+        match log_upload::start(&cfg.log_upload.bind, reg.clone()).await {
+            Ok(()) => {
+                info!("[日志上报] 客户端将上传至 {}", base);
+                Some(reg)
+            }
+            Err(e) => {
+                error!("[日志上报] 启动失败: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let cfg_arc = Arc::new(cfg.clone());
-    let state = Arc::new(Mutex::new(AppState::new(relay_registry, cfg_arc.clone())));
+    let state = Arc::new(Mutex::new(AppState::new(
+        relay_registry,
+        log_uploads,
+        cfg_arc.clone(),
+    )));
     start_session_timeout_task(state.clone());
 
     admin::maybe_start(&cfg_arc, state.clone());

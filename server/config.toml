@@ -12,16 +12,55 @@ port = 10209
 # 中继服务器公网地址（下发给客户端连接用）
 # 部署时改成你的服务器公网 IP 或域名
 public_addr = "127.0.0.1"
-# 中继端口池范围（单池，按 TCP/UDP 房间动态调度）
-port_start = 10113
-port_end = 10213
+# 全局唯一的中继 QUIC 端口 —— 所有房间共用这一个端口。
+#
+# 房间路由完全靠 QUIC 首流里的 token，监听端口从不参与识别，
+# 因此不需要"每房间一个端口"。并发上限由带宽决定，不再由端口数决定
+# （按每房间双向 5 Mbps 估算，100 个并发就已接近 1 Gbps）。
+#
+# 默认 443/UDP：企业、校园、酒店等受限网络普遍放行（QUIC/HTTP3 就跑在这里），
+# 而中继连不上就意味着彻底失败，所以这里的穿透率很关键。
+# 注意 TCP/443 与 UDP/443 是两套独立的端口空间，与你的 HTTPS 不冲突。
+quic_port = 443
 # Token 过期时间（秒）
 token_ttl_secs = 120
+
+[stun]
+# 是否启用自建 STUN。**强烈建议保持开启**——
+# STUN 是打洞链路上唯一不可绕过的一环：拿不到 srflx 候选就没有公网映射，
+# 端口预测和撒网都无从谈起，只能落中继。
+# 实测三台境外公共 STUN 曾在同一次会话内全部超时，等于打洞未开始就已失败。
+enabled = true
+# STUN 主端口
+port = 3478
+# STUN 备用端口。这不是冗余：判定 NAT 映射行为至少需要两个不同的目标端点，
+# 客户端用同一个源 socket 分别打这两个端口，比较返回的映射端口是否一致，
+# 才能区分锥形与对称 NAT。只有单端点时 NAT 分类只能靠猜。
+alt_port = 3479
+# 对外公布的 STUN 地址，留空则复用 relay.public_addr
+public_addr = ""
+# 第三方公共 STUN 兜底（格式 "host:port"），自建不可用时使用。
+# 例：fallback_servers = ["stun.miwifi.com:3478", "stun.qq.com:3478"]
+fallback_servers = []
+
+[log_upload]
+# 是否启用日志包接收服务。
+# 观测模型是集中式的——用户不会主动收集日志，排障靠客户端把整个 log/ 目录
+# 打包上传。关掉它就没法远程排障了。
+enabled = true
+# 接收服务监听地址
+bind = "0.0.0.0:10211"
+# 下发给客户端的可访问基址（含协议与端口）。
+# 留空则按 http://<relay.public_addr>:<bind 端口> 推导——
+# 部署时如果 relay.public_addr 还是 127.0.0.1，客户端会传不上来。
+public_base = ""
+# 日志包落盘目录，按 user_id 分子目录存放
+store_dir = "log_uploads"
 
 [port_allocation]
 # Guest 本地端口池范围
 guest_port_start = 25600
-guest_port_end = 25700     # 100 个端口，支持 100 个并发 Guest
+guest_port_end = 25700
 
 [auth]
 # 是否启用 Ed25519 鉴权（关闭后所有客户端直接通过）

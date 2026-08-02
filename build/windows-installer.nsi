@@ -8,7 +8,7 @@ Unicode true
   !define APP_NAME "幻梦P2P"
 !endif
 !ifndef APP_VERSION
-  !define APP_VERSION "2.7.7"
+  !define APP_VERSION "3.0.0"
 !endif
 !define APP_EXE       "phantom-p2p.exe"
 !define APP_PUBLISHER "Phantom P2P Project"

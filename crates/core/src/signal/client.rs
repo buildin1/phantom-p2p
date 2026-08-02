@@ -8,15 +8,24 @@
 //! 5. 将服务端消息转化为 Tauri 事件推送到前端
 
 use futures_util::{SinkExt, StreamExt};
-use phantom_protocol::{ClientMessage, ServerMessage};
+use phantom_protocol::{ClientMessage, NetworkConfig, ServerMessage, PROTOCOL_VERSION};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
 use crate::identity::Identity;
+
+/// 当前 Unix 毫秒时间戳
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 // ============================================================
 // 连接状态
@@ -70,6 +79,12 @@ pub struct SignalClient {
     identity: Arc<Identity>,
     /// 是否允许日志输出真实信令地址（开发者模式）
     expose_signal_address: bool,
+    /// 实测信令 RTT（毫秒）。由心跳往返测得，
+    /// 服务端用它计算打洞的自适应同步窗口（固定偏移在跨省链路上等于没有同步）。
+    signal_rtt_ms: Arc<AtomicU32>,
+    /// 服务端下发的网络配置（STUN 列表、中继地址与端口）。
+    /// 客户端不内置任何端口常量或 STUN 地址，一律以此为准。
+    network_config: Arc<RwLock<Option<NetworkConfig>>>,
 }
 
 impl SignalClient {
@@ -85,7 +100,25 @@ impl SignalClient {
             running: Arc::new(RwLock::new(false)),
             identity,
             expose_signal_address,
+            signal_rtt_ms: Arc::new(AtomicU32::new(0)),
+            network_config: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// 最近一次实测的信令 RTT（毫秒）；尚未测得时返回 0
+    pub fn signal_rtt_ms(&self) -> u32 {
+        self.signal_rtt_ms.load(Ordering::Relaxed)
+    }
+
+    /// 设备长期身份密钥。打洞阶段用它为临时 X25519 公钥签名，
+    /// 使对端能验证密钥未被信令服务器掉包。
+    pub fn identity(&self) -> Arc<Identity> {
+        self.identity.clone()
+    }
+
+    /// 服务端下发的网络配置；鉴权完成前为 None
+    pub async fn network_config(&self) -> Option<NetworkConfig> {
+        self.network_config.read().await.clone()
     }
 
     /// 获取当前连接状态
@@ -130,6 +163,8 @@ impl SignalClient {
         let running = self.running.clone();
         let identity = self.identity.clone();
         let expose_signal_address = self.expose_signal_address;
+        let signal_rtt_ms = self.signal_rtt_ms.clone();
+        let network_config = self.network_config.clone();
 
         tokio::spawn(async move {
             let mut retry_count: u32 = 0;
@@ -184,9 +219,36 @@ impl SignalClient {
                                                 Ok(server_msg) => {
                                                     // 处理特殊消息（更新内部状态）
                                                     match &server_msg {
-                                                        ServerMessage::Welcome { session_id: sid } => {
+                                                        ServerMessage::Welcome { session_id: sid, protocol_version } => {
                                                             *session_id.write().await = Some(sid.clone());
-                                                            info!("[信令] 收到 Welcome, session_id={}", sid);
+                                                            info!("[信令] 收到 Welcome, session_id={}, 服务端协议版本={}", sid, protocol_version);
+                                                            if *protocol_version != PROTOCOL_VERSION {
+                                                                error!(
+                                                                    "[信令] 协议版本不匹配：本机 {} / 服务端 {}。本协议不提供向后兼容，请升级客户端。",
+                                                                    PROTOCOL_VERSION, protocol_version
+                                                                );
+                                                            }
+                                                        }
+                                                        ServerMessage::VersionMismatch {
+                                                            server_protocol_version,
+                                                            client_protocol_version,
+                                                            message,
+                                                        } => {
+                                                            error!(
+                                                                "[信令] 服务端拒绝连接：协议版本不匹配（本机 {} / 服务端 {}）：{}",
+                                                                client_protocol_version, server_protocol_version, message
+                                                            );
+                                                            // 版本不兼容时重连也没有意义，停止重连循环
+                                                            *running.write().await = false;
+                                                        }
+                                                        ServerMessage::NetworkConfigUpdate { config } => {
+                                                            info!(
+                                                                "[信令] 收到网络配置: {} 个 STUN 服务器, 中继 {}:{}",
+                                                                config.stun_servers.len(),
+                                                                config.relay_addr,
+                                                                config.relay_quic_port
+                                                            );
+                                                            *network_config.write().await = Some(config.clone());
                                                         }
                                                         ServerMessage::AuthChallenge { nonce } => {
                                                             info!("[鉴权] 收到 AuthChallenge，nonce 长度: {}", nonce.len());
@@ -196,6 +258,8 @@ impl SignalClient {
                                                             let auth_msg = ClientMessage::Auth {
                                                                 public_key: identity.public_key_bytes(),
                                                                 signature: sig,
+                                                                protocol_version: PROTOCOL_VERSION,
+                                                                client_version: env!("CARGO_PKG_VERSION").to_string(),
                                                             };
                                                             match phantom_protocol::serialize(&auth_msg) {
                                                                 Ok(bytes) => {
@@ -231,7 +295,13 @@ impl SignalClient {
                                                             *room_code.write().await = None;
                                                             info!("[信令] 房间已关闭: {}", reason);
                                                         }
-                                                        ServerMessage::Pong => {
+                                                        ServerMessage::Pong { client_time_ms, .. } => {
+                                                            // 心跳往返测算信令 RTT，供服务端计算自适应同步窗口。
+                                                            // 只用本机时钟做差，不依赖两端时钟同步。
+                                                            let rtt = now_ms().saturating_sub(*client_time_ms);
+                                                            if rtt <= 60_000 {
+                                                                signal_rtt_ms.store(rtt as u32, Ordering::Relaxed);
+                                                            }
                                                             // 心跳响应，不需要转发到前端
                                                             continue;
                                                         }
@@ -290,7 +360,7 @@ impl SignalClient {
 
                                 // 心跳
                                 _ = heartbeat_interval.tick() => {
-                                    let ping_msg = ClientMessage::Ping;
+                                    let ping_msg = ClientMessage::Ping { client_time_ms: now_ms() };
                                     match phantom_protocol::serialize(&ping_msg) {
                                         Ok(bytes) => {
                                             if let Err(e) = ws_sink.send(Message::Binary(bytes.into())).await {
