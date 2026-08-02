@@ -20,6 +20,9 @@ permissions:
 env:
   PHANTOM_SKIP_VERSION_BUMP: "1"
   CARGO_TERM_COLOR: always
+  # NDK 版本在此处集中管理：它同时是 sdkmanager 的安装目标和缓存 key，
+  # 改这一处即可整体升级并自动令旧缓存失效。
+  NDK_VERSION: "27.2.12479018"
 
 jobs:
   android:
@@ -35,17 +38,52 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
-      - name: Install Android SDK and cargo-ndk
+
+      # 本地没有 Android 构建环境，这条流水线是唯一的验证途径，
+      # 因此三段耗时都要缓存：NDK 下载、Rust 四 ABI 交叉编译、Gradle 依赖。
+
+      # runner 预设的 ANDROID_SDK_ROOT 不在 ${{ env }} 上下文里，
+      # 写进 GITHUB_ENV 后下面的步骤才能在 with: 里引用到它。
+      - name: Export SDK path for later steps
+        run: echo "SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+
+      # NDK 约 1GB，是冷启动最大的单项下载。按版本号做 key，
+      # 升级 NDK 时自动失效。
+      - name: Cache Android NDK
+        id: ndk-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SDK_ROOT }}/ndk/${{ env.NDK_VERSION }}
+          key: android-ndk-${{ env.NDK_VERSION }}
+
+      # 四个 ABI 各要把 phantom-core 的依赖树交叉编译一遍，冷缓存时是最慢的一段。
+      # 该 action 同时会恢复 ~/.cargo/bin，命中时下面的 cargo-ndk 安装直接跳过。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android
+
+      # Gradle 依赖、wrapper 发行版与构建缓存由该 action 托管。
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Install Android SDK components and cargo-ndk
         run: |
+          set -euo pipefail
           yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;27.2.12479018"
-          cargo install cargo-ndk --locked
+          # platforms/build-tools 体积小、下载快，不单独缓存；
+          # NDK 命中缓存时跳过，避免重复解压近 1GB。
+          PACKAGES=("platforms;android-36" "build-tools;36.0.0")
+          if [ "${{ steps.ndk-cache.outputs.cache-hit }}" != "true" ]; then
+            PACKAGES+=("ndk;${NDK_VERSION}")
+          fi
+          sdkmanager "${PACKAGES[@]}"
+          command -v cargo-ndk >/dev/null || cargo install cargo-ndk --locked
       - name: Build Android APKs
         run: |
           echo "sdk.dir=$ANDROID_SDK_ROOT" > android/local.properties
-          chmod +x android/gradlew
           cd android
-          ./gradlew --no-daemon clean assembleStandardDebug assembleStandardRelease -Pphantom.buildRustNative=true --stacktrace
+          # 不跑 clean：runner 每次都是全新 VM，没有陈旧产物可清，
+          # 清掉反而会让 Gradle 构建缓存无从命中。
+          ./gradlew assembleStandardDebug assembleStandardRelease -Pphantom.buildRustNative=true --stacktrace
       - name: Stage Android artifacts
         run: |
           mkdir -p build/release/android
