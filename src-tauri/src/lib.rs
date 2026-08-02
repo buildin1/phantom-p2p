@@ -645,14 +645,14 @@ async fn connect_signal(
                     ServerMessage::PunchStart {
                         peer_session_id,
                         peer_candidates,
-                        start_at_ms,
+                        start_delay_ms,
                         ..
                     } => {
                         let app_for_ice = app_for_task.clone();
                         let peer_session_id = peer_session_id.clone();
                         let task_peer_id = peer_session_id.clone();
                         let candidates = peer_candidates.clone();
-                        let start_at_ms = *start_at_ms;
+                        let start_delay_ms = *start_delay_ms;
                         let stats_for_ice = stats_mgr.clone();
                         let signal_client_for_ice = client_clone.clone();
 
@@ -688,7 +688,7 @@ async fn connect_signal(
                                 peer_session_id.clone(),
                                 is_host,
                             );
-                            let outcome = session.run(candidates, start_at_ms, ctx).await;
+                            let outcome = session.run(candidates, start_delay_ms, ctx).await;
 
                             // 成败都上报——失败样本对分析 NAT 组合成功率同样重要
                             let _ = signal_client_for_ice

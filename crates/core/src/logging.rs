@@ -176,16 +176,29 @@ fn template_of(line: &str) -> String {
 
 /// 按 target 选择目标文件。
 ///
-/// `ice`/`punch` 归到 ice.log——打洞是核心，值得单独全量保留。
+/// **按模块路径的末段精确匹配**，不能用 `contains`——
+/// `"stun"` 里含 `"tun"`，用子串匹配会把 STUN 日志错误地分到 `tunnel.log`，
+/// 实测导致排查打洞失败时在 `ice.log` 里完全看不到 STUN 的超时原因。
 fn route_of(target: &str) -> Target {
-    if target.contains("punch") || target.contains("ice") {
-        Target::Ice
-    } else if target.contains("signal") {
-        Target::Signal
-    } else if target.contains("tunnel") || target.contains("tun_bridge") || target.contains("tun") {
-        Target::Tunnel
-    } else {
-        Target::App
+    let module = target.rsplit("::").next().unwrap_or(target);
+    match module {
+        // 打洞链路：STUN 是其中不可分割的一环，失败原因必须和打洞过程放在一起
+        "punch" | "ice" | "stun" | "nat" | "puncher" => Target::Ice,
+        "client" | "signal" => Target::Signal,
+        "tunnel" | "tun" | "tun_bridge" | "udp_tunnel" | "crypto" => Target::Tunnel,
+        _ => {
+            // 兜底：模块名未收录时按路径里的关键词粗分，
+            // 但仍要保证 stun 不被 tun 抢走
+            if target.contains("stun") || target.contains("punch") || target.contains("ice") {
+                Target::Ice
+            } else if target.contains("signal") {
+                Target::Signal
+            } else if target.contains("tun") {
+                Target::Tunnel
+            } else {
+                Target::App
+            }
+        }
     }
 }
 
@@ -198,11 +211,22 @@ enum Target {
 
 impl LogRouter {
     /// 写入一行（已格式化）。返回是否真的落盘（被抑制则为 false）。
-    pub fn write_line(&self, target: &str, line: &str) -> bool {
+    ///
+    /// `dedupable` 为 false 时跳过重复抑制。**WARN/ERROR 绝不折叠**——
+    /// 去重是为了压掉每秒一条的心跳 DEBUG，而告警本来就稀疏，
+    /// 每一条的具体参数都是排障线索。实测曾把 STUN 对备用端口 3479 的
+    /// 查询失败和主端口 3478 的折叠成一条（模板去掉数字后相同），
+    /// 导致日志里看不出备用端口也试过。
+    pub fn write_line(&self, target: &str, line: &str, dedupable: bool) -> bool {
         let mut inner = match self.inner.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
+
+        if !dedupable {
+            let _ = write_to(&mut inner, target, line);
+            return true;
+        }
 
         // 重复抑制：窗口内同模板只留首条，其余累计计数
         let key = template_of(line);
@@ -297,7 +321,9 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RouterLayer {
             meta.target(),
             visitor.0
         );
-        self.router.write_line(meta.target(), &line);
+        // 只对 DEBUG/TRACE 去重：告警稀疏且每条参数都是线索，折叠会丢诊断信息
+        let dedupable = matches!(*meta.level(), tracing::Level::DEBUG | tracing::Level::TRACE);
+        self.router.write_line(meta.target(), &line, dedupable);
     }
 }
 
@@ -366,15 +392,32 @@ mod tests {
         assert!(matches!(route_of("phantom_core::ice"), Target::Ice));
     }
 
+    /// 回归测试：`"stun"` 里含 `"tun"`。早先用 `contains` 匹配把 STUN 日志
+    /// 错误分流到了 tunnel.log，排查打洞失败时在 ice.log 里根本看不到
+    /// STUN 超时这个根因。STUN 是打洞链路不可分割的一环，必须同文件。
+    #[test]
+    fn stun_logs_go_to_ice_not_tunnel() {
+        assert!(
+            matches!(route_of("phantom_core::stun"), Target::Ice),
+            "STUN 属于打洞链路，不能因为 'stun' 含 'tun' 就被分到 tunnel"
+        );
+        assert!(matches!(route_of("phantom_core::nat"), Target::Ice));
+        // 真正的 tunnel 模块仍要落到 tunnel.log
+        assert!(matches!(route_of("phantom_core::tunnel"), Target::Tunnel));
+        assert!(matches!(
+            route_of("phantom_core::tun_bridge"),
+            Target::Tunnel
+        ));
+    }
+
     #[test]
     fn targets_route_to_expected_files() {
         assert!(matches!(
             route_of("phantom_core::signal::client"),
             Target::Signal
         ));
-        assert!(matches!(route_of("phantom_core::tunnel"), Target::Tunnel));
         assert!(matches!(
-            route_of("phantom_core::tun_bridge"),
+            route_of("phantom_core::udp_tunnel"),
             Target::Tunnel
         ));
         assert!(matches!(route_of("phantom_p2p_lib"), Target::App));
@@ -388,14 +431,34 @@ mod tests {
 
         let t = "phantom_core::tunnel";
         assert!(
-            router.write_line(t, "[QUIC] rtt=1ms sent=1\n"),
+            router.write_line(t, "[QUIC] rtt=1ms sent=1\n", true),
             "首条应落盘"
         );
         // 同模板（仅数值不同）在窗口内应被抑制
-        assert!(!router.write_line(t, "[QUIC] rtt=2ms sent=2\n"));
-        assert!(!router.write_line(t, "[QUIC] rtt=3ms sent=3\n"));
+        assert!(!router.write_line(t, "[QUIC] rtt=2ms sent=2\n", true));
+        assert!(!router.write_line(t, "[QUIC] rtt=3ms sent=3\n", true));
         // 结构不同的行不受影响
-        assert!(router.write_line(t, "[TUN] device closed\n"));
+        assert!(router.write_line(t, "[TUN] device closed\n", true));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回归测试：告警不参与去重。
+    ///
+    /// 早先 STUN 对 3478 与 3479 两个端口的失败被折叠成一条
+    /// （模板抹掉数字后完全相同），日志里看不出备用端口也试过。
+    #[test]
+    fn warnings_are_never_folded_even_when_templates_match() {
+        let dir = std::env::temp_dir().join(format!("phantom-warn-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let router = LogRouter::new(&dir).unwrap();
+
+        let t = "phantom_core::stun";
+        assert!(router.write_line(t, "[STUN] 查询失败: host:3478\n", false));
+        assert!(
+            router.write_line(t, "[STUN] 查询失败: host:3479\n", false),
+            "仅端口不同的告警必须各自留存，否则丢掉排障线索"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
