@@ -1,4 +1,15 @@
-use phantom_core::{
+//! 平台无关的会话运行时。
+//!
+//! 连接的完整编排——信令 → NAT 探测 → 三阶段打洞 → 建隧道 → 中继回退——
+//! 在三个客户端之间是同一件事，因此实现只留这一份：桌面端（`src-tauri`）、
+//! headless 端（`src-web`）与 Android（`crates/mobile` 的 JNI 桥）都调用它。
+//!
+//! 各宿主之间真正的差异只有三点，由 [`RuntimeHost`] 注入：事件如何投递给界面、
+//! 日志写到哪里、数据目录在哪里。Android 的日志必须落在应用外部目录
+//! （`getExternalFilesDir`）才能在未 root 的设备上取到，这正是日志根目录
+//! 不能在 core 里写死的原因。
+
+use crate::{
     config::ClientConfig, identity::Identity, network, punch, puncher, signal, stats, tun_bridge,
     tunnel,
 };
@@ -9,17 +20,40 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::{broadcast, watch, Mutex, RwLock};
+use tokio::sync::{watch, Mutex, RwLock};
 
-/// 日志目录。与桌面端一致放在配置目录下的 `log/`，
-/// 这样"打包整个目录上报"的逻辑两端可以共用。
-pub fn log_directory() -> std::path::PathBuf {
+/// 宿主平台需要提供给运行时的能力。
+///
+/// 实现要点：[`emit`](RuntimeHost::emit) 会在信令消息循环里被同步调用，
+/// 实现必须立即返回，不能阻塞——耗时的投递自行转异步。
+pub trait RuntimeHost: Send + Sync + 'static {
+    /// 把事件投递给界面。桌面端走 Tauri 的 `emit`，headless 端走 broadcast
+    /// 通道再转 SSE，Android 走 JNI 回调。
+    fn emit(&self, event: &str, data: Value);
+
+    /// 日志根目录。桌面端在配置目录下的 `log/`；Android 必须是
+    /// `getExternalFilesDir()`，否则无 root 的设备根本读不到日志。
+    fn log_dir(&self) -> PathBuf;
+
+    /// 身份密钥与配置的存放目录。
+    fn data_dir(&self) -> PathBuf {
+        ClientConfig::config_path()
+            .parent()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+}
+
+/// 桌面端与 headless 端共用的日志目录：配置目录下的 `log/`。
+/// Android 不适用，见 [`RuntimeHost::log_dir`]。
+pub fn default_log_directory() -> PathBuf {
     ClientConfig::config_path()
         .parent()
         .map(|d| d.join("log"))
-        .unwrap_or_else(|| std::path::PathBuf::from("log"))
+        .unwrap_or_else(|| PathBuf::from("log"))
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -30,7 +64,6 @@ pub struct UiEvent {
 
 #[derive(Clone)]
 struct RelayInfo {
-    room_code: String,
     relay_addr: String,
     relay_quic_port: u16,
     token: String,
@@ -59,7 +92,7 @@ struct RuntimeState {
     punch_sessions: PunchSessions,
     /// 打洞阶段协商出的 overlay 会话密钥。
     /// P2P 与中继两条路径共用同一份——中继只做盲转发，看不到明文。
-    peer_crypto: Option<Arc<phantom_core::crypto::SessionCrypto>>,
+    peer_crypto: Option<Arc<crate::crypto::SessionCrypto>>,
     relay: Option<RelayInfo>,
     conn_manager: Option<Arc<tunnel::TunnelConnManager>>,
     host_endpoint: Option<quinn::Endpoint>,
@@ -94,46 +127,36 @@ impl Default for RuntimeState {
     }
 }
 
-pub struct HeadlessRuntime {
+pub struct SessionRuntime {
     signal: Arc<signal::client::SignalClient>,
     stats: Arc<stats::StatsManager>,
     state: Mutex<RuntimeState>,
     config: RwLock<ClientConfig>,
-    events: broadcast::Sender<UiEvent>,
+    host: Arc<dyn RuntimeHost>,
     overlay_ip: watch::Sender<Option<Ipv4Addr>>,
     auto_host: AtomicBool,
-    web_port: u16,
 }
 
-impl HeadlessRuntime {
-    pub fn new(web_port: u16) -> Result<Arc<Self>, String> {
-        phantom_core::ensure_rustls_crypto_provider()?;
+impl SessionRuntime {
+    pub fn new(host: Arc<dyn RuntimeHost>) -> Result<Arc<Self>, String> {
+        crate::ensure_rustls_crypto_provider()?;
         let config = ClientConfig::load();
-        let data_dir = ClientConfig::config_path()
-            .parent()
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-        let identity = Arc::new(Identity::load_or_generate(&data_dir)?);
+        let identity = Arc::new(Identity::load_or_generate(&host.data_dir())?);
         let signal = Arc::new(signal::client::SignalClient::new(identity, config.dev_mode));
         let stats = Arc::new(stats::StatsManager::new(false));
         stats.clone().start_sampling_task();
-        let (events, _) = broadcast::channel(512);
         let (overlay_ip, _) = watch::channel(None);
         Ok(Arc::new(Self {
             signal,
             stats,
             state: Mutex::new(RuntimeState::default()),
             config: RwLock::new(config),
-            events,
+            host,
             overlay_ip,
             auto_host: AtomicBool::new(false),
-            web_port,
         }))
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<UiEvent> {
-        self.events.subscribe()
-    }
     pub fn overlay_receiver(&self) -> watch::Receiver<Option<Ipv4Addr>> {
         self.overlay_ip.subscribe()
     }
@@ -153,10 +176,7 @@ impl HeadlessRuntime {
 
     fn emit<T: Serialize>(&self, event: &str, payload: T) {
         if let Ok(data) = serde_json::to_value(payload) {
-            let _ = self.events.send(UiEvent {
-                event: event.to_string(),
-                data,
-            });
+            self.host.emit(event, data);
         }
     }
 
@@ -274,11 +294,16 @@ impl HeadlessRuntime {
                             json!({"my_ip": virtual_ip, "host_ip": virtual_ip, "subnet": subnet}),
                         );
                         let _ = self.signal.send(ClientMessage::HostReady).await;
-                        println!();
-                        println!("Room code:        {}", room_code);
-                        println!("Host virtual IP:  {}", virtual_ip);
-                        println!("Overlay WebUI:    http://{}:{}", virtual_ip, self.web_port);
-                        println!();
+                        // 房主信息如何呈现由宿主决定：headless 端打印到终端，
+                        // 桌面端与 Android 走各自的界面。core 只负责把事实发出去。
+                        self.emit(
+                            "room:host_ready",
+                            json!({
+                                "room_code": room_code,
+                                "virtual_ip": virtual_ip,
+                                "subnet": subnet,
+                            }),
+                        );
                     }
                     Err(error) => {
                         tracing::error!("[TUN] Host device initialization failed: {}", error);
@@ -341,26 +366,24 @@ impl HeadlessRuntime {
                 }
             }
             ServerMessage::RelayPreAllocated {
-                room_code,
                 relay_addr,
                 relay_quic_port,
                 token,
+                ..
             } => {
                 self.state.lock().await.relay = Some(RelayInfo {
-                    room_code,
                     relay_addr,
                     relay_quic_port,
                     token,
                 });
             }
             ServerMessage::RelayReady {
-                room_code,
                 relay_addr,
                 relay_quic_port,
                 token,
+                ..
             } => {
                 let relay = RelayInfo {
-                    room_code,
                     relay_addr,
                     relay_quic_port,
                     token,
@@ -412,9 +435,9 @@ impl HeadlessRuntime {
     /// 打包与 HTTP 传输都是阻塞操作，放到 blocking 线程池，
     /// 避免拖住信令消息循环。
     async fn upload_logs(&self, upload_url: String, reason: String) {
-        let dir = log_directory();
+        let dir = self.host.log_dir();
         let result = tokio::task::spawn_blocking(move || {
-            let uploader = phantom_core::log_upload::LogUploader::new(&dir);
+            let uploader = crate::log_upload::LogUploader::new(&dir);
             // 先补投历史失败的包——它们往往正是"网络有问题"那次的日志
             uploader.flush_pending();
             uploader.upload_now(&upload_url, &reason)
@@ -934,11 +957,12 @@ impl HeadlessRuntime {
                         .get("signalUrl")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    let url = phantom_core::config::runtime_signal_server(requested);
+                    let url = crate::config::runtime_signal_server(requested);
                     self.signal.connect(url).await;
                 }
+                // 重放当前状态，让刚接上的界面立刻看到完整快照
                 for event in self.snapshot().await {
-                    let _ = self.events.send(event);
+                    self.host.emit(&event.event, event.data);
                 }
                 Ok(Value::Null)
             }
@@ -1008,13 +1032,6 @@ impl HeadlessRuntime {
             }
             "start_relay_tunnel" => {
                 let relay = RelayInfo {
-                    room_code: self
-                        .state
-                        .lock()
-                        .await
-                        .room_code
-                        .clone()
-                        .unwrap_or_default(),
                     relay_addr: required_string(&payload, "relayAddr")?,
                     relay_quic_port: payload
                         .get("relayQuicPort")
