@@ -42,3 +42,7 @@ libc = "0.2"
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
 passfd = "0.1"
+
+# Android 的 TUN 由 VpnService 建立，fd 经 JNI 交进来后按普通 Linux fd 读写
+[target.'cfg(target_os = "android")'.dependencies]
+libc = "0.2"
