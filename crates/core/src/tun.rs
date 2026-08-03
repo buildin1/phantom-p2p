@@ -115,6 +115,12 @@ mod platform;
 #[cfg(target_os = "macos")]
 pub use platform::{provision as macos_provision_tun, ProvisionedTun as MacosProvisionedTun};
 
+/// Android 的虚拟网卡由系统的 `VpnService` 建立，Rust 拿到的只是一个 fd。
+/// 重导出交接入口，好让 `crates/mobile` 的 JNI 层把它递进来，
+/// 而不必把整个 `platform` 模块暴露出去。详见 `tun_android.rs` 的模块文档。
+#[cfg(target_os = "android")]
+pub use platform::set_vpn_fd as android_set_vpn_fd;
+
 /// TUN 设备
 pub struct TunDevice {
     inner: Arc<platform::PlatformTun>,
