@@ -822,16 +822,9 @@ impl SessionRuntime {
         }
     }
 
-    async fn start_relay(&self, relay: RelayInfo) -> Result<(), String> {
+    async fn start_relay(self: &Arc<Self>, relay: RelayInfo) -> Result<(), String> {
         let address = resolve_ipv4(&relay.relay_addr, relay.relay_quic_port).await?;
-        let (is_host, tun, crypto) = {
-            let state = self.state.lock().await;
-            (
-                state.is_host,
-                state.tun_bridge.clone(),
-                state.peer_crypto.clone(),
-            )
-        };
+        let is_host = self.state.lock().await.is_host;
         let user = self
             .stats
             .first_connection_id()
@@ -872,16 +865,56 @@ impl SessionRuntime {
                 return Ok(());
             }
 
-            let connection = tunnel::connect_relay_quic_host(
-                address,
-                relay.token,
-                self.stats.clone(),
-                user,
-                tun,
-                crypto,
-            )
-            .await?;
-            self.state.lock().await.relay_host_conn = Some(connection);
+            // 建连自带 30 秒超时，**绝不能在信令消息循环里 await**——
+            // 中继不可达时会把心跳与状态更新一起卡死整整半分钟。
+            let runtime = self.clone();
+            let token = relay.token.clone();
+            let stats = self.stats.clone();
+            tokio::spawn(async move {
+                // tun 与会话密钥在建连时刻重新取：排队等待期间它们可能已经变了
+                let (tun, crypto) = {
+                    let state = runtime.state.lock().await;
+                    (state.tun_bridge.clone(), state.peer_crypto.clone())
+                };
+                match tunnel::connect_relay_quic_host(
+                    address,
+                    token.clone(),
+                    stats,
+                    user,
+                    tun,
+                    crypto,
+                )
+                .await
+                {
+                    Ok(connection) => {
+                        let mut state = runtime.state.lock().await;
+                        // 建连期间可能已被更新的 token 顶替，那这条就是过期连接
+                        if state.relay_host_token.as_deref() == Some(token.as_str()) {
+                            state.relay_host_conn = Some(connection);
+                            drop(state);
+                            runtime.emit("tunnel:started", "Relay");
+                        } else {
+                            connection.close(0u32.into(), b"stale relay connection");
+                        }
+                    }
+                    Err(error) => {
+                        {
+                            let mut state = runtime.state.lock().await;
+                            // 失败后必须清掉 token：否则守卫会认为"同 token 且正在建立中"
+                            // 而一直拒绝重连，房间就再也回不到中继了
+                            if state.relay_host_token.as_deref() == Some(token.as_str()) {
+                                state.relay_host_token = None;
+                                if let Some(old) = state.relay_host_conn.take() {
+                                    old.close(0u32.into(), b"relay connection failed");
+                                }
+                            }
+                        }
+                        tracing::error!("[中继] Host 连接失败: {}", error);
+                        runtime.emit("tunnel:failed", json!({"mode": "Relay", "reason": error}));
+                    }
+                }
+            });
+            return Ok(());
         } else {
             let connection =
                 tunnel::connect_relay_quic_guest(address, relay.token, self.stats.clone(), user)
