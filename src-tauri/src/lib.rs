@@ -433,13 +433,19 @@ pub fn run(dev_mode: bool) {
             // 运行时要在这里才能建：它需要 AppHandle 才能把事件发给界面。
             // 身份密钥、信令客户端与统计采样都由 SessionRuntime 内部完成，
             // 不再在此处各建一份。
+            //
+            // 必须包在 block_on 里：SessionRuntime::new 内部会 tokio::spawn
+            // 带宽采样任务，而 setup() 跑在主线程、不在运行时上下文中，
+            // 直接调用会 panic —— 表现为窗口根本不出现（GUI 子系统没有控制台，
+            // panic 信息也看不到）。
             let host = Arc::new(TauriHost {
                 app: _app.handle().clone(),
             });
-            let runtime = SessionRuntime::new(host).map_err(|e| {
-                tracing::error!("[启动] 运行时初始化失败: {}", e);
-                e
-            })?;
+            let runtime = tauri::async_runtime::block_on(async { SessionRuntime::new(host) })
+                .map_err(|e| {
+                    tracing::error!("[启动] 运行时初始化失败: {}", e);
+                    e
+                })?;
             _app.manage(AppRuntime { runtime });
 
             // 启动时静默检测一次出口公网 IP 对应的宽带运营商（纯展示型功能，
