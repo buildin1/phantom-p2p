@@ -98,6 +98,10 @@ struct RuntimeState {
     host_endpoint: Option<quinn::Endpoint>,
     host_peers: HashMap<String, HostPeer>,
     host_ice_tasks: HashMap<String, tokio::task::JoinHandle<()>>,
+    /// 房间里所有 Guest 共用 Host 这一条中继连接，因此要记住它对应的
+    /// token：token 没变且连接还活着时**不能重连**，否则会把正在通过它
+    /// 转发的其他 Guest 一起掐断。判定见 [`should_start_host_relay`]。
+    relay_host_token: Option<String>,
     relay_host_conn: Option<quinn::Connection>,
     tun_bridge: Option<Arc<tun_bridge::TunBridge>>,
 }
@@ -121,6 +125,7 @@ impl Default for RuntimeState {
             host_endpoint: None,
             host_peers: HashMap::new(),
             host_ice_tasks: HashMap::new(),
+            relay_host_token: None,
             relay_host_conn: None,
             tun_bridge: None,
         }
@@ -836,6 +841,37 @@ impl SessionRuntime {
             .add_connection(user.clone(), "relay".into())
             .await;
         if is_host {
+            // 同一个房间里每个 Guest 回落中继都会触发一次 RelayReady，
+            // 但 Host 只应该有一条中继连接。token 未变且连接仍活着时直接复用，
+            // 否则会把正在经由它转发的其他 Guest 一并掐断。
+            let should_start = {
+                let mut state = self.state.lock().await;
+                let connection_alive = state
+                    .relay_host_conn
+                    .as_ref()
+                    .map(|conn| conn.close_reason().is_none())
+                    .unwrap_or(false);
+                let start = should_start_host_relay(
+                    state.relay_host_token.as_deref(),
+                    &relay.token,
+                    state.relay_host_conn.is_some(),
+                    connection_alive,
+                );
+                if start {
+                    if let Some(old) = state.relay_host_conn.take() {
+                        old.close(0u32.into(), b"relay token changed");
+                    }
+                    state.relay_host_token = Some(relay.token.clone());
+                }
+                start
+            };
+
+            if !should_start {
+                tracing::info!("[中继] Host 中继连接已就绪，复用 token {}", relay.token);
+                self.emit("tunnel:started", "Relay");
+                return Ok(());
+            }
+
             let connection = tunnel::connect_relay_quic_host(
                 address,
                 relay.token,
@@ -1156,4 +1192,58 @@ async fn resolve_ipv4(host: &str, port: u16) -> Result<SocketAddr, String> {
         "cannot resolve an IPv4 relay address for {}",
         target
     ))
+}
+
+/// Host 是否需要新建中继连接。
+///
+/// 房间里所有 Guest 共用 Host 这一条中继连接，而每个 Guest 回落中继都会
+/// 触发一次 `RelayReady`。若 token 未变且连接仍可用，重连只会把正在经由
+/// 它转发的其他 Guest 一起掐断，因此这里必须返回 false。
+fn should_start_host_relay(
+    active_token: Option<&str>,
+    requested_token: &str,
+    connection_present: bool,
+    connection_alive: bool,
+) -> bool {
+    let same_token = active_token == Some(requested_token);
+    !(same_token && (connection_alive || !connection_present))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_start_host_relay;
+
+    #[test]
+    fn host_relay_is_idempotent_per_room_token() {
+        // 首次请求：没有活动 token，必须建立
+        assert!(should_start_host_relay(None, "room-a", false, false));
+        // 同 token 且正在建立中（尚无连接对象）：不要重复发起
+        assert!(!should_start_host_relay(
+            Some("room-a"),
+            "room-a",
+            false,
+            false
+        ));
+        // 同 token 且连接存活：复用，绝不能重连
+        assert!(!should_start_host_relay(
+            Some("room-a"),
+            "room-a",
+            true,
+            true
+        ));
+        // 同 token 但连接已断：需要重建
+        assert!(should_start_host_relay(
+            Some("room-a"),
+            "room-a",
+            true,
+            false
+        ));
+        // 换了房间（token 变化）：必须重建
+        assert!(should_start_host_relay(
+            Some("room-a"),
+            "room-b",
+            true,
+            true
+        ));
+    }
 }
