@@ -143,6 +143,13 @@ pub struct SessionRuntime {
 }
 
 impl SessionRuntime {
+    /// 构造运行时。
+    ///
+    /// **必须在 Tokio 运行时上下文内调用**——内部会 `tokio::spawn` 带宽采样
+    /// 任务，脱离上下文调用会直接 panic。`#[tokio::main]` 里天然满足；
+    /// 桌面端的 Tauri `setup()` 跑在主线程上不满足，需要用
+    /// `tauri::async_runtime::block_on` 包一层；Android 的 JNI 入口同理，
+    /// 要先进入运行时再建。
     pub fn new(host: Arc<dyn RuntimeHost>) -> Result<Arc<Self>, String> {
         crate::ensure_rustls_crypto_provider()?;
         let config = ClientConfig::load();
