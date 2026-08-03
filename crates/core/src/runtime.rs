@@ -169,14 +169,35 @@ impl SessionRuntime {
     pub async fn start(self: &Arc<Self>, signal_url: String, auto_host: bool) {
         self.auto_host.store(auto_host, Ordering::Relaxed);
         self.signal.connect(signal_url).await;
-        if let Some(mut receiver) = self.signal.take_event_rx().await {
-            let runtime = self.clone();
-            tokio::spawn(async move {
-                while let Some(message) = receiver.recv().await {
-                    runtime.handle_server_message(message).await;
-                }
-            });
+        self.spawn_message_loop();
+    }
+
+    /// 界面上"连接"按钮的语义：已连接时先断开再重连。
+    ///
+    /// 与 [`start`](Self::start) 的区别只在这一步。启动时不需要它——那时必然
+    /// 是断开状态；而用户点连接时可能正连着，直接再 `connect` 会叠加一条
+    /// websocket 任务，两条同时往同一个事件通道里灌消息。
+    pub async fn connect_signal(self: &Arc<Self>, signal_url: String) {
+        if self.signal.get_state().await != signal::client::ConnectionState::Disconnected {
+            self.signal.disconnect().await;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
+        self.signal.connect(signal_url).await;
+        self.spawn_message_loop();
+    }
+
+    /// 事件接收端只能取一次，因此重连时这里会拿到 None——
+    /// 首次启动时建立的那个循环仍在读同一个通道，无需也不能再开一个。
+    fn spawn_message_loop(self: &Arc<Self>) {
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            let Some(mut receiver) = runtime.signal.take_event_rx().await else {
+                return;
+            };
+            while let Some(message) = receiver.recv().await {
+                runtime.handle_server_message(message).await;
+            }
+        });
     }
 
     fn emit<T: Serialize>(&self, event: &str, payload: T) {
@@ -1019,6 +1040,11 @@ impl SessionRuntime {
     pub async fn invoke(self: &Arc<Self>, command: &str, payload: Value) -> Result<Value, String> {
         match command {
             "is_dev_mode" => Ok(json!(false)),
+            "get_signal_status" => Ok(json!({
+                "state": self.signal.get_state().await.to_string(),
+                "session_id": self.signal.get_session_id().await,
+                "room_code": self.signal.get_room_code().await,
+            })),
             "show_main_window" => Ok(Value::Null),
             "connect_signal" => {
                 if self.signal.get_state().await == signal::client::ConnectionState::Disconnected {
