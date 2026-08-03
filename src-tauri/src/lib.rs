@@ -6,16 +6,16 @@
 //! - puncher → UDP 打洞引擎
 
 use phantom_protocol::{ClientMessage, IceCandidate, RelayPreAllocInfo, ServerMessage};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::net::UdpSocket;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
 
 mod config;
-use phantom_core::{
-    identity, nat, network, network_info, punch, puncher, signal, stats, stun, tun_bridge, tunnel,
-};
+mod desktop;
+mod net_diag;
+use phantom_core::{identity, network_info, punch, puncher, signal, stats, tun_bridge, tunnel};
 use std::sync::atomic::AtomicBool;
 
 // Web 服务器模块（仅在启用 web-server feature 时编译）
@@ -33,30 +33,6 @@ struct SignalState {
 struct HostPeer {
     socket: Arc<UdpSocket>,
     endpoint: Option<quinn::Endpoint>,
-}
-
-/// 客户端日志目录。
-///
-/// 与启动时 `logging::init` 用的是同一处，"打包整个目录上报"才对得上。
-/// 优先放在安装目录（便携部署好找），不可写时退回用户数据目录。
-fn client_log_dir() -> std::path::PathBuf {
-    let install = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
-        .filter(|dir| {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(dir.join(".write-probe"))
-                .is_ok()
-        });
-    match install {
-        Some(dir) => dir.join("log"),
-        None => dirs::data_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join("phantom-p2p")
-            .join("log"),
-    }
 }
 
 /// 主动上报日志（前端"反馈问题"按钮调用）。
@@ -147,46 +123,6 @@ struct StatsState {
     manager: Arc<stats::StatsManager>,
 }
 
-/// 网络诊断信息
-#[derive(Serialize, Deserialize)]
-pub struct NetworkInfo {
-    pub nat_type: String,
-    pub nat_type_key: String,
-    pub nat_difficulty: String,
-    pub external_ip: String,
-    pub external_port: u16,
-    pub upnp: bool,
-    pub upnp_port: u16,
-    pub ipv6: bool,
-    pub ipv6_addr: String,
-    pub local_ip: String,
-    pub local_port: u16,
-    pub stun_mappings: Vec<String>,
-    pub stun_details: Vec<StunDetail>,
-    pub port_pattern: String,
-    pub mapping_behavior: String,
-    pub filtering_behavior: String,
-    pub confidence: String,
-    pub diagnostics_rounds: u8,
-    pub network_priority: String,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct StunDetail {
-    pub server: String,
-    pub mapping: String,
-    pub rtt_ms: u32,
-    pub socket: String,
-    pub round: u8,
-}
-
-#[derive(Serialize, Clone)]
-struct NetDiagProgress {
-    progress: u8,
-    stage: String,
-    eta_seconds: u8,
-}
-
 /// 前端展示的连接信息
 #[derive(Debug, Clone, Serialize)]
 pub struct SignalStatus {
@@ -199,29 +135,6 @@ pub struct SignalStatus {
 struct TunnelFailedPayload {
     mode: String,
     reason: String,
-}
-
-#[cfg(windows)]
-#[link(name = "kernel32")]
-extern "system" {
-    fn AttachConsole(dw_process_id: u32) -> i32;
-    fn AllocConsole() -> i32;
-}
-
-#[cfg(windows)]
-fn enable_windows_dev_console(dev_mode: bool) {
-    if !dev_mode {
-        return;
-    }
-
-    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
-
-    // 优先附着父进程控制台；若不存在（例如双击启动），则新建一个控制台窗口。
-    unsafe {
-        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
-            let _ = AllocConsole();
-        }
-    }
 }
 
 async fn abort_punch_task(punch_state: &PunchState) {
@@ -286,137 +199,6 @@ async fn clear_virtual_network(punch_state: &PunchState) {
 #[tauri::command]
 fn is_dev_mode() -> bool {
     DEV_MODE.load(Ordering::Relaxed)
-}
-
-/// 获取网络信息（NAT 类型、公网 IP、STUN、UPnP、IPv6 等）
-#[tauri::command]
-async fn get_network_info(app: AppHandle) -> Result<NetworkInfo, String> {
-    const DIAG_ROUNDS: usize = 3;
-    let emit_progress = |progress: u8, stage: &str, eta_seconds: u8| {
-        let _ = app.emit(
-            "diag:progress",
-            NetDiagProgress {
-                progress,
-                stage: stage.to_string(),
-                eta_seconds,
-            },
-        );
-    };
-
-    emit_progress(4, "初始化诊断环境", 15);
-
-    let mut rounds = Vec::with_capacity(DIAG_ROUNDS);
-    for idx in 0..DIAG_ROUNDS {
-        let progress = 10 + (idx as u8 * 20);
-        let eta = ((DIAG_ROUNDS - idx) * 4 + 3) as u8;
-        emit_progress(
-            progress,
-            &format!("多 STUN 映射采样 第 {}/{} 轮", idx + 1, DIAG_ROUNDS),
-            eta,
-        );
-        rounds.push(stun::query_dual_async().await);
-    }
-
-    emit_progress(72, "过滤行为探测（IP/端口限制）", 5);
-    let filtering_probe = stun::detect_filtering_behavior_async().await;
-
-    let analysis = nat::analyze_multi_round(
-        &rounds,
-        filtering_probe.behavior.key(),
-        &format!("{} @ {}", filtering_probe.detail, filtering_probe.server),
-    );
-
-    let mut merged_a = Vec::new();
-    let mut merged_b = Vec::new();
-    let mut stun_details: Vec<StunDetail> = Vec::new();
-    for (round_index, round) in rounds.iter().enumerate() {
-        merged_a.extend(round.mappings_a.clone());
-        merged_b.extend(round.mappings_b.clone());
-
-        for sample in &round.samples_a {
-            stun_details.push(StunDetail {
-                server: sample.server.clone(),
-                mapping: format!("{}:{}", sample.mapping.ip, sample.mapping.port),
-                rtt_ms: sample.rtt_ms,
-                socket: "A".to_string(),
-                round: (round_index + 1) as u8,
-            });
-        }
-        for sample in &round.samples_b {
-            stun_details.push(StunDetail {
-                server: sample.server.clone(),
-                mapping: format!("{}:{}", sample.mapping.ip, sample.mapping.port),
-                rtt_ms: sample.rtt_ms,
-                socket: "B".to_string(),
-                round: (round_index + 1) as u8,
-            });
-        }
-    }
-
-    let primary = if !merged_a.is_empty() {
-        &merged_a
-    } else {
-        &merged_b
-    };
-    let (external_ip, external_port) = if let Some(first) = primary.first() {
-        (first.ip.clone(), first.port)
-    } else {
-        ("0.0.0.0".to_string(), 0)
-    };
-    let local_port = rounds.first().map(|r| r.local_port_a).unwrap_or(0);
-
-    let mut stun_mappings: Vec<String> = Vec::new();
-    for detail in &stun_details {
-        stun_mappings.push(format!(
-            "R{}-{}→{}",
-            detail.round, detail.socket, detail.mapping
-        ));
-    }
-
-    emit_progress(86, "UPnP / IPv6 / 本机网卡检测", 2);
-    let (upnp_result, local_net) = tokio::join!(
-        network::detect_upnp(),
-        tokio::task::spawn_blocking(network::detect_local_network),
-    );
-
-    let local_net = local_net.unwrap_or_else(|_| network::LocalNetworkInfo {
-        local_ip: "127.0.0.1".to_string(),
-        ipv6_available: false,
-        ipv6_addr: String::new(),
-    });
-
-    let network_priority = if local_net.ipv6_available {
-        "ipv6".to_string()
-    } else {
-        "ipv4".to_string()
-    };
-
-    emit_progress(95, "汇总 NAT 诊断结果", 1);
-
-    let info = NetworkInfo {
-        nat_type: analysis.nat_type.display_name().to_string(),
-        nat_type_key: analysis.nat_type.type_key().to_string(),
-        nat_difficulty: analysis.nat_type.difficulty().to_string(),
-        mapping_behavior: analysis.mapping_behavior,
-        filtering_behavior: analysis.filtering_behavior,
-        confidence: analysis.confidence,
-        external_ip,
-        external_port,
-        upnp: upnp_result.available,
-        upnp_port: upnp_result.external_port,
-        ipv6: local_net.ipv6_available,
-        ipv6_addr: local_net.ipv6_addr,
-        local_ip: local_net.local_ip,
-        local_port,
-        stun_mappings,
-        stun_details,
-        port_pattern: analysis.port_pattern,
-        diagnostics_rounds: DIAG_ROUNDS as u8,
-        network_priority,
-    };
-
-    emit_progress(100, "诊断完成", 0);
-    Ok(info)
 }
 
 /// 连接信令服务器
@@ -566,7 +348,7 @@ async fn connect_signal(
                         let why = reason.clone();
                         let app_for_upload = app_for_task.clone();
                         tokio::task::spawn_blocking(move || {
-                            let dir = client_log_dir();
+                            let dir = desktop::client_log_dir();
                             let uploader = phantom_core::log_upload::LogUploader::new(&dir);
                             // 先补投历史失败的包——它们往往正是"网络有问题"那次的日志
                             uploader.flush_pending();
@@ -1653,7 +1435,7 @@ pub fn run(dev_mode: bool) {
     DEV_MODE.store(dev_mode, Ordering::Relaxed);
 
     #[cfg(windows)]
-    enable_windows_dev_console(dev_mode);
+    desktop::enable_dev_console(dev_mode);
 
     // 初始化 Rustls 加密提供者
     rustls::crypto::ring::default_provider()
@@ -1674,7 +1456,7 @@ pub fn run(dev_mode: bool) {
     // 其中 91.4% 是每秒一条、数值相同的心跳 DEBUG，
     // 真正有用的打洞过程被完全淹没，也没法上报给服务端做聚合。
     let _ = install_dir;
-    let log_dir = client_log_dir();
+    let log_dir = desktop::client_log_dir();
     let _ = std::env::var("RUST_LOG").or_else(|_| {
         std::env::set_var("RUST_LOG", default_filter);
         Ok::<String, std::env::VarError>(default_filter.to_string())
@@ -1769,7 +1551,7 @@ pub fn run(dev_mode: bool) {
         .invoke_handler(tauri::generate_handler![
             show_main_window,
             is_dev_mode,
-            get_network_info,
+            net_diag::get_network_info,
             connect_signal,
             disconnect_signal,
             get_signal_status,
