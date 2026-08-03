@@ -123,6 +123,21 @@ class PhantomVpnService : VpnService() {
         return START_NOT_STICKY
     }
 
+    /**
+     * 用户在系统设置里关闭本 VPN、或另一个 VPN 应用抢占了接口时，系统调用这里。
+     *
+     * 此时 TUN 描述符已经被系统作废，继续读写只会不断报错。不实现这个回调的话
+     * 数据面协程会一直空转、通知栏也还挂着，用户在设置里明明已经关了，应用却
+     * 表现得还连着。
+     *
+     * 注意它**不会**触发 onDestroy——服务本身仍然存活，所以必须在这里主动收尾。
+     */
+    override fun onRevoke() {
+        Log.w(TAG, "VPN 权限被撤销（用户手动关闭或被其它 VPN 抢占），停止服务")
+        stopVpn(removeService = true)
+        super.onRevoke()
+    }
+
     override fun onDestroy() {
         stopVpn(removeService = false)
         ioScope.cancel()
@@ -164,10 +179,11 @@ class PhantomVpnService : VpnService() {
         val notification = buildNotification()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            // 必须与清单里声明的 foregroundServiceType 一致，否则系统会拒绝启动前台服务。
             startForeground(
                 NOTIFICATION_ID,
                 notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED
             )
         } else {
             startForeground(NOTIFICATION_ID, notification)
