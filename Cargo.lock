@@ -3074,7 +3074,9 @@ dependencies = [
  "parking_lot",
  "phantom-core",
  "quinn",
+ "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
