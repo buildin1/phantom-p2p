@@ -27,7 +27,11 @@ use serde::{Deserialize, Serialize};
 /// 客户端在 [`ClientMessage::Auth`] 中声明，服务端不匹配则回
 /// [`ServerMessage::VersionMismatch`]。**任何消息结构变更都必须递增此值**，
 /// 否则会出现难以定位的反序列化失败。
-pub const PROTOCOL_VERSION: u32 = 3;
+///
+/// - `4`：数据面引入前向纠错（FEC）与中继 DATAGRAM 转发。
+///   FEC 本身靠**带内探测**协商（见 `phantom_core::fec`），与旧客户端可自动回退；
+///   但中继必须转发 DATAGRAM，旧中继无法承载新数据面，故递增版本挡住不匹配的组合。
+pub const PROTOCOL_VERSION: u32 = 4;
 
 // ============================================================
 // ICE 候选

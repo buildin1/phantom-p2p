@@ -984,10 +984,22 @@ impl SessionRuntime {
         let connection = connection.ok_or("QUIC connection is not ready")?;
         // 没有会话密钥就不建隧道——绝不退回明文传输
         let crypto = crypto.ok_or("overlay 会话密钥尚未协商完成")?;
-        let bridge =
-            tun_bridge::TunBridge::start(&subnet, &virtual_ip, &host_ip, connection, crypto)
-                .await
-                .map_err(|e| e.to_string())?;
+        // Guest 只有一条对端连接，取它做流量统计的归属
+        let peer_stats = self
+            .stats
+            .first_connection_id()
+            .await
+            .map(|user| (self.stats.clone(), user));
+        let bridge = tun_bridge::TunBridge::start(
+            &subnet,
+            &virtual_ip,
+            &host_ip,
+            connection,
+            crypto,
+            peer_stats,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         self.state.lock().await.tun_bridge = Some(bridge);
         self.emit(
             "tun:ready",
