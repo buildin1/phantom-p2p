@@ -79,6 +79,12 @@ struct RepairSession {
     detector: std::sync::Mutex<LossDetector>,
     /// 本端已发出的最大计数器，随心跳告知对端以便它发现尾部丢包
     highest_sent: AtomicU64,
+    /// 补包专用通道（中继）。
+    ///
+    /// P2P 已经证明它在丢包，从同一条烂路上补，大概率还是丢。所以重度丢包时
+    /// 向信令求援借用中继，**只让补包走中继**，原包仍走 P2P：
+    /// 既拿到了中继的可靠性，又不用付全流量走中继的带宽代价。
+    repair_conn: std::sync::Mutex<Option<Connection>>,
     /// 本地发送失败计数。用于区分「网络丢包」与「本地发送队列丢包」——
     /// 后者是拥塞窗口耗尽导致的，包根本没上过网络，补包完全帮不上忙。
     send_failures: AtomicU64,
@@ -90,16 +96,31 @@ impl RepairSession {
     fn new(now: Instant) -> Self {
         Self {
             peer_supports: AtomicBool::new(false),
-            policy: std::sync::Mutex::new(RepairPolicy::new()),
+            // 从该网络此前学到的安全上限起步，而不是每次重新试探到被掐
+            policy: std::sync::Mutex::new(RepairPolicy::with_ceiling(repair::current_ceiling())),
             send_buffer: std::sync::Mutex::new(SendBuffer::new()),
             lossy_flows: std::sync::Mutex::new(LossyFlows::new()),
             queue: std::sync::Mutex::new(SendQueue::new()),
             detector: std::sync::Mutex::new(LossDetector::new(now)),
             highest_sent: AtomicU64::new(0),
+            repair_conn: std::sync::Mutex::new(None),
             send_failures: AtomicU64::new(0),
             copies_sent: AtomicU64::new(0),
             retransmits: AtomicU64::new(0),
         }
+    }
+
+    /// 挂上/摘下补包专用通道
+    fn set_repair_conn(&self, conn: Option<Connection>) {
+        let mut c = self.repair_conn.lock().unwrap_or_else(|e| e.into_inner());
+        *c = conn;
+    }
+
+    fn repair_conn(&self) -> Option<Connection> {
+        self.repair_conn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     fn peer_ready(&self) -> bool {
@@ -282,10 +303,23 @@ impl PeerForwarder {
                 f.mark(flow, now);
             }
         }
+        // 有中继可用就走中继补：P2P 已经证明它在丢包，
+        // 从同一条烂路上补大概率还是丢。
+        let via_relay = self.repair.repair_conn();
         let n = payloads.len();
         for p in payloads {
             self.repair.retransmits.fetch_add(1, Ordering::Relaxed);
-            self.send_raw(p.to_vec());
+            match &via_relay {
+                Some(relay) => {
+                    if relay.send_datagram(p.to_vec().into()).is_err() {
+                        // 中继也发不出去就退回主路，尽力而为
+                        self.send_raw(p.to_vec());
+                    }
+                }
+                None => {
+                    self.send_raw(p.to_vec());
+                }
+            }
         }
         n
     }
@@ -303,6 +337,18 @@ pub struct TunBridge {
     default_peer: Mutex<Option<PeerForwarder>>,
     closed: std::sync::atomic::AtomicBool,
     tx_packets: AtomicU64,
+    /// 所有已接入的对端连接。
+    ///
+    /// 必须显式持有：接收任务与修复巡检都循环在各自的 `Connection` 上，
+    /// 只丢掉 `Arc<TunBridge>` 是停不掉它们的——那些任务各自克隆了连接句柄。
+    /// 不在这里逐个 `close()` 的话，关了房间旧会话仍然能收发。
+    conns: Mutex<Vec<Connection>>,
+    /// 按内层流拆分的重放窗口，**全会话共享**。
+    ///
+    /// 不能做成每个接收任务一份：切换传输（P2P ↔ 中继）时两条路会短暂并存，
+    /// 各自一份窗口就意味着同一个报文经两条路到达时都能通过，
+    /// 重复写进 TUN。共享之后去重才是全局有效的。
+    replay: Arc<std::sync::Mutex<FlowReplayTable>>,
 }
 
 impl TunBridge {
@@ -376,6 +422,8 @@ impl TunBridge {
             default_peer: Mutex::new(None),
             closed: std::sync::atomic::AtomicBool::new(false),
             tx_packets: AtomicU64::new(0),
+            conns: Mutex::new(Vec::new()),
+            replay: Arc::new(std::sync::Mutex::new(FlowReplayTable::new())),
         });
         let reader = bridge.clone();
         tokio::spawn(async move {
@@ -395,6 +443,48 @@ impl TunBridge {
         peer_hint: Option<Ipv4Addr>,
         stats: PeerStats,
     ) -> Result<(), TunError> {
+        self.attach_peer_inner(conn, crypto, peer_hint, stats, false)
+            .await
+    }
+
+    /// 接入一条新连接并**把它设为默认出口**，用于 P2P → 中继的无缝切换。
+    ///
+    /// 与 [`attach_peer`](Self::attach_peer) 的区别只在最后一步：那个版本只在
+    /// 默认出口还空着时才填，切换时必须强制改指向，否则出方向的包会继续
+    /// 往那条已经废掉的旧路上送。
+    ///
+    /// 采用**先建后拆**：这里只负责建好并改指向，旧连接由调用方在确认新路
+    /// 通了之后再关，中间没有空窗期，游戏的 TCP 连接不会断。
+    pub async fn attach_and_promote(
+        &self,
+        conn: Connection,
+        crypto: Arc<SessionCrypto>,
+        stats: PeerStats,
+    ) -> Result<(), TunError> {
+        self.attach_peer_inner(conn, crypto, None, stats, true)
+            .await
+    }
+
+    async fn attach_peer_inner(
+        &self,
+        conn: Connection,
+        crypto: Arc<SessionCrypto>,
+        peer_hint: Option<Ipv4Addr>,
+        stats: PeerStats,
+        promote: bool,
+    ) -> Result<(), TunError> {
+        // 切换到一条数据报上限更小的路，会让满载包突然开始被拒发，
+        // 而 TUN 的 MTU 在设备创建时就定死了、运行中改不了。宁可不切。
+        let required = TUN_MTU as usize + crate::crypto::OVERHEAD;
+        if let Some(limit) = conn.max_datagram_size() {
+            if limit < required {
+                return Err(TunError::CreateFailed(format!(
+                    "对端数据报上限 {} 小于满载包所需 {}，接入会导致满载包被拒发",
+                    limit, required
+                )));
+            }
+        }
+
         let forwarder = PeerForwarder {
             conn: conn.clone(),
             crypto,
@@ -402,20 +492,23 @@ impl TunBridge {
             stats,
         };
         tracing::info!(
-            "[TUN] 数据报通道就绪 (local={}, peer_hint={:?}, host={}, max_datagram={:?})",
+            "[TUN] 数据报通道就绪 (local={}, peer_hint={:?}, host={}, promote={}, max_datagram={:?})",
             self.my_vip,
             peer_hint,
             self.is_host,
+            promote,
             conn.max_datagram_size()
         );
+        self.conns.lock().await.push(conn.clone());
         if let Some(ip) = peer_hint {
             self.peers.lock().await.insert(ip, forwarder.clone());
         }
-        let mut default = self.default_peer.lock().await;
-        if !self.is_host && default.is_none() {
-            *default = Some(forwarder.clone());
+        {
+            let mut default = self.default_peer.lock().await;
+            if promote || (!self.is_host && default.is_none()) {
+                *default = Some(forwarder.clone());
+            }
         }
-        drop(default);
 
         // 修复层的定时工作必须独立于收包循环：稀疏流量下包与包之间隔着几十毫秒，
         // 挂在收包上驱动的话，副本发送、NACK 重试、心跳全都会被拖到下一个包才动。
@@ -424,13 +517,23 @@ impl TunBridge {
 
         let tun = self.tun.clone();
         let peers = self.peers.clone();
+        let replay = self.replay.clone();
         let sender = forwarder;
         let is_host = self.is_host;
         let host_vip = self.host_vip;
         let guest_network = self.guest_network;
         tokio::spawn(async move {
-            if let Err(e) =
-                receive_datagrams(conn, tun, peers, sender, is_host, host_vip, guest_network).await
+            if let Err(e) = receive_datagrams(
+                conn,
+                tun,
+                peers,
+                replay,
+                sender,
+                is_host,
+                host_vip,
+                guest_network,
+            )
+            .await
             {
                 debug!("[TUN] 对端数据报循环结束: {}", e);
             }
@@ -506,7 +609,71 @@ impl TunBridge {
     pub async fn close(&self) {
         self.closed
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        // 必须显式关掉每条连接。接收任务和修复巡检各自克隆了连接句柄，
+        // 光丢引用是停不掉它们的——不关的话关了房间旧会话仍然能收发。
+        // 关掉之后 `read_datagram()` 立刻返回错误，两个任务自然退出。
+        for conn in self.conns.lock().await.drain(..) {
+            conn.close(0u32.into(), b"tunnel closed");
+        }
+        self.peers.lock().await.clear();
+        *self.default_peer.lock().await = None;
         self.tun.close().await;
+    }
+
+    /// 关闭除当前默认出口之外的所有连接。
+    ///
+    /// 无缝切换的收尾：新路已经确认可用、默认出口也已改指向之后，
+    /// 才把旧路撤掉，中间不留空窗期。
+    pub async fn retire_inactive_peers(&self) {
+        let keep = self
+            .default_peer
+            .lock()
+            .await
+            .as_ref()
+            .map(|f| f.conn.stable_id());
+        let mut conns = self.conns.lock().await;
+        let mut retained = Vec::new();
+        for conn in conns.drain(..) {
+            if Some(conn.stable_id()) == keep {
+                retained.push(conn);
+            } else {
+                tracing::info!("[TUN] 撤下旧传输通道 {}", conn.remote_address());
+                conn.close(0u32.into(), b"superseded");
+            }
+        }
+        *conns = retained;
+    }
+
+    /// 给所有对端挂上补包专用通道（中继），或传 `None` 摘下。
+    ///
+    /// 只影响**补包**：原包仍走各自的主路。
+    pub async fn set_repair_channel(&self, conn: Option<Connection>) {
+        if let Some(f) = self.default_peer.lock().await.as_ref() {
+            f.repair.set_repair_conn(conn.clone());
+        }
+        for f in self.peers.lock().await.values() {
+            f.repair.set_repair_conn(conn.clone());
+        }
+        match &conn {
+            Some(c) => tracing::info!("[修复] 补包改走中继 {}", c.remote_address()),
+            None => tracing::info!("[修复] 补包改回 P2P 直连"),
+        }
+    }
+
+    /// 当前观测到的最差入方向丢包率（万分之一），供上层决定要不要求援
+    pub async fn worst_observed_loss_bp(&self) -> u16 {
+        let mut worst = 0u16;
+        let mut consider = |f: &PeerForwarder| {
+            let p = f.repair.policy.lock().unwrap_or_else(|e| e.into_inner());
+            worst = worst.max(p.smoothed_loss_bp());
+        };
+        if let Some(f) = self.default_peer.lock().await.as_ref() {
+            consider(f);
+        }
+        for f in self.peers.lock().await.values() {
+            consider(f);
+        }
+        worst
     }
 
     pub fn host_vip(&self) -> Ipv4Addr {
@@ -612,7 +779,8 @@ fn spawn_repair_ticker(sender: PeerForwarder, conn: Connection) {
 
         loop {
             tick.tick().await;
-            if conn.close_reason().is_some() {
+            if let Some(reason) = conn.close_reason() {
+                note_disconnect(&sender, &reason);
                 break;
             }
             let now = Instant::now();
@@ -722,17 +890,17 @@ fn spawn_repair_ticker(sender: PeerForwarder, conn: Connection) {
 /// 与旧的流式实现相比，这里**丢包不影响后续包**——数据报之间彼此独立，
 /// 不存在队头阻塞，也不会为早已过期的实时流量做重传。
 /// 单个包解密失败只丢它自己，循环继续。
+#[allow(clippy::too_many_arguments)]
 async fn receive_datagrams(
     conn: Connection,
     tun: Arc<TunDevice>,
     peers: PeerSenders,
+    replay: Arc<std::sync::Mutex<FlowReplayTable>>,
     sender: PeerForwarder,
     is_host: bool,
     host_vip: Ipv4Addr,
     guest_network: Ipv4Addr,
 ) -> Result<(), String> {
-    let mut flows = FlowReplayTable::new();
-
     loop {
         let datagram = conn.read_datagram().await.map_err(|e| e.to_string())?;
         if let Some((stats, user)) = &sender.stats {
@@ -783,7 +951,11 @@ async fn receive_datagrams(
             // 于是**本地 TUN 永远只收到每个 IP 包恰好一份**，多倍包只存在于
             // P2P 双端之间——这是不能破坏的性质。
             let key = flow_key(header, &packet);
-            if !flows.accept(key, counter) {
+            let accepted = {
+                let mut flows = replay.lock().unwrap_or_else(|e| e.into_inner());
+                flows.accept(key, counter)
+            };
+            if !accepted {
                 debug!("[TUN] 丢弃重复/过旧的 overlay 报文 (counter={counter})");
                 continue;
             }
@@ -826,6 +998,36 @@ async fn receive_datagrams(
                 );
             }
         }
+    }
+}
+
+/// 连接结束时判断是否疑似触发了运营商风控。
+///
+/// **只把异常断开算数**：对端正常关房间同样会让连接结束，若不加区分，
+/// 每次正常退出都会被当成风控，把冗余上限一路压到零保护。
+/// `ApplicationClosed`/`LocallyClosed` 是双方谈好的关闭，不算；
+/// 超时与被重置才是"被人掐断"的样子。
+fn note_disconnect(sender: &PeerForwarder, reason: &quinn::ConnectionError) {
+    use quinn::ConnectionError::*;
+    let abnormal = matches!(reason, TimedOut | Reset);
+    if !abnormal {
+        return;
+    }
+    let lowered = {
+        let mut p = sender
+            .repair
+            .policy
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        p.on_abnormal_disconnect(Instant::now())
+    };
+    if let Some(ceiling) = lowered {
+        warn!(
+            "[修复] 隧道在提高冗余后不久被异常掐断（{}），疑似触发运营商风控；\
+             已把冗余上限降到 {} 并记住该网络",
+            reason, ceiling
+        );
+        repair::save_ceiling(&repair::current_network(), ceiling);
     }
 }
 

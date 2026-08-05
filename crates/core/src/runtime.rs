@@ -93,6 +93,8 @@ struct RuntimeState {
     /// 打洞阶段协商出的 overlay 会话密钥。
     /// P2P 与中继两条路径共用同一份——中继只做盲转发，看不到明文。
     peer_crypto: Option<Arc<crate::crypto::SessionCrypto>>,
+    /// 是否已经向信令求援借用中继补包（避免重复申请）
+    repair_assist_active: bool,
     relay: Option<RelayInfo>,
     conn_manager: Option<Arc<tunnel::TunnelConnManager>>,
     host_endpoint: Option<quinn::Endpoint>,
@@ -120,6 +122,7 @@ impl Default for RuntimeState {
             local_candidates: Vec::new(),
             punch_sessions: HashMap::new(),
             peer_crypto: None,
+            repair_assist_active: false,
             relay: None,
             conn_manager: None,
             host_endpoint: None,
@@ -409,6 +412,31 @@ impl SessionRuntime {
                     relay_quic_port,
                     token,
                 });
+            }
+            ServerMessage::RelayAssistGranted {
+                relay_addr,
+                relay_quic_port,
+                token,
+            } => {
+                let runtime = self.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = runtime
+                        .attach_repair_relay(RelayInfo {
+                            relay_addr,
+                            relay_quic_port,
+                            token,
+                        })
+                        .await
+                    {
+                        tracing::warn!("[中继补包] 借用中继失败，退回纯 P2P 补包: {}", e);
+                        runtime.state.lock().await.repair_assist_active = false;
+                    }
+                });
+            }
+            ServerMessage::RelayAssistDenied { reason } => {
+                // 被拒不是错误：中继带宽有限，退回纯 P2P 补包，尽力而为
+                tracing::info!("[中继补包] 求援被拒（{}），继续用 P2P 补包", reason);
+                self.state.lock().await.repair_assist_active = false;
             }
             ServerMessage::RelayReady {
                 relay_addr,
@@ -962,8 +990,8 @@ impl SessionRuntime {
         Ok(())
     }
 
-    async fn start_guest_tun(&self) -> Result<(), String> {
-        let (subnet, virtual_ip, host_ip, connection, already_started, crypto) = {
+    async fn start_guest_tun(self: &Arc<Self>) -> Result<(), String> {
+        let (subnet, virtual_ip, host_ip, connection, existing, crypto) = {
             let state = self.state.lock().await;
             let connection = match &state.conn_manager {
                 Some(manager) => manager.get_conn().await,
@@ -974,13 +1002,10 @@ impl SessionRuntime {
                 state.virtual_ip.clone(),
                 state.host_virtual_ip.clone(),
                 connection,
-                state.tun_bridge.is_some(),
+                state.tun_bridge.clone(),
                 state.peer_crypto.clone(),
             )
         };
-        if already_started {
-            return Ok(());
-        }
         let connection = connection.ok_or("QUIC connection is not ready")?;
         // 没有会话密钥就不建隧道——绝不退回明文传输
         let crypto = crypto.ok_or("overlay 会话密钥尚未协商完成")?;
@@ -990,6 +1015,24 @@ impl SessionRuntime {
             .first_connection_id()
             .await
             .map(|user| (self.stats.clone(), user));
+
+        // 桥已经在跑：这是**换了传输**（P2P → 中继），不是重复启动。
+        //
+        // 以前这里直接返回，于是新连接从来没被接进桥——热替换只换掉了
+        // 管理器里那份引用，而数据面根本不看它，隧道实际还在往旧的死路上发。
+        // 现在改成把新连接接进来并强制改指向，确认可用后再撤旧路（先建后拆），
+        // 虚拟 IP 与 TUN 设备始终不变，游戏的 TCP 连接不会断。
+        if let Some(bridge) = existing {
+            bridge
+                .attach_and_promote(connection, crypto, peer_stats)
+                .await
+                .map_err(|e| e.to_string())?;
+            bridge.retire_inactive_peers().await;
+            tracing::info!("[TUN] 已切换到新的传输通道，游戏连接保持不变");
+            self.emit("tun:switched", json!({"my_ip": virtual_ip}));
+            return Ok(());
+        }
+
         let bridge = tun_bridge::TunBridge::start(
             &subnet,
             &virtual_ip,
@@ -1001,10 +1044,76 @@ impl SessionRuntime {
         .await
         .map_err(|e| e.to_string())?;
         self.state.lock().await.tun_bridge = Some(bridge);
+        // 隧道跑起来之后才开始盯丢包：没有桥就没有观测，盯了也是空转
+        self.spawn_repair_assist_watch();
         self.emit(
             "tun:ready",
             json!({"my_ip": virtual_ip, "host_ip": host_ip, "subnet": subnet}),
         );
+        Ok(())
+    }
+
+    /// 丢包高到 P2P 自己补不回来时，向信令求援借用中继补包。
+    ///
+    /// 判据用**平滑后**的丢包率而不是单窗口值：几十个样本下的估计噪声有一两个
+    /// 百分点，照着单窗口申请会在阈值附近反复申请又释放。
+    const REPAIR_ASSIST_ON_BP: u16 = 2000; // 20%
+    const REPAIR_ASSIST_OFF_BP: u16 = 800; // 8%，留足滞回避免抖动
+
+    fn spawn_repair_assist_watch(self: &Arc<Self>) {
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+            loop {
+                tick.tick().await;
+                let (bridge, active) = {
+                    let st = runtime.state.lock().await;
+                    (st.tun_bridge.clone(), st.repair_assist_active)
+                };
+                let Some(bridge) = bridge else { continue };
+                let loss = bridge.worst_observed_loss_bp().await;
+
+                if !active && loss >= Self::REPAIR_ASSIST_ON_BP {
+                    runtime.state.lock().await.repair_assist_active = true;
+                    tracing::info!(
+                        "[中继补包] 丢包 {:.2}% 已超出 P2P 自补能力，向信令求援",
+                        loss as f64 / 100.0
+                    );
+                    let _ = runtime
+                        .signal
+                        .send(ClientMessage::RelayAssistRequest { loss_bp: loss })
+                        .await;
+                } else if active && loss <= Self::REPAIR_ASSIST_OFF_BP {
+                    runtime.state.lock().await.repair_assist_active = false;
+                    bridge.set_repair_channel(None).await;
+                    tracing::info!(
+                        "[中继补包] 丢包已降到 {:.2}%，交还中继额度",
+                        loss as f64 / 100.0
+                    );
+                    let _ = runtime.signal.send(ClientMessage::RelayAssistRelease).await;
+                }
+            }
+        });
+    }
+
+    /// 连上中继并把它挂成**补包专用**通道（原包仍走 P2P）
+    async fn attach_repair_relay(self: &Arc<Self>, relay: RelayInfo) -> Result<(), String> {
+        let address = resolve_ipv4(&relay.relay_addr, relay.relay_quic_port).await?;
+        let user = self
+            .stats
+            .first_connection_id()
+            .await
+            .unwrap_or_else(|| "assist".to_string());
+        let conn = tunnel::connect_relay_quic_guest(address, relay.token, self.stats.clone(), user)
+            .await?;
+        let bridge = self
+            .state
+            .lock()
+            .await
+            .tun_bridge
+            .clone()
+            .ok_or("TUN 桥尚未就绪")?;
+        bridge.set_repair_channel(Some(conn)).await;
         Ok(())
     }
 
@@ -1244,6 +1353,8 @@ fn server_event_name(message: &ServerMessage) -> &'static str {
         ServerMessage::AuthFailed { .. } => "signal:auth_failed",
         ServerMessage::RelayReady { .. } => "signal:relay_ready",
         ServerMessage::RelayPreAllocated { .. } => "signal:relay_pre_allocated",
+        ServerMessage::RelayAssistGranted { .. } => "signal:relay_assist_granted",
+        ServerMessage::RelayAssistDenied { .. } => "signal:relay_assist_denied",
         ServerMessage::PunchPlan { .. } => "signal:punch_plan",
         ServerMessage::PunchStart { .. } => "signal:punch_start",
         ServerMessage::RequestLogUpload { .. } => "signal:request_log_upload",
