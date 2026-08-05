@@ -159,11 +159,7 @@ impl PeerForwarder {
 
         let now = Instant::now();
         let (data, parities) = {
-            let mut enc = self
-                .fec
-                .encoder
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut enc = self.fec.encoder.lock().unwrap_or_else(|e| e.into_inner());
             let data = enc.push(&sealed, now);
             let parities = if enc.should_close(now) {
                 enc.close_group()
@@ -187,11 +183,7 @@ impl PeerForwarder {
             return;
         }
         let parities = {
-            let mut enc = self
-                .fec
-                .encoder
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut enc = self.fec.encoder.lock().unwrap_or_else(|e| e.into_inner());
             if !enc.should_close(now) {
                 return;
             }
@@ -213,11 +205,7 @@ impl PeerForwarder {
                 .unwrap_or_else(|e| e.into_inner());
             c.current()
         };
-        let mut enc = self
-            .fec
-            .encoder
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut enc = self.fec.encoder.lock().unwrap_or_else(|e| e.into_inner());
         enc.set_redundancy(level);
     }
 }
@@ -614,11 +602,7 @@ async fn receive_datagrams(
                         c.tick(now);
                         c.current()
                     };
-                    let mut enc = sender
-                        .fec
-                        .encoder
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                    let mut enc = sender.fec.encoder.lock().unwrap_or_else(|e| e.into_inner());
                     if enc.redundancy() != redundancy {
                         tracing::info!(
                             "[FEC] 对端报告丢包 {:.2}%，冗余调整为 k={} r={}（溢价 {}%）",
