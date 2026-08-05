@@ -792,10 +792,16 @@ impl TunnelConnManager {
         info!("[TunnelManager] 连接已热替换（静默升级完成）");
     }
 
-    /// 关闭管理器（清除连接）
+    /// 关闭管理器。
+    ///
+    /// 必须**真的关掉** QUIC 连接，而不只是清掉这里的引用：数据面的接收任务
+    /// 各自克隆了连接句柄，清引用对它们毫无影响。以前只置 None，结果关了房间
+    /// 之后旧会话仍然能收发，对端也收不到任何断开通知。
     pub async fn close(&self) {
         let mut guard = self.conn.write().await;
-        *guard = None;
+        if let Some(conn) = guard.take() {
+            conn.close(0u32.into(), b"tunnel closed");
+        }
     }
 
     /// 当前活跃流数量

@@ -283,13 +283,21 @@ const ALPHA_FALL: f64 = 0.05;
 /// 远超噪声量级，只可能是链路真的恶化了。
 const SNAP_THRESHOLD_BP: f64 = 500.0;
 
+/// 升档之后多久内被异常掐断，算作"疑似触发运营商风控"。
+///
+/// 取 30 秒：风控通常在流量特征持续一段时间后才动手（用户观测到 hy2 约 2 分钟被掐），
+/// 但窗口太长会把无关的断线也算进来。
+pub const RISK_SUSPICION_WINDOW: Duration = Duration::from_secs(30);
+
 /// 冗余档位控制器
 pub struct RepairPolicy {
     level: usize,
     smoothed_loss_bp: f64,
     last_feedback: Option<Instant>,
-    /// 档位上限。风控自校准（后续版本）会下压这个值。
+    /// 档位上限。风控自校准会下压这个值。
     ceiling: usize,
+    /// 最近一次升档的时刻与目标档位，用于事后判断掐断是否由它引起
+    last_escalation: Option<(Instant, usize)>,
 }
 
 impl Default for RepairPolicy {
@@ -305,7 +313,15 @@ impl RepairPolicy {
             smoothed_loss_bp: 0.0,
             last_feedback: None,
             ceiling: LADDER.len() - 1,
+            last_escalation: None,
         }
+    }
+
+    /// 从持久化的校准结果恢复上限（同一网络环境下次直接从安全值起步）
+    pub fn with_ceiling(ceiling: usize) -> Self {
+        let mut p = Self::new();
+        p.set_ceiling(ceiling);
+        p
     }
 
     pub fn level(&self) -> RepairLevel {
@@ -344,7 +360,31 @@ impl RepairPolicy {
             };
             self.smoothed_loss_bp += alpha * (raw - self.smoothed_loss_bp);
         }
-        self.level = level_for_loss(self.smoothed_loss_bp()).min(self.ceiling);
+        let want = level_for_loss(self.smoothed_loss_bp()).min(self.ceiling);
+        if want > self.level {
+            self.last_escalation = Some((now, want));
+        }
+        self.level = want;
+    }
+
+    /// 隧道被**异常**掐断时调用（超时/被重置，而不是对端正常关闭）。
+    ///
+    /// 阈值各地不同、用户也无法预先测出来，所以只能让软件自己学：
+    /// 如果掐断紧跟在一次升档之后，那多半就是这次加大的包速率触发了风控。
+    /// 把上限压到该档位之下，返回新上限供持久化——同一网络下次直接从安全值起步。
+    ///
+    /// 只在**异常**断开时调用是关键：对端正常关房间也会让连接结束，
+    /// 若不加区分，正常退出会被误判成风控，把上限一路压到零保护。
+    pub fn on_abnormal_disconnect(&mut self, now: Instant) -> Option<usize> {
+        let (at, level) = self.last_escalation?;
+        if now.duration_since(at) > RISK_SUSPICION_WINDOW || level == 0 {
+            return None;
+        }
+        let new_ceiling = level.saturating_sub(1);
+        self.ceiling = new_ceiling;
+        self.level = self.level.min(new_ceiling);
+        self.last_escalation = None;
+        Some(new_ceiling)
     }
 
     /// 反馈中断太久就回落（对端可能换了链路或掉线重连）
@@ -356,6 +396,98 @@ impl RepairPolicy {
                 self.last_feedback = None;
             }
         }
+    }
+}
+
+// ============================================================
+// 风控校准的持久化
+// ============================================================
+
+/// 学到的安全上限，按网络环境保存。
+///
+/// 各地运营商的风控阈值不同，用户也无法预先测出来，所以只能在**每个用户
+/// 自己的网络里**学：被掐一次，记住当时的档位，下次不再上探到那里。
+/// 换了网络（公网 IP 段变了）就重新学，因为阈值是跟着运营商走的。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct Calibration {
+    /// 学到这个值时所处的网络（公网 IP 的前两段）
+    pub network: String,
+    /// 安全的档位上限
+    pub ceiling: usize,
+}
+
+fn calibration_path() -> std::path::PathBuf {
+    let dir = dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("phantom-p2p");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("repair-calibration.json")
+}
+
+/// 当前所处网络的标识。
+///
+/// 做成进程级共享而不是逐层传参：唯一的写入点是 NAT 探测（那里才知道公网 IP），
+/// 唯一的读取点是断线判定，中间隔着好几层与网络身份毫无关系的代码，
+/// 为它们各加一个参数只会污染接口。
+static NETWORK: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
+
+/// 把公网 IP 归一化成网络标识（取前两段）。
+///
+/// 用 /16 而不是完整 IP：家宽的公网 IP 会变，但通常还在同一个运营商的同一段里，
+/// 而风控策略是跟着运营商走的，不是跟着具体 IP。
+pub fn network_key(public_ip: Option<&str>) -> String {
+    match public_ip {
+        Some(ip) => {
+            let parts: Vec<&str> = ip.split('.').take(2).collect();
+            if parts.len() == 2 {
+                parts.join(".")
+            } else {
+                "unknown".to_string()
+            }
+        }
+        None => "unknown".to_string(),
+    }
+}
+
+/// NAT 探测拿到公网 IP 后调用，记下当前网络
+pub fn set_current_network(public_ip: Option<&str>) {
+    let key = network_key(public_ip);
+    if let Ok(mut n) = NETWORK.write() {
+        *n = key;
+    }
+}
+
+pub fn current_network() -> String {
+    NETWORK
+        .read()
+        .map(|n| n.clone())
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// 当前网络此前学到的安全上限；没学过就是满档
+pub fn current_ceiling() -> usize {
+    load_ceiling(&current_network()).unwrap_or(LADDER.len() - 1)
+}
+
+/// 读取该网络此前学到的上限。网络对不上就当没学过。
+pub fn load_ceiling(network: &str) -> Option<usize> {
+    let raw = std::fs::read_to_string(calibration_path()).ok()?;
+    let saved: Calibration = serde_json::from_str(&raw).ok()?;
+    if saved.network == network {
+        Some(saved.ceiling.min(LADDER.len() - 1))
+    } else {
+        None
+    }
+}
+
+/// 保存本次学到的上限
+pub fn save_ceiling(network: &str, ceiling: usize) {
+    let value = Calibration {
+        network: network.to_string(),
+        ceiling,
+    };
+    if let Ok(text) = serde_json::to_string_pretty(&value) {
+        let _ = std::fs::write(calibration_path(), text);
     }
 }
 
@@ -1146,6 +1278,54 @@ mod tests {
         assert!(p.level_index() > 0);
         p.tick(t + FEEDBACK_STALE + Duration::from_secs(1));
         assert_eq!(p.level_index(), 0, "反馈中断应回落，不能一直高冗余空转");
+    }
+
+    /// 升档之后不久被异常掐断 → 判定疑似风控，压低上限
+    #[test]
+    fn abnormal_disconnect_after_escalation_lowers_ceiling() {
+        let t = t0();
+        let mut p = RepairPolicy::new();
+        p.observe(3000, t); // 升到高档
+        let level = p.level_index();
+        assert!(level > 0);
+        let ceiling = p.on_abnormal_disconnect(t + Duration::from_secs(5));
+        assert_eq!(ceiling, Some(level - 1), "应把上限压到出事档位之下");
+        assert!(p.level_index() <= level - 1);
+    }
+
+    /// 但掐断发生在很久之后，就跟这次升档没关系了
+    #[test]
+    fn late_disconnect_is_not_blamed_on_escalation() {
+        let t = t0();
+        let mut p = RepairPolicy::new();
+        p.observe(3000, t);
+        assert_eq!(
+            p.on_abnormal_disconnect(t + RISK_SUSPICION_WINDOW + Duration::from_secs(1)),
+            None,
+            "超出怀疑窗口的断线不该归咎于升档"
+        );
+    }
+
+    /// 从没升过档就被掐，与冗余无关，不能因此降上限
+    #[test]
+    fn disconnect_without_escalation_changes_nothing() {
+        let t = t0();
+        let mut p = RepairPolicy::new();
+        assert_eq!(p.on_abnormal_disconnect(t), None);
+        assert_eq!(p.level_index(), 0);
+    }
+
+    /// 换了网络就不该套用上次学到的上限——风控策略是跟着运营商走的
+    #[test]
+    fn calibration_is_scoped_to_the_network() {
+        assert_eq!(network_key(Some("27.190.194.154")), "27.190");
+        assert_eq!(network_key(Some("192.168.1.1")), "192.168");
+        assert_eq!(network_key(None), "unknown");
+        assert_ne!(
+            network_key(Some("27.190.1.1")),
+            network_key(Some("60.9.1.1")),
+            "不同运营商网段必须是不同的键"
+        );
     }
 
     #[test]
