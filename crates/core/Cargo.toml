@@ -1,6 +1,6 @@
 [package]
 name = "phantom-core"
-version = "3.0.1"
+version = "3.0.2"
 edition = "2021"
 
 [lib]
@@ -35,6 +35,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 # 日志包上传：打成 zip 便于人工排障时直接解压查看
 zip = { version = "2", default-features = false, features = ["deflate"] }
+reed-solomon-erasure = "6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
