@@ -90,6 +90,8 @@ struct RepairSession {
     send_failures: AtomicU64,
     copies_sent: AtomicU64,
     retransmits: AtomicU64,
+    /// 收包计数，仅用于日志；按对端计数，避免跨会话累加把日志变哑
+    rx_packets: AtomicU64,
 }
 
 impl RepairSession {
@@ -107,6 +109,7 @@ impl RepairSession {
             send_failures: AtomicU64::new(0),
             copies_sent: AtomicU64::new(0),
             retransmits: AtomicU64::new(0),
+            rx_packets: AtomicU64::new(0),
         }
     }
 
@@ -465,6 +468,16 @@ impl TunBridge {
             .await
     }
 
+    /// 这条连接是否已经接入过。
+    ///
+    /// **绝不能在同一条连接上挂第二个接收任务**：quinn 的数据报接收只有一个
+    /// waker 槽位，两个并发 reader 会互相覆盖对方的 waker，最终双方都 park 住
+    /// 再也醒不过来——表现是出方向正常、入方向彻底静默。
+    pub async fn has_connection(&self, conn: &Connection) -> bool {
+        let id = conn.stable_id();
+        self.conns.lock().await.iter().any(|c| c.stable_id() == id)
+    }
+
     async fn attach_peer_inner(
         &self,
         conn: Connection,
@@ -473,6 +486,13 @@ impl TunBridge {
         stats: PeerStats,
         promote: bool,
     ) -> Result<(), TunError> {
+        // 重复接入同一条连接是上层重复调用造成的（比如界面又点了一次"建立隧道"）。
+        // 直接忽略：再挂一个接收任务会让两个 reader 争抢同一个 waker 槽位，
+        // 把入方向整个弄死。
+        if self.has_connection(&conn).await {
+            debug!("[TUN] 该连接已接入，跳过重复接入");
+            return Ok(());
+        }
         // 切换到一条数据报上限更小的路，会让满载包突然开始被拒发，
         // 而 TUN 的 MTU 在设备创建时就定死了、运行中改不了。宁可不切。
         let required = TUN_MTU as usize + crate::crypto::OVERHEAD;
@@ -986,7 +1006,7 @@ async fn receive_datagrams(
                     e
                 )
             })?;
-            let count = tun_rx_counter(&tun, &peers, &sender, is_host);
+            let count = tun_rx_counter(&sender);
             if count <= 100 || count % 1000 == 0 {
                 tracing::info!(
                     "[TUN] rx #{} {} -> {} {} bytes={}",
@@ -1098,16 +1118,11 @@ fn packet_protocol(packet: &[u8]) -> String {
 }
 
 // Kept separate from packet routing so the receive path remains allocation-free.
-fn tun_rx_counter(
-    _tun: &Arc<TunDevice>,
-    _peers: &PeerSenders,
-    _sender: &PeerForwarder,
-    _is_host: bool,
-) -> u64 {
-    // receive_frames is shared by host and guest and predates per-bridge state;
-    // the log counter is process-local and only used for diagnostics.
-    static COUNT: AtomicU64 = AtomicU64::new(0);
-    COUNT.fetch_add(1, Ordering::Relaxed) + 1
+fn tun_rx_counter(sender: &PeerForwarder) -> u64 {
+    // 必须**按对端**计数，不能用进程级静态：静态计数器跨会话累加，
+    // 而日志只在 `count <= 100` 时打印，于是第二次连接之后收包就再也不记录了——
+    // 排查时会得出"一个包都没收到"的错误结论，而实际上收得好好的。
+    sender.repair.rx_packets.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 fn parse_network(prefix: &str) -> Result<Ipv4Addr, TunError> {

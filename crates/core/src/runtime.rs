@@ -601,6 +601,18 @@ impl SessionRuntime {
     }
 
     async fn start_punch(&self) -> Result<(), String> {
+        // 开发者模式的强制中继：直接跳过打洞去要中继。
+        //
+        // 存在的意义是**能单独测中继链路**——平时打洞几乎总能成功，
+        // 中继路径就很少被真正走到，出了问题也不容易复现。
+        // 非开发者模式下这个开关会被 `apply_mode_policy` 强制关掉。
+        if self.config.read().await.force_relay_mode {
+            tracing::warn!("[开发者模式] 强制中继已开启，跳过 P2P 打洞直接申请中继");
+            self.emit("punch:forced_relay", json!({"enabled": true}));
+            self.signal.send(ClientMessage::RelayRequest).await?;
+            return Ok(());
+        }
+
         // Host 的 socket 是长期存活的，已有候选就直接复用重报，
         // 不要重新探测——否则会毁掉已经建立的连接
         let existing = {
