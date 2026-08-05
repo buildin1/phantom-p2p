@@ -10,15 +10,16 @@
 //! 内层协议自己负责可靠性——TCP 本就会重传，UDP 本就允许丢。
 
 use crate::crypto::{ReplayWindow, SessionCrypto};
-use crate::fec::{self, FecDecoder, FecEncoder, Incoming, LossTracker, RedundancyController};
+use crate::repair::{self, LossDetector, LossyFlows, RepairPolicy, SendBuffer, SendQueue};
 use crate::stats::StatsManager;
 use crate::tun::{Ipv4Header, TunDevice, TunError};
 use quinn::Connection;
 use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
@@ -30,20 +31,24 @@ pub type PeerStats = Option<(Arc<StatsManager>, String)>;
 /// TUN 设备 MTU。
 ///
 /// 必须留出 QUIC DATAGRAM 的空间：QUIC 为避免 IP 分片会把数据报限制在
-/// 保守的路径 MTU（典型 ~1200 字节）以内，还要再扣掉两层开销：
-/// - overlay 加密 [`crate::crypto::OVERHEAD`]（8 字节计数器 + 16 字节认证标签）
-/// - FEC 头（数据报 5 字节；校验报 9 字节 + 2 字节长度前缀，是最紧的那一档）
+/// 保守的路径 MTU（典型 ~1200 字节）以内，还要再扣掉 overlay 加密的
+/// [`crate::crypto::OVERHEAD`]（8 字节计数器 + 16 字节认证标签）。
 ///
-/// 最坏情况是**校验报**：`TUN_MTU + OVERHEAD + LEN_PREFIX + PARITY_HEADER_LEN`。
-/// 取 1140 时为 `1140 + 24 + 2 + 9 = 1175`，距 1200 还有 25 字节余量。
+/// 丢包修复层**不增加任何字节**——冗余副本与重传都是原报文的逐字节重发
+/// （见 [`crate::repair`]），所以这里只需覆盖加密开销。
+///
+/// 取 1140 而非更大的值，是为了与 3.0.2 保持一致：混版本房间里两端 MTU
+/// 不同会让内层 MSS 协商结果不可预期，多留的那 20 字节不值得冒这个险。
 ///
 /// **不能直接取 1200**——那样每个满载包加密后都会超限被拒发，
 /// 而这种故障只在真实链路上才暴露，本地环回测不出来。
 /// `full_mtu_packet_still_fits_in_a_quic_datagram` 用断言钉死了这个关系。
 pub const TUN_MTU: u16 = 1140;
 
-/// 分组 flush 巡检间隔。稀疏流量时组攒不满，靠这个巡检按时关组补 parity。
-const FLUSH_TICK: std::time::Duration = std::time::Duration::from_millis(5);
+/// 修复层巡检间隔：驱动冗余副本发送、NACK 轮询、心跳。
+///
+/// 必须远小于 [`repair::FIRST_COPY_DELAY`]，否则副本会被巡检粒度拖慢。
+const REPAIR_TICK: Duration = Duration::from_millis(5);
 
 /// 一个对端的转发句柄。
 ///
@@ -56,42 +61,65 @@ const FLUSH_TICK: std::time::Duration = std::time::Duration::from_millis(5);
 /// 要么入队要么立刻报错，不会像 `write_all` 那样被拥塞卡住。
 /// 因此原先"每对端一条 channel + 专用任务 + 写超时"的整套机制不再需要——
 /// 那套机制本就是为了绕开流写入会阻塞 TUN 读循环的问题。
-/// 一个对端的 FEC 会话状态。
+/// 一个对端的丢包修复会话状态。
 ///
-/// `peer_supports_fec` 由**带内探测**得出（收到对端 HELLO 才置位），
-/// 而不是靠信令协商——见 [`crate::fec`] 模块文档。这样做是失败安全的：
-/// 任何一环出问题都只退回传统格式，而不会把对端看不懂的报文发出去把隧道搞断。
-struct FecSession {
-    peer_supports_fec: AtomicBool,
-    encoder: std::sync::Mutex<FecEncoder>,
-    controller: std::sync::Mutex<RedundancyController>,
+/// `peer_supports` 由**带内探测**得出（收到对端 HELLO 才置位），
+/// 而不是靠信令协商——见 [`crate::repair`] 模块文档。这样做是失败安全的：
+/// 任何一环出问题都只退回"什么都不做"，绝不会把对端看不懂的报文发出去把隧道搞断。
+struct RepairSession {
+    peer_supports: AtomicBool,
+    policy: std::sync::Mutex<RepairPolicy>,
+    /// 已发出报文的留存，供重传与冗余副本使用
+    send_buffer: std::sync::Mutex<SendBuffer>,
+    /// 哪些内层流最近丢过包——冗余只施加在这些流上，而不是全流放大
+    lossy_flows: std::sync::Mutex<LossyFlows>,
+    /// 排程待发的副本（故意延后发送以躲开突发丢包）
+    queue: std::sync::Mutex<SendQueue>,
+    /// 入方向丢包检测
+    detector: std::sync::Mutex<LossDetector>,
+    /// 本端已发出的最大计数器，随心跳告知对端以便它发现尾部丢包
+    highest_sent: AtomicU64,
     /// 本地发送失败计数。用于区分「网络丢包」与「本地发送队列丢包」——
-    /// 后者是拥塞控制把窗口压崩导致的，FEC 完全帮不上忙，得靠调 CC 解决。
+    /// 后者是拥塞窗口耗尽导致的，包根本没上过网络，补包完全帮不上忙。
     send_failures: AtomicU64,
-    parity_sent: AtomicU64,
-    recovered: AtomicU64,
+    copies_sent: AtomicU64,
+    retransmits: AtomicU64,
 }
 
-impl FecSession {
-    fn new() -> Self {
+impl RepairSession {
+    fn new(now: Instant) -> Self {
         Self {
-            peer_supports_fec: AtomicBool::new(false),
-            encoder: std::sync::Mutex::new(FecEncoder::new()),
-            controller: std::sync::Mutex::new(RedundancyController::new(0)),
+            peer_supports: AtomicBool::new(false),
+            policy: std::sync::Mutex::new(RepairPolicy::new()),
+            send_buffer: std::sync::Mutex::new(SendBuffer::new()),
+            lossy_flows: std::sync::Mutex::new(LossyFlows::new()),
+            queue: std::sync::Mutex::new(SendQueue::new()),
+            detector: std::sync::Mutex::new(LossDetector::new(now)),
+            highest_sent: AtomicU64::new(0),
             send_failures: AtomicU64::new(0),
-            parity_sent: AtomicU64::new(0),
-            recovered: AtomicU64::new(0),
+            copies_sent: AtomicU64::new(0),
+            retransmits: AtomicU64::new(0),
         }
     }
 
     fn peer_ready(&self) -> bool {
-        self.peer_supports_fec.load(Ordering::Relaxed)
+        self.peer_supports.load(Ordering::Relaxed)
     }
 
-    /// 首次得知对端支持 FEC 时返回 true（用于只打一次日志）
+    /// 首次得知对端支持修复时返回 true（用于只打一次日志）
     fn mark_peer_ready(&self) -> bool {
-        !self.peer_supports_fec.swap(true, Ordering::Relaxed)
+        !self.peer_supports.swap(true, Ordering::Relaxed)
     }
+}
+
+/// 把内层五元组压成一个哈希。
+///
+/// 发送端要按流决定"这条流要不要加冗余"，但没必要保留完整五元组——
+/// 只需要一个稳定的标识把同一条流认出来。
+fn flow_hash(header: &Ipv4Header, packet: &[u8]) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    flow_key(header, packet).hash(&mut h);
+    h.finish()
 }
 
 #[derive(Clone)]
@@ -100,7 +128,7 @@ struct PeerForwarder {
     /// overlay 端到端加密。中继模式下 QUIC 是逐跳的，中继能看到明文，
     /// 机密性必须由这一层保证。
     crypto: Arc<SessionCrypto>,
-    fec: Arc<FecSession>,
+    repair: Arc<RepairSession>,
     stats: PeerStats,
 }
 
@@ -130,8 +158,9 @@ impl PeerForwarder {
             }
             Err(e) => {
                 // 这里的失败发生在**本机**，包根本没上过网络。
-                // 与网络丢包是两回事，必须分开计数，否则会误判病因。
-                let n = self.fec.send_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                // 与网络丢包是两回事，必须分开计数，否则会误判病因：
+                // 这类丢包补包完全帮不上忙，要靠调拥塞控制解决。
+                let n = self.repair.send_failures.fetch_add(1, Ordering::Relaxed) + 1;
                 if n <= 10 || n % 500 == 0 {
                     warn!(
                         "[TUN] 本地数据报发送失败 #{}（非网络丢包，通常是拥塞窗口耗尽）: {}",
@@ -152,61 +181,113 @@ impl PeerForwarder {
                 return false;
             }
         };
-        // 对端不支持 FEC（旧版本）就走传统格式，保证互通
-        if !self.fec.peer_ready() {
+        // 对端不支持修复（旧版本）：原样发走，零额外开销，保证互通
+        if !self.repair.peer_ready() {
             return self.send_raw(sealed);
         }
 
         let now = Instant::now();
-        let (data, parities) = {
-            let mut enc = self.fec.encoder.lock().unwrap_or_else(|e| e.into_inner());
-            let data = enc.push(&sealed, now);
-            let parities = if enc.should_close(now) {
-                enc.close_group()
-            } else {
-                Vec::new()
-            };
-            (data, parities)
-        };
-        // 数据报立即发出，绝不为了攒组而缓冲——FEC 对正常路径零延迟惩罚
-        let ok = self.send_raw(data);
-        for p in parities {
-            self.fec.parity_sent.fetch_add(1, Ordering::Relaxed);
-            self.send_raw(p);
-        }
-        ok
-    }
+        let counter = crate::crypto::counter_of(&sealed).unwrap_or(0);
+        let flow = Ipv4Header::from_bytes(packet)
+            .map(|h| flow_hash(h, packet))
+            .unwrap_or(0);
 
-    /// 定时巡检：稀疏流量时组攒不满，靠这里按时关组补 parity
-    fn flush_due(&self, now: Instant) {
-        if !self.fec.peer_ready() {
-            return;
-        }
-        let parities = {
-            let mut enc = self.fec.encoder.lock().unwrap_or_else(|e| e.into_inner());
-            if !enc.should_close(now) {
-                return;
-            }
-            enc.close_group()
-        };
-        for p in parities {
-            self.fec.parity_sent.fetch_add(1, Ordering::Relaxed);
-            self.send_raw(p);
-        }
-    }
-
-    /// 把控制器当前档位同步给编码器
-    fn sync_redundancy(&self) {
+        // 档位决定要不要给这个包排冗余副本
         let level = {
-            let c = self
-                .fec
-                .controller
+            let p = self.repair.policy.lock().unwrap_or_else(|e| e.into_inner());
+            p.level()
+        };
+        let protect = level.copies > 0
+            && (level.all_flows || {
+                let f = self
+                    .repair
+                    .lossy_flows
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                f.is_lossy(flow, now)
+            });
+
+        // 留存供重传/副本使用。即使这次不排副本也要存——
+        // 对端随时可能 NACK 它。
+        let stored: Arc<[u8]> = Arc::from(&sealed[..]);
+        {
+            let mut b = self
+                .repair
+                .send_buffer
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            c.current()
+            b.push(counter, flow, stored.clone(), now);
+        }
+        self.repair
+            .highest_sent
+            .fetch_max(counter, Ordering::Relaxed);
+
+        if protect {
+            // 副本**故意延后**：紧跟原包发出的副本，一次持续两个包的突发
+            // 就能把正副两份一起带走，冗余等于白加。
+            let mut q = self.repair.queue.lock().unwrap_or_else(|e| e.into_inner());
+            for i in 0..level.copies {
+                let delay = repair::FIRST_COPY_DELAY + repair::COPY_SPACING * i as u32;
+                q.schedule(now + delay, stored.clone());
+            }
+        }
+
+        // 原包立即发出，绝不为了冗余而缓冲——修复层对正常路径零延迟惩罚
+        self.send_raw(sealed)
+    }
+
+    /// 定时巡检：发出到期的冗余副本
+    fn flush_due(&self, now: Instant) -> usize {
+        let due = {
+            let mut q = self.repair.queue.lock().unwrap_or_else(|e| e.into_inner());
+            q.take_due(now)
         };
-        let mut enc = self.fec.encoder.lock().unwrap_or_else(|e| e.into_inner());
-        enc.set_redundancy(level);
+        let n = due.len();
+        for payload in due {
+            self.repair.copies_sent.fetch_add(1, Ordering::Relaxed);
+            self.send_raw(payload.to_vec());
+        }
+        n
+    }
+
+    /// 应对端请求重传若干报文。
+    ///
+    /// 顺带把这些报文所属的流标记为"最近丢过包"——接收端无法告诉我们
+    /// 哪条流在丢（它连那个包都没收到，看不到五元组），但发送端这里有
+    /// 计数器到流的映射，于是能反推出来，从而只对这些流加冗余。
+    fn retransmit(&self, counters: &[u64], now: Instant) -> usize {
+        // 两把锁分开取，不嵌套——嵌套的取锁顺序一旦和别处相反就是死锁
+        let mut payloads = Vec::new();
+        let mut flows = Vec::new();
+        {
+            let b = self
+                .repair
+                .send_buffer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for c in counters {
+                if let Some((flow, payload)) = b.get(*c) {
+                    flows.push(flow);
+                    payloads.push(payload);
+                }
+            }
+        }
+        {
+            let mut f = self
+                .repair
+                .lossy_flows
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for flow in flows {
+                f.mark(flow, now);
+            }
+        }
+        let n = payloads.len();
+        for p in payloads {
+            self.repair.retransmits.fetch_add(1, Ordering::Relaxed);
+            self.send_raw(p.to_vec());
+        }
+        n
     }
 }
 
@@ -317,7 +398,7 @@ impl TunBridge {
         let forwarder = PeerForwarder {
             conn: conn.clone(),
             crypto,
-            fec: Arc::new(FecSession::new()),
+            repair: Arc::new(RepairSession::new(Instant::now())),
             stats,
         };
         tracing::info!(
@@ -336,20 +417,10 @@ impl TunBridge {
         }
         drop(default);
 
-        // 稀疏流量时分组攒不满，需要独立巡检按时关组补 parity。
+        // 修复层的定时工作必须独立于收包循环：稀疏流量下包与包之间隔着几十毫秒，
+        // 挂在收包上驱动的话，副本发送、NACK 重试、心跳全都会被拖到下一个包才动。
         // 随连接结束自动退出，不会留下孤儿任务。
-        let flusher = forwarder.clone();
-        let flush_conn = conn.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(FLUSH_TICK);
-            loop {
-                tick.tick().await;
-                if flush_conn.close_reason().is_some() {
-                    break;
-                }
-                flusher.flush_due(Instant::now());
-            }
-        });
+        spawn_repair_ticker(forwarder.clone(), conn.clone());
 
         let tun = self.tun.clone();
         let peers = self.peers.clone();
@@ -526,6 +597,126 @@ impl FlowReplayTable {
     }
 }
 
+/// 修复层的定时驱动任务。
+///
+/// 独立于收包循环是必须的：稀疏流量下包与包之间隔着几十毫秒，
+/// 如果把这些定时工作挂在收包上驱动，冗余副本、NACK 重试、心跳
+/// 全都要等到下一个包到达才动——而"下一个包迟迟不来"恰恰就是丢包的场景。
+fn spawn_repair_ticker(sender: PeerForwarder, conn: Connection) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(REPAIR_TICK);
+        let mut last_hello = Instant::now() - repair::HELLO_INTERVAL;
+        let mut last_heartbeat = Instant::now();
+        let mut observed_loss_bp: u16 = 0;
+        let mut last_level = usize::MAX;
+
+        loop {
+            tick.tick().await;
+            if conn.close_reason().is_some() {
+                break;
+            }
+            let now = Instant::now();
+
+            // 能力宣告：1 字节/秒。一直发（而不是协商成功就停）
+            // 是为了让重连或后加入的对端也能学到。
+            if now.duration_since(last_hello) >= repair::HELLO_INTERVAL {
+                last_hello = now;
+                sender.send_raw(repair::hello_datagram());
+            }
+
+            // 到期的冗余副本
+            sender.flush_due(now);
+
+            if sender.repair.peer_ready() {
+                // NACK：请求对端补发已经确认丢失的报文
+                let nack = {
+                    let mut d = sender
+                        .repair
+                        .detector
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    d.poll_nack(now)
+                };
+                if let Some(missing) = nack {
+                    if let Some(datagram) = repair::encode_nack(&missing) {
+                        sender.send_raw(datagram);
+                    }
+                }
+
+                // 心跳：捎带本端已发到第几号（让对端发现尾部丢包），
+                // 以及本端观测到的入方向丢包率（对端据此决定要发几份冗余）。
+                if now.duration_since(last_heartbeat) >= repair::HEARTBEAT_INTERVAL {
+                    last_heartbeat = now;
+                    let highest = sender.repair.highest_sent.load(Ordering::Relaxed);
+                    sender.send_raw(repair::heartbeat_datagram(highest, observed_loss_bp));
+                }
+            }
+
+            // 结算入方向丢包窗口
+            {
+                let mut d = sender
+                    .repair
+                    .detector
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if d.window_due(now) {
+                    observed_loss_bp = d.settle(now);
+                    if observed_loss_bp > 0 {
+                        tracing::info!(
+                            "[修复] 入方向丢包 {:.2}%，累计已补回 {} 个包，待补 {} 个",
+                            observed_loss_bp as f64 / 100.0,
+                            d.repaired_total,
+                            d.pending_holes()
+                        );
+                    }
+                }
+            }
+
+            // 档位维护与过期回收
+            {
+                let mut p = sender
+                    .repair
+                    .policy
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                p.tick(now);
+                let level = p.level_index();
+                if level != last_level {
+                    last_level = level;
+                    let l = p.level();
+                    tracing::info!(
+                        "[修复] 冗余档位 → {}（对端丢包 {:.2}%，每包补发 {} 份，{}）",
+                        level,
+                        p.smoothed_loss_bp() as f64 / 100.0,
+                        l.copies,
+                        if l.all_flows {
+                            "全部流"
+                        } else {
+                            "仅丢过包的流"
+                        }
+                    );
+                }
+            }
+            {
+                let mut b = sender
+                    .repair
+                    .send_buffer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                b.expire(now);
+            }
+            {
+                let mut f = sender
+                    .repair
+                    .lossy_flows
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                f.expire(now);
+            }
+        }
+    });
+}
+
 /// 接收对端数据报，解密后写入 TUN。
 ///
 /// 与旧的流式实现相比，这里**丢包不影响后续包**——数据报之间彼此独立，
@@ -541,36 +732,8 @@ async fn receive_datagrams(
     guest_network: Ipv4Addr,
 ) -> Result<(), String> {
     let mut flows = FlowReplayTable::new();
-    let mut decoder = FecDecoder::new();
-    let mut loss = LossTracker::new(Instant::now());
-    let mut last_hello = Instant::now() - fec::HELLO_INTERVAL;
-    let mut last_feedback = Instant::now();
 
     loop {
-        // HELLO 周期性广播：1 字节/秒，让对端知道我们能收 FEC 格式。
-        // 一直发（而不是协商成功就停）是为了让后加入/重连的对端也能学到。
-        let now = Instant::now();
-        if now.duration_since(last_hello) >= fec::HELLO_INTERVAL {
-            last_hello = now;
-            sender.send_raw(fec::hello_datagram());
-        }
-        // 入方向观测回传给发送端：A→B 的丢包只有 B 能看见，
-        // 但决定 A→B 冗余率的是 A，所以必须由 B 主动反馈。
-        if now.duration_since(last_feedback) >= fec::FEEDBACK_INTERVAL && loss.window_due(now) {
-            last_feedback = now;
-            let recovered_window = std::mem::take(&mut decoder.recovered_window);
-            let report = loss.settle(now, recovered_window);
-            sender.send_raw(report.encode());
-            if report.raw_loss_bp > 0 {
-                tracing::info!(
-                    "[FEC] 入方向观测: 原始丢包 {:.2}% 残余 {:.2}% 本窗口恢复 {} 个",
-                    report.raw_loss_bp as f64 / 100.0,
-                    report.residual_loss_bp as f64 / 100.0,
-                    report.recovered
-                );
-            }
-        }
-
         let datagram = conn.read_datagram().await.map_err(|e| e.to_string())?;
         if let Some((stats, user)) = &sender.stats {
             let (stats, user, n) = (stats.clone(), user.clone(), datagram.len());
@@ -578,73 +741,32 @@ async fn receive_datagrams(
         }
         let now = Instant::now();
 
-        // 同时接受两种格式：传统裸 sealed，以及 FEC 封装。
-        // 判别靠首字节（见 fec 模块文档），旧版本永远落在传统分支。
-        let mut sealed_batch: Vec<Vec<u8>> = Vec::new();
-        if fec::is_fec(&datagram) {
-            match decoder.accept(&datagram, now) {
-                Incoming::Data(sealed) => sealed_batch.push(sealed),
-                Incoming::Parity => {}
-                Incoming::Hello => {
-                    if sender.fec.mark_peer_ready() {
-                        tracing::info!("[FEC] 对端支持前向纠错，本端切换到 FEC 格式发送");
-                        sender.sync_redundancy();
-                    }
-                }
-                Incoming::Control(report) => {
-                    let redundancy = {
-                        let mut c = sender
-                            .fec
-                            .controller
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
-                        c.observe(report, now);
-                        c.tick(now);
-                        c.current()
-                    };
-                    let mut enc = sender.fec.encoder.lock().unwrap_or_else(|e| e.into_inner());
-                    if enc.redundancy() != redundancy {
-                        tracing::info!(
-                            "[FEC] 对端报告丢包 {:.2}%，冗余调整为 k={} r={}（溢价 {}%）",
-                            report.raw_loss_bp as f64 / 100.0,
-                            redundancy.k,
-                            redundancy.r,
-                            redundancy.overhead_pct()
-                        );
-                        enc.set_redundancy(redundancy);
-                    }
-                }
-                Incoming::Invalid => {
-                    debug!("[FEC] 丢弃无法解析的 FEC 数据报 ({} 字节)", datagram.len());
-                }
-            }
-            // 校验分片可能刚好补齐了某个残缺分组
-            for rec in decoder.take_recovered(now) {
-                sealed_batch.push(rec.sealed);
-            }
-        } else {
-            sealed_batch.push(datagram.to_vec());
+        // 控制报文与数据报靠首字节区分（见 repair 模块文档）：
+        // 传统数据报首字节是计数器最高位，恒为 0；控制报文 bit7 恒为 1。
+        // 旧版本永远落在数据分支，不受影响。
+        if repair::is_control(&datagram) {
+            handle_control(&datagram, &sender, now);
+            continue;
         }
 
-        let recovered_now = decoder.recovered_total;
-        if recovered_now > sender.fec.recovered.swap(recovered_now, Ordering::Relaxed) {
-            let n = recovered_now;
-            if n <= 20 || n % 100 == 0 {
-                tracing::info!("[FEC] 累计已从丢包中恢复 {} 个数据报", n);
-            }
-        }
-
-        for sealed in sealed_batch {
+        {
             // 解密失败不是致命错误：可能是认证不通过、或途中损坏。
             // 丢弃这一个包继续跑，绝不能因此中断整条隧道。
-            let (counter, packet) = match sender.crypto.open(&sealed) {
+            let (counter, packet) = match sender.crypto.open(&datagram) {
                 Ok(v) => v,
                 Err(e) => {
                     debug!("[TUN] 丢弃无法解密的数据报: {}", e);
                     continue;
                 }
             };
-            loss.on_received(counter);
+            {
+                let mut d = sender
+                    .repair
+                    .detector
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                d.on_received(counter, now);
+            }
             let len = packet.len();
             if !(20..=MAX_PACKET).contains(&len) {
                 debug!("[TUN] 丢弃长度异常的包: {}", len);
@@ -656,8 +778,10 @@ async fn receive_datagrams(
             // 重放判定按内层流拆分（见 FlowKey 文档），必须在这里、拿到
             // 明文之后才能做——五元组在解密前是不可见的。
             //
-            // 这一步同时天然完成了 FEC 的去重：一个包如果既直达、又被恢复出来，
-            // 第二份会被当作重放丢掉，不需要额外的去重逻辑。
+            // 这一步同时天然完成了修复层的去重：冗余副本与重传都是原报文的
+            // 逐字节重发、计数器相同，第二份会被当作重放丢掉。
+            // 于是**本地 TUN 永远只收到每个 IP 包恰好一份**，多倍包只存在于
+            // P2P 双端之间——这是不能破坏的性质。
             let key = flow_key(header, &packet);
             if !flows.accept(key, counter) {
                 debug!("[TUN] 丢弃重复/过旧的 overlay 报文 (counter={counter})");
@@ -703,6 +827,51 @@ async fn receive_datagrams(
             }
         }
     }
+}
+
+/// 处理修复层的控制报文。
+///
+/// 控制报文**永远不会**被写进 TUN——它们不是用户数据，只是双端之间的协调信息。
+fn handle_control(datagram: &[u8], sender: &PeerForwarder, now: Instant) {
+    // HELLO：对端宣告它支持丢包修复
+    if datagram.len() == 1 && datagram[0] == repair::CTRL_MARKER | repair::CTRL_HELLO {
+        if sender.repair.mark_peer_ready() {
+            tracing::info!("[修复] 对端支持丢包修复，本端启用补包");
+        }
+        return;
+    }
+
+    // NACK：对端请求补发若干报文
+    if let Some(missing) = repair::decode_nack(datagram) {
+        let n = sender.retransmit(&missing, now);
+        if n > 0 {
+            debug!("[修复] 应对端请求补发 {}/{} 个报文", n, missing.len());
+        }
+        return;
+    }
+
+    // 心跳：对端已发到第几号（用于发现尾部丢包）+ 它观测到的入方向丢包率
+    if let Some((peer_highest, peer_loss_bp)) = repair::parse_heartbeat(datagram) {
+        {
+            let mut d = sender
+                .repair
+                .detector
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            d.observe_peer_highest(peer_highest, now);
+        }
+        // 对端报告的是**它那一侧**的入方向丢包，也就是本端发出去的包丢了多少——
+        // 所以这个数字该用来调整**本端**的冗余强度。
+        let mut p = sender
+            .repair
+            .policy
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        p.observe(peer_loss_bp, now);
+        return;
+    }
+
+    debug!("[修复] 丢弃无法解析的控制报文 ({} 字节)", datagram.len());
 }
 
 fn packet_protocol(packet: &[u8]) -> String {
@@ -799,37 +968,38 @@ mod tests {
         assert!(!same_prefix24(Ipv4Addr::new(172, 24, 0, 1), guest_network));
     }
 
-    /// 一个满 MTU 的包加上 overlay 加密与 FEC 开销后，必须仍能塞进 QUIC 数据报。
+    /// 一个满 MTU 的包加上 overlay 加密开销后，必须仍能塞进 QUIC 数据报。
     ///
     /// QUIC 为避免 IP 分片会把数据报限制在保守的路径 MTU 内（典型 1200 左右）。
     /// 这个关系一旦破坏，**每一个满载包都会被拒发**——而且只在真实链路上
     /// 才暴露，本地环回测不出来，所以在这里用断言钉死。
-    ///
-    /// 最紧的一档是**校验报**：它总是满长度的（数据报可以按原始长度发，
-    /// 但 parity 必须补齐到分组内最大分片）。
     #[test]
     fn full_mtu_packet_still_fits_in_a_quic_datagram() {
         // QUIC 在 IPv6 最小 MTU(1280) 下扣掉包头后的保守可用值
         const CONSERVATIVE_QUIC_DATAGRAM_LIMIT: usize = 1200;
         let sealed = TUN_MTU as usize + crate::crypto::OVERHEAD;
-
-        let data_case = sealed + crate::fec::DATA_HEADER_LEN;
         assert!(
-            data_case <= CONSERVATIVE_QUIC_DATAGRAM_LIMIT,
-            "满载数据报 {} 超出 QUIC 保守上限 {}",
-            data_case,
-            CONSERVATIVE_QUIC_DATAGRAM_LIMIT
-        );
-
-        // 校验报 = FEC 校验头 + 分片(2 字节长度前缀 + sealed)
-        let parity_case = crate::fec::PARITY_HEADER_LEN + 2 + sealed;
-        assert!(
-            parity_case <= CONSERVATIVE_QUIC_DATAGRAM_LIMIT,
-            "满载校验报 {} 超出 QUIC 保守上限 {}（TUN_MTU={} 需下调）",
-            parity_case,
+            sealed <= CONSERVATIVE_QUIC_DATAGRAM_LIMIT,
+            "满载数据报 {} 超出 QUIC 保守上限 {}（TUN_MTU={} 需下调）",
+            sealed,
             CONSERVATIVE_QUIC_DATAGRAM_LIMIT,
             TUN_MTU
         );
+    }
+
+    /// 修复层不得给数据报增加任何字节：冗余副本与重传都是原报文的逐字节重发。
+    ///
+    /// 一旦有人给数据报加了头部，满载包就可能超限被拒发，而这种故障
+    /// 只在真实链路上才暴露。这条断言把"修复层零字节开销"这个前提钉死。
+    #[test]
+    fn repair_layer_adds_no_bytes_to_data_path() {
+        let sealed = vec![0u8; TUN_MTU as usize + crate::crypto::OVERHEAD];
+        assert!(
+            !crate::repair::is_control(&sealed),
+            "数据报绝不能被当成控制报文"
+        );
+        // 控制报文是独立的报文，不寄生在数据报里
+        assert!(crate::repair::is_control(&crate::repair::hello_datagram()));
     }
 
     /// MTU 也不能定得过小，否则每个 IP 包都要被内层协议分片，白白浪费带宽
