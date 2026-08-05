@@ -30,7 +30,6 @@ pub fn ensure_rustls_crypto_provider() -> Result<(), String> {
 
 pub mod config;
 pub mod crypto;
-pub mod fec;
 pub mod ice;
 pub mod identity;
 pub mod log_upload;
@@ -40,6 +39,7 @@ pub mod network;
 pub mod network_info;
 pub mod punch;
 pub mod puncher;
+pub mod repair;
 pub mod runtime;
 pub mod signal;
 pub mod stats;
