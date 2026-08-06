@@ -62,15 +62,38 @@ struct PeerForwarder {
     stats: PeerStats,
 }
 
+/// 一个窗口至少要攒够这么多样本才结算。
+///
+/// 丢包率是抽样估计，方差随样本数下降。50 个样本时，真实 5% 的链路单窗口
+/// 读数在 2%~8% 之间跳都属正常（标准误约 3 个百分点）。样本再少就纯粹是噪声，
+/// 报出去只会让人追着假数字排查。
+const MIN_LOSS_SAMPLES: u64 = 50;
+
+/// 攒样本最多等这么久。稀疏流量下宁可报一个粗糙的数，也不能一直不报。
+const MAX_LOSS_WINDOW: Duration = Duration::from_secs(10);
+
 /// 基于 overlay 计数器空洞的**入方向**丢包测量。
 ///
 /// 数据面从 TCP 代理迁到 TUN + DATAGRAM 之后，唯一还在上报的丢包口径是 QUIC
 /// 的路径统计，而那测的是**出方向**。真正影响体验的"对端发来、我没收到"
 /// 只能靠计数器空洞算——计数器是发送端在加密时打上的，中继换几段也不影响，
 /// 天然是端到端、入方向的。
+///
+/// # 这个测量做不到什么
+///
+/// 它只能看见**落在已观测序号区间内**的空洞，因此：
+///
+/// - **尾部丢包看不见**：如果对端最后发的几个包全丢了，本端根本不知道那些序号
+///   存在过。要补上这一块，需要对端在心跳里带上"我已发到第几号"。
+/// - **分不清"对端没发"和"全丢了"**：两种情况本端观测到的都是"没有新序号"。
+///   因此空闲窗口一律**不报**——报 100% 会在玩家静止时刷满假丢包。
+/// - **不是精确值而是估计值**：见 [`MIN_LOSS_SAMPLES`]。
 struct LossMeter {
+    /// 本窗口见过的最大计数器
     highest: u64,
+    /// 本窗口内首次见到的序号数
     received: u64,
+    /// 本窗口的起始计数器
     window_start: u64,
     window_began: Instant,
     started: bool,
@@ -87,28 +110,52 @@ impl LossMeter {
         }
     }
 
-    fn on_received(&mut self, counter: u64) {
+    fn on_received(&mut self, counter: u64, now: Instant) {
         if !self.started {
             self.started = true;
             self.highest = counter;
             self.window_start = counter;
+            // 计时从**第一个包**算起，而不是从构造算起：
+            // 否则连接刚建立那段空等也被算进窗口，首个读数会只有几个样本。
+            self.window_began = now;
+        }
+        // 上一个窗口的迟到包不属于本窗口。计进来会稀释本窗口的丢包率，
+        // 让真实丢包被"看起来收到了更多包"掩盖掉。
+        if counter < self.window_start {
+            return;
         }
         self.highest = self.highest.max(counter);
         self.received += 1;
     }
 
-    /// 窗口到期则结算，返回丢包率（万分之一）
+    /// 窗口到期且样本足够时结算，返回丢包率（万分之一）。
+    ///
+    /// 返回 `None` 表示**这次没有可信的观测**——可能是还没到期、样本不够，
+    /// 或者链路空闲。绝不能把这些情况当成 0% 或 100%。
     fn poll(&mut self, now: Instant) -> Option<u16> {
-        if !self.started || now.duration_since(self.window_began) < LOSS_WINDOW {
+        if !self.started {
             return None;
         }
-        let span = self.highest.saturating_sub(self.window_start) + 1;
+        let elapsed = now.duration_since(self.window_began);
+        if elapsed < LOSS_WINDOW {
+            return None;
+        }
+
+        // 本窗口没有任何新序号：对端可能只是没发东西。
+        // 这两种情况在本端是不可区分的，所以不报，并把计时重新开始。
+        if self.received == 0 || self.highest < self.window_start {
+            self.window_began = now;
+            return None;
+        }
+
+        let span = self.highest - self.window_start + 1;
+        // 样本不够就继续攒，不重置窗口——除非已经等得太久。
+        if span < MIN_LOSS_SAMPLES && elapsed < MAX_LOSS_WINDOW {
+            return None;
+        }
+
         let received = self.received.min(span);
-        let bp = if span == 0 {
-            0
-        } else {
-            (((span - received).saturating_mul(10_000)) / span).min(10_000) as u16
-        };
+        let bp = (((span - received).saturating_mul(10_000)) / span).min(10_000) as u16;
         self.window_start = self.highest + 1;
         self.received = 0;
         self.window_began = now;
@@ -504,8 +551,9 @@ async fn receive_datagrams(
         };
         // 计数器空洞就是入方向丢包，必须在重放判定**之前**记——
         // 重放判定会把重复包挡掉，放在后面就统计不到真实到达情况了。
-        loss.on_received(counter);
-        if let Some(bp) = loss.poll(Instant::now()) {
+        let now = Instant::now();
+        loss.on_received(counter, now);
+        if let Some(bp) = loss.poll(now) {
             if let Some((stats, user)) = &sender.stats {
                 let (stats, user) = (stats.clone(), user.clone());
                 tokio::spawn(async move { stats.update_inbound_loss(&user, bp).await });
@@ -702,9 +750,9 @@ mod tests {
     fn loss_meter_measures_counter_gaps() {
         let t = Instant::now();
         let mut m = LossMeter::new(t);
-        // 0..100 只收到偶数，即丢一半
-        for c in (0..100u64).step_by(2) {
-            m.on_received(c);
+        // 0..200 只收到偶数，即丢一半
+        for c in (0..200u64).step_by(2) {
+            m.on_received(c, t);
         }
         let bp = m.poll(t + LOSS_WINDOW).expect("窗口到期应结算");
         assert!(
@@ -718,18 +766,97 @@ mod tests {
     fn loss_meter_reports_zero_on_clean_link() {
         let t = Instant::now();
         let mut m = LossMeter::new(t);
-        for c in 0..100u64 {
-            m.on_received(c);
+        for c in 0..200u64 {
+            m.on_received(c, t);
         }
         assert_eq!(m.poll(t + LOSS_WINDOW), Some(0));
     }
 
-    /// 窗口没到期不该结算，否则样本太少、丢包率全是噪声
+    /// **空闲不是丢包。**
+    ///
+    /// 本端观测到"没有新序号"时，无法区分对端没发和全丢了。此前的实现会
+    /// 直接报 100%，于是玩家一站着不动、一开菜单，界面就刷满假丢包。
+    #[test]
+    fn idle_link_must_not_be_reported_as_total_loss() {
+        let t = Instant::now();
+        let mut m = LossMeter::new(t);
+        for c in 0..200u64 {
+            m.on_received(c, t);
+        }
+        assert_eq!(m.poll(t + LOSS_WINDOW), Some(0), "先正常结算一次");
+
+        // 之后对端安静下来，一个包都不发
+        let idle = t + LOSS_WINDOW * 3;
+        assert_eq!(m.poll(idle), None, "空闲窗口不得报成 100% 丢包");
+        assert_eq!(m.poll(idle + LOSS_WINDOW * 2), None, "持续空闲同样不报");
+    }
+
+    /// 样本太少时估计的方差比数值本身还大，不能报
+    #[test]
+    fn loss_meter_needs_enough_samples() {
+        let t = Instant::now();
+        let mut m = LossMeter::new(t);
+        for c in 0..5u64 {
+            m.on_received(c, t);
+        }
+        assert_eq!(
+            m.poll(t + LOSS_WINDOW),
+            None,
+            "5 个样本算出的丢包率纯粹是噪声"
+        );
+        // 攒够之后才结算
+        for c in 5..MIN_LOSS_SAMPLES + 5 {
+            m.on_received(c, t);
+        }
+        assert!(m.poll(t + LOSS_WINDOW).is_some(), "样本够了就该结算");
+    }
+
+    /// 稀疏流量下不能永远攒不够就一直不报
+    #[test]
+    fn loss_meter_settles_eventually_even_when_sparse() {
+        let t = Instant::now();
+        let mut m = LossMeter::new(t);
+        for c in 0..5u64 {
+            m.on_received(c, t);
+        }
+        assert!(
+            m.poll(t + MAX_LOSS_WINDOW).is_some(),
+            "等得够久就该报，哪怕样本少"
+        );
+    }
+
+    /// 上一个窗口的迟到包会稀释本窗口的丢包率，必须排除
+    #[test]
+    fn late_packets_from_the_previous_window_are_ignored() {
+        let t = Instant::now();
+        let mut m = LossMeter::new(t);
+        for c in 0..200u64 {
+            m.on_received(c, t);
+        }
+        m.poll(t + LOSS_WINDOW);
+
+        // 新窗口：201..400 丢一半，同时混入几个上个窗口的迟到包
+        let t2 = t + LOSS_WINDOW;
+        for c in (201..400u64).step_by(2) {
+            m.on_received(c, t2);
+        }
+        for late in [3u64, 17, 42] {
+            m.on_received(late, t2);
+        }
+        let bp = m.poll(t2 + LOSS_WINDOW).expect("应结算");
+        assert!(
+            (4700..=5200).contains(&bp),
+            "迟到包不该把丢包率冲淡，实得 {}bp",
+            bp
+        );
+    }
+
+    /// 窗口没到期不该结算
     #[test]
     fn loss_meter_waits_for_the_window() {
         let t = Instant::now();
         let mut m = LossMeter::new(t);
-        m.on_received(0);
+        m.on_received(0, t);
         assert_eq!(m.poll(t), None);
     }
 
