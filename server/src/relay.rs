@@ -186,10 +186,6 @@ pub async fn start_quic_relay(bind_port: u16, registry: SharedRegistry) -> Resul
     let mut transport = quinn::TransportConfig::default();
     transport.max_concurrent_bidi_streams(4096u32.into());
     transport.keep_alive_interval(Some(Duration::from_secs(10)));
-    // 数据面走 DATAGRAM（见 phantom_core::tun_bridge），中继必须收得下：
-    // 缓冲太小会在突发时把包丢在中继自己手上，看起来像网络丢包，极难排查。
-    transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
-    transport.datagram_send_buffer_size(8 * 1024 * 1024);
     server_config.transport_config(Arc::new(transport));
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", bind_port).parse().unwrap();
@@ -458,37 +454,6 @@ async fn handle_guest_conn(
 ///
 /// 注意：relay_streams 本身是双向的（a_recv→b_send, b_recv→a_send），
 /// 所以一个流就实现了 Guest↔Host 全双工通信。
-/// 单向盲转发 QUIC 数据报。
-///
-/// **中继必须转发 datagram**，因为客户端的三层数据面（`phantom_core::tun_bridge`）
-/// 完全走 DATAGRAM 而不是流——只转发流的话中继模式下隧道根本不通。
-///
-/// 中继在这里是**纯盲转发器**：载荷由 overlay 层端到端加密（`phantom_core::crypto`），
-/// 前向纠错的分组头虽然是明文，中继也不需要理解——FEC 闭环完全在两个客户端之间完成，
-/// 中继零状态、零 CPU 开销。
-fn spawn_datagram_relay(from: quinn::Connection, to: quinn::Connection, label: &'static str) {
-    tokio::spawn(async move {
-        loop {
-            match from.read_datagram().await {
-                Ok(datagram) => {
-                    if let Err(e) = to.send_datagram(datagram) {
-                        // 对端缓冲满或连接已关：丢这一个继续跑，
-                        // 数据面本就是不可靠语义，不该因此拆掉整条桥。
-                        debug!("[中继桥接] {} 数据报转发失败: {}", label, e);
-                        if to.close_reason().is_some() {
-                            break;
-                        }
-                    }
-                }
-                Err(e) => {
-                    debug!("[中继桥接] {} 数据报来源结束: {}", label, e);
-                    break;
-                }
-            }
-        }
-    });
-}
-
 async fn bridge_guest_to_host(guest_conn: quinn::Connection, host_conn: quinn::Connection) {
     let remote_guest = guest_conn.remote_address();
     let remote_host = host_conn.remote_address();
@@ -496,10 +461,6 @@ async fn bridge_guest_to_host(guest_conn: quinn::Connection, host_conn: quinn::C
         "[中继桥接] Guest({}) ↔ Host({}) 开始",
         remote_guest, remote_host
     );
-
-    // 三层数据面走 DATAGRAM，必须双向盲转发
-    spawn_datagram_relay(guest_conn.clone(), host_conn.clone(), "Guest→Host");
-    spawn_datagram_relay(host_conn.clone(), guest_conn.clone(), "Host→Guest");
 
     loop {
         match guest_conn.accept_bi().await {

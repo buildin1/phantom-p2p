@@ -105,15 +105,6 @@ pub struct RelayConfig {
     pub quic_port: u16,
     #[serde(default = "default_token_ttl")]
     pub token_ttl_secs: u64,
-    /// 同时允许多少个房间借用中继**补包**。
-    ///
-    /// 中继的硬约束是带宽而不是连接数，所以这里用并发授权数给带宽封顶：
-    /// 补包只占丢包率那一小部分流量（30% 丢包的 5Mbps 房间约 1.5Mbps），
-    /// 比整体切中继省数倍，同样的带宽能照顾更多房间。
-    /// 排满之后新的求援会被拒绝，客户端退回纯 P2P 补包，尽力而为——
-    /// 宁可让一个房间体验差一点，也不能让所有房间一起被拖垮。
-    #[serde(default = "default_max_assist_rooms")]
-    pub max_assist_rooms: usize,
 }
 
 /// 端口分配配置
@@ -179,10 +170,6 @@ fn default_guest_port_end() -> u16 {
 }
 fn default_token_ttl() -> u64 {
     120
-}
-/// 按 50Mbps 中继、单房间补包约 1.5Mbps 估算，留足余量取 24
-fn default_max_assist_rooms() -> usize {
-    24
 }
 fn default_true() -> bool {
     true
@@ -250,7 +237,6 @@ impl Default for RelayConfig {
             public_addr: default_relay_addr(),
             quic_port: default_relay_quic_port(),
             token_ttl_secs: default_token_ttl(),
-            max_assist_rooms: default_max_assist_rooms(),
         }
     }
 }

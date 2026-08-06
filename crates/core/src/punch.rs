@@ -206,9 +206,6 @@ pub fn probe(
         identity_public: identity.public_key_bytes(),
     };
 
-    // 记下当前网络，供丢包修复层按环境读写风控校准结果
-    crate::repair::set_current_network(profile.public_ip.as_deref());
-
     let gather_ms = started.elapsed().as_millis() as u32;
     info!(
         "[打洞] NAT 画像: class={:?} step={} 置信度={:.0}% base_port={} ipv6={} 候选={} 个 耗时={}ms",

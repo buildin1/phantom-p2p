@@ -27,13 +27,7 @@ use serde::{Deserialize, Serialize};
 /// 客户端在 [`ClientMessage::Auth`] 中声明，服务端不匹配则回
 /// [`ServerMessage::VersionMismatch`]。**任何消息结构变更都必须递增此值**，
 /// 否则会出现难以定位的反序列化失败。
-///
-/// - `4`：数据面引入中继 DATAGRAM 转发。中继必须转发 DATAGRAM，
-///   旧中继无法承载新数据面，故递增版本挡住不匹配的组合。
-/// - `5`：新增中继补包求援（`RelayAssistRequest` 等）。丢包修复本身靠
-///   **带内探测**协商（见 `phantom_core::repair`），与旧客户端可自动回退；
-///   但求援需要服务端参与带宽调度，旧服务端不认识这些消息。
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 // ============================================================
 // ICE 候选
@@ -568,21 +562,6 @@ pub enum ClientMessage {
     #[serde(rename = "relay_upgrade_request")]
     RelayUpgradeRequest,
 
-    /// 求援：P2P 直连丢包已经补不回来了，申请借用中继**只用来补包**。
-    ///
-    /// 与 [`RelayUpgradeRequest`] 的区别是不切走全部流量：原包继续走 P2P，
-    /// 只有补包走中继。同样丢包程度下中继带宽占用低数倍，
-    /// 所以服务端能同时照顾更多房间。
-    #[serde(rename = "relay_assist_request")]
-    RelayAssistRequest {
-        /// 本端观测到的入方向丢包率（万分之一），供服务端评估该放行多少
-        loss_bp: u16,
-    },
-
-    /// 补包不再需要中继（链路恢复），主动交还额度
-    #[serde(rename = "relay_assist_release")]
-    RelayAssistRelease,
-
     /// Request a persistent virtual address for future Host rooms.
     #[serde(rename = "request_fixed_host_ip")]
     RequestFixedHostIp,
@@ -730,22 +709,6 @@ pub enum ServerMessage {
         relay_quic_port: u16,
         token: String,
     },
-
-    /// 求援获准：可以借用中继补包
-    #[serde(rename = "relay_assist_granted")]
-    RelayAssistGranted {
-        relay_addr: String,
-        relay_quic_port: u16,
-        token: String,
-    },
-
-    /// 求援被拒（通常是中继带宽已经排满）。
-    ///
-    /// 被拒不是错误：客户端退回纯 P2P 补包，尽力而为。
-    /// 带宽是中继的硬约束，宁可让一个房间体验差一点，
-    /// 也不能让所有房间一起被拖垮。
-    #[serde(rename = "relay_assist_denied")]
-    RelayAssistDenied { reason: String },
 
     /// **阶段一响应**：下发打洞计划（策略、本端参数、对端画像）。
     ///
