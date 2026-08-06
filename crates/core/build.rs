@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 /// Reads the repo-root `official.env` file and injects a single
-/// `OFFICIAL_SIGNAL_SERVER` compile-time env var (e.g. `ws://qx.coreyuan.cn:10112`)
+/// `OFFICIAL_SIGNAL_SERVER` compile-time env var (e.g. `ws://quic.coreyuan.cn:60368`)
 /// so `USER_MODE_SIGNAL_SERVER` in `src/config.rs` doesn't have to hardcode the
 /// official signaling address as a string literal.
 ///

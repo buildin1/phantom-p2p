@@ -142,7 +142,7 @@ fn default_bind() -> String {
     "0.0.0.0".to_string()
 }
 fn default_signal_port() -> u16 {
-    10209
+    60368
 }
 fn default_relay_addr() -> String {
     "127.0.0.1".to_string()
