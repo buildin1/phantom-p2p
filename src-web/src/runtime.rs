@@ -517,17 +517,6 @@ impl HeadlessRuntime {
     }
 
     async fn start_punch(&self) -> Result<(), String> {
-        // 开发者模式的强制中继：跳过打洞直接要中继。
-        //
-        // 存在的意义是**能单独测中继链路**——打洞几乎总会成功，中继路径平时
-        // 根本走不到，出了问题也无从复现。非开发者模式下这个开关会被
-        // `apply_mode_policy` 强制关掉，普通用户不受影响。
-        if self.config.read().await.force_relay_mode {
-            tracing::warn!("[开发者模式] 强制中继已开启，跳过 P2P 打洞直接申请中继");
-            self.emit("punch:forced_relay", json!({ "enabled": true }));
-            return self.signal.send(ClientMessage::RelayRequest).await;
-        }
-
         // Host 的 socket 是长期存活的，已有候选就直接复用重报，
         // 不要重新探测——否则会毁掉已经建立的连接
         let existing = {
@@ -646,6 +635,27 @@ impl HeadlessRuntime {
             }
         };
 
+        // 开发者模式的强制中继：会话密钥在阶段二 `on_plan` 就已经通过双方
+        // 交换的临时公钥派生完毕，跟真的去打洞完全无关——这里直接跳过
+        // `session.run()`（真实 UDP 打洞尝试），当成一次打洞失败处理，
+        // 复用下面已有的"失败就回退中继"逻辑，不用另起一套中继连接代码。
+        if self.config.read().await.force_relay_mode {
+            self.state.lock().await.peer_crypto = session.crypto();
+            tracing::warn!("[开发者模式] 强制中继已开启，跳过 P2P 打洞");
+            self.emit(
+                "punch:phase",
+                puncher::PunchPhase::Failed {
+                    reason: "开发者模式已开启强制中继".into(),
+                },
+            );
+            if let Some(relay) = self.state.lock().await.relay.clone() {
+                if let Err(error) = self.start_relay(relay).await {
+                    self.emit("tunnel:failed", json!({"mode": "Relay", "reason": error}));
+                }
+            }
+            return;
+        }
+
         self.emit("punch:phase", puncher::PunchPhase::Punching);
         let outcome = session.run(peer_candidates, start_delay_ms, ctx).await;
 
@@ -661,6 +671,9 @@ impl HeadlessRuntime {
         }
 
         let Some(success) = outcome.success else {
+            // 数据面必须用这把密钥；没有它就只能明文，宁可不建隧道。
+            // 打洞失败时同样要写回——接下来就是走中继回退，中继同样需要它。
+            self.state.lock().await.peer_crypto = outcome.crypto.clone();
             if is_host {
                 if let Some(peer) = self.state.lock().await.host_peers.remove(&peer_session_id) {
                     if let Some(endpoint) = peer.endpoint {
