@@ -93,7 +93,6 @@ impl EphemeralKeypair {
             tx: ChaCha20Poly1305::new(Key::from_slice(&tx_key)),
             rx: ChaCha20Poly1305::new(Key::from_slice(&rx_key)),
             tx_counter: AtomicU64::new(0),
-            replay: parking_lot_free::ReplayWindow::new(),
         }
     }
 }
@@ -103,7 +102,6 @@ pub struct SessionCrypto {
     tx: ChaCha20Poly1305,
     rx: ChaCha20Poly1305,
     tx_counter: AtomicU64,
-    replay: parking_lot_free::ReplayWindow,
 }
 
 impl SessionCrypto {
@@ -129,19 +127,26 @@ impl SessionCrypto {
         Ok(out)
     }
 
-    /// 解密一个 overlay 报文，同时做重放检测。
-    pub fn open(&self, packet: &[u8]) -> Result<Vec<u8>, String> {
+    /// 解密一个 overlay 报文。**不做重放判定**，把计数器随明文一起交还调用方。
+    ///
+    /// # 为什么重放判定不能放在这里
+    ///
+    /// 计数器是整条隧道会话共享的（同一把密钥下 nonce 不能重复），但隧道里同时
+    /// 复用着多条互不相关的内层流量。若重放窗口也按会话全局维护，一条流的突发
+    /// 就会把窗口整体往前推，导致另一条几乎静默的流延迟到达的**合法**包被判成
+    /// "已滑出窗口"而丢弃——这不是攻击，只是正常的多路复用乱序。
+    ///
+    /// 实测后果：突发流量（例如同时在传文件）之后，游戏流量开始被成片丢弃，
+    /// 积累到心跳也被误伤时，看门狗判定连接已死，整条隧道掉线重连。
+    ///
+    /// 调用方拿到明文后能看到内层 IP 头，按五元组把窗口拆开维护即可。
+    pub fn open(&self, packet: &[u8]) -> Result<(u64, Vec<u8>), String> {
         if packet.len() < OVERHEAD {
             return Err("overlay 报文过短".to_string());
         }
         let mut c = [0u8; COUNTER_LEN];
         c.copy_from_slice(&packet[..COUNTER_LEN]);
         let counter = u64::from_be_bytes(c);
-
-        // 先查重放再解密：省掉对重复包做无谓的 AEAD 运算
-        if !self.replay.check(counter) {
-            return Err(format!("overlay 报文重放或过旧 (counter={counter})"));
-        }
 
         let nonce = nonce_from(counter);
         let pt = self
@@ -155,8 +160,7 @@ impl SessionCrypto {
             )
             .map_err(|_| "overlay 解密失败（认证不通过）".to_string())?;
 
-        self.replay.accept(counter);
-        Ok(pt)
+        Ok((counter, pt))
     }
 }
 
@@ -171,19 +175,21 @@ fn nonce_from(counter: u64) -> Nonce {
 ///
 /// 独立成模块只是为了把位运算的细节圈起来——DATAGRAM 天然乱序，
 /// 这里必须容忍窗口内的任意顺序，只拒绝重复与过旧的包。
+pub(crate) use parking_lot_free::ReplayWindow;
+
 mod parking_lot_free {
     use super::REPLAY_WINDOW;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
 
-    pub struct ReplayWindow {
+    pub(crate) struct ReplayWindow {
         highest: AtomicU64,
         /// 位图：记录 `highest` 往前 REPLAY_WINDOW 个序号的到达情况
         seen: Mutex<Vec<u64>>,
     }
 
     impl ReplayWindow {
-        pub fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 highest: AtomicU64::new(0),
                 seen: Mutex::new(vec![0u64; (REPLAY_WINDOW / 64) as usize]),
@@ -191,7 +197,7 @@ mod parking_lot_free {
         }
 
         /// 该序号是否可接受（未见过且未过旧）
-        pub fn check(&self, counter: u64) -> bool {
+        pub(crate) fn check(&self, counter: u64) -> bool {
             let highest = self.highest.load(Ordering::Relaxed);
             if counter + REPLAY_WINDOW < highest {
                 return false; // 太旧，已滑出窗口
@@ -201,14 +207,27 @@ mod parking_lot_free {
         }
 
         /// 标记该序号已接收
-        pub fn accept(&self, counter: u64) {
+        pub(crate) fn accept(&self, counter: u64) {
             let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
             let highest = self.highest.load(Ordering::Relaxed);
             if counter > highest {
-                // 窗口前移，清掉滑出去的位
-                for c in (highest + 1)..=counter {
-                    if c >= REPLAY_WINDOW {
-                        Self::clear(&mut seen, c - REPLAY_WINDOW);
+                if counter - highest >= REPLAY_WINDOW {
+                    // 跳跃超过整个窗口宽度：位图里每一位记的都是已经过时的历史，
+                    // 逐位回收等于白转一整圈，直接清空。
+                    //
+                    // 这条快路径对**按流拆分**是必需的：每条流的窗口是第一次见到
+                    // 该流时才建的，而计数器整条会话共享，所以它的第一个包计数器
+                    // 可能已经是几十万——没有这条，accept 会退化成 O(counter) 的循环，
+                    // 一条新流就能把收包线程卡死。
+                    for w in seen.iter_mut() {
+                        *w = 0;
+                    }
+                } else {
+                    // 窗口前移，只清掉滑出去的那部分位
+                    for c in (highest + 1)..=counter {
+                        if c >= REPLAY_WINDOW {
+                            Self::clear(&mut seen, c - REPLAY_WINDOW);
+                        }
                     }
                 }
                 self.highest.store(counter, Ordering::Relaxed);
@@ -253,11 +272,11 @@ mod tests {
         let (a, b) = pair();
         let msg = b"the quick brown fox jumps over the lazy dog";
         let sealed = a.seal(msg).unwrap();
-        assert_eq!(b.open(&sealed).unwrap(), msg);
+        assert_eq!(b.open(&sealed).unwrap().1, msg);
 
         // 反方向同样要通
         let sealed = b.seal(msg).unwrap();
-        assert_eq!(a.open(&sealed).unwrap(), msg);
+        assert_eq!(a.open(&sealed).unwrap().1, msg);
     }
 
     /// 双方必须派生出**相反**的角色，否则会各自用同一把密钥发送，
@@ -299,37 +318,58 @@ mod tests {
         assert!(b.open(&sealed).is_err());
     }
 
+    /// `open` 只负责认证解密，重放判定已移交调用方按内层流处理，
+    /// 所以同一个密文能被反复解开——去重是上层的事。
     #[test]
-    fn replay_is_rejected() {
+    fn open_no_longer_rejects_replays_itself() {
         let (a, b) = pair();
         let sealed = a.seal(b"once").unwrap();
         assert!(b.open(&sealed).is_ok());
-        assert!(b.open(&sealed).is_err(), "同一个包不能被接受两次");
+        assert!(
+            b.open(&sealed).is_ok(),
+            "重放判定已交给调用方，open 本身不该再拒绝"
+        );
+    }
+
+    #[test]
+    fn replay_window_rejects_duplicates() {
+        let w = ReplayWindow::new();
+        assert!(w.check(10));
+        w.accept(10);
+        assert!(!w.check(10), "重复序号必须被拒绝");
     }
 
     /// DATAGRAM 天然乱序，窗口内的任意顺序都必须接受
     #[test]
-    fn out_of_order_within_window_is_accepted() {
-        let (a, b) = pair();
-        let packets: Vec<Vec<u8>> = (0..64).map(|i| a.seal(&[i as u8; 32]).unwrap()).collect();
-        // 逆序投递
-        for p in packets.iter().rev() {
-            assert!(b.open(p).is_ok(), "窗口内乱序不应被拒");
+    fn replay_window_accepts_any_order_inside_window() {
+        let w = ReplayWindow::new();
+        for c in (0..64).rev() {
+            assert!(w.check(c), "窗口内乱序不应被拒");
+            w.accept(c);
         }
-        // 但重复仍要拒
-        assert!(b.open(&packets[10]).is_err());
+        assert!(!w.check(10), "但重复仍要拒");
     }
 
     #[test]
-    fn very_old_packets_fall_out_of_window() {
-        let (a, b) = pair();
-        let first = a.seal(b"old").unwrap();
-        // 推进窗口远超宽度
-        for _ in 0..(REPLAY_WINDOW + 64) {
-            let p = a.seal(b"x").unwrap();
-            let _ = b.open(&p);
-        }
-        assert!(b.open(&first).is_err(), "滑出窗口的包应被丢弃");
+    fn replay_window_drops_packets_that_slid_out() {
+        let w = ReplayWindow::new();
+        w.accept(0);
+        w.accept(REPLAY_WINDOW + 64);
+        assert!(!w.check(0), "滑出窗口的包应被丢弃");
+    }
+
+    /// 每条流的窗口是第一次见到该流时才建的，而计数器整条会话共享，
+    /// 所以新流的第一个包计数器可能已经很大。这个跳跃必须被高效处理，
+    /// 否则一条新流就能让收包线程转几十万次空循环。
+    #[test]
+    fn replay_window_handles_large_initial_jump() {
+        let w = ReplayWindow::new();
+        let start = 1_000_000u64;
+        assert!(w.check(start));
+        w.accept(start);
+        assert!(!w.check(start), "刚接受过的序号不能重复接受");
+        assert!(w.check(start + 1), "窗口内的新序号应可接受");
+        assert!(w.check(start - 1), "窗口内的乱序回退也应可接受");
     }
 
     #[test]

@@ -9,17 +9,27 @@
 //! 过期的实时包仍被重传、内层 TCP 与外层重传叠加会导致吞吐崩塌。
 //! 内层协议自己负责可靠性——TCP 本就会重传，UDP 本就允许丢。
 
-use crate::crypto::SessionCrypto;
+use crate::crypto::{ReplayWindow, SessionCrypto};
+use crate::stats::StatsManager;
 use crate::tun::{Ipv4Header, TunDevice, TunError};
 use quinn::Connection;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 const MAX_PACKET: usize = 65535;
+
+/// 该对端的流量统计句柄。
+///
+/// 连接建立时才知道 user_id，且 Host 侧有可能拿不到映射，故为 Option。
+pub type PeerStats = Option<(Arc<StatsManager>, String)>;
+
+/// 入方向丢包率的结算窗口
+const LOSS_WINDOW: Duration = Duration::from_secs(2);
 
 /// TUN 设备 MTU。
 ///
@@ -49,6 +59,61 @@ struct PeerForwarder {
     /// overlay 端到端加密。中继模式下 QUIC 是逐跳的，中继能看到明文，
     /// 机密性必须由这一层保证。
     crypto: Arc<SessionCrypto>,
+    stats: PeerStats,
+}
+
+/// 基于 overlay 计数器空洞的**入方向**丢包测量。
+///
+/// 数据面从 TCP 代理迁到 TUN + DATAGRAM 之后，唯一还在上报的丢包口径是 QUIC
+/// 的路径统计，而那测的是**出方向**。真正影响体验的"对端发来、我没收到"
+/// 只能靠计数器空洞算——计数器是发送端在加密时打上的，中继换几段也不影响，
+/// 天然是端到端、入方向的。
+struct LossMeter {
+    highest: u64,
+    received: u64,
+    window_start: u64,
+    window_began: Instant,
+    started: bool,
+}
+
+impl LossMeter {
+    fn new(now: Instant) -> Self {
+        Self {
+            highest: 0,
+            received: 0,
+            window_start: 0,
+            window_began: now,
+            started: false,
+        }
+    }
+
+    fn on_received(&mut self, counter: u64) {
+        if !self.started {
+            self.started = true;
+            self.highest = counter;
+            self.window_start = counter;
+        }
+        self.highest = self.highest.max(counter);
+        self.received += 1;
+    }
+
+    /// 窗口到期则结算，返回丢包率（万分之一）
+    fn poll(&mut self, now: Instant) -> Option<u16> {
+        if !self.started || now.duration_since(self.window_began) < LOSS_WINDOW {
+            return None;
+        }
+        let span = self.highest.saturating_sub(self.window_start) + 1;
+        let received = self.received.min(span);
+        let bp = if span == 0 {
+            0
+        } else {
+            (((span - received).saturating_mul(10_000)) / span).min(10_000) as u16
+        };
+        self.window_start = self.highest + 1;
+        self.received = 0;
+        self.window_began = now;
+        Some(bp)
+    }
 }
 
 impl PeerForwarder {
@@ -73,8 +138,17 @@ impl PeerForwarder {
                 return false;
             }
         }
+        let len = sealed.len();
         match self.conn.send_datagram(sealed.into()) {
-            Ok(()) => true,
+            Ok(()) => {
+                // 数据面迁到 DATAGRAM 之后，这个埋点一直没跟着迁过来，
+                // 于是不管传多少数据带宽都显示 0。
+                if let Some((stats, user)) = &self.stats {
+                    let (stats, user) = (stats.clone(), user.clone());
+                    tokio::spawn(async move { stats.record_send(&user, len).await });
+                }
+                true
+            }
             Err(e) => {
                 debug!("[TUN] 数据报发送失败: {}", e);
                 false
@@ -95,6 +169,12 @@ pub struct TunBridge {
     default_peer: Mutex<Option<PeerForwarder>>,
     closed: std::sync::atomic::AtomicBool,
     tx_packets: AtomicU64,
+    /// 所有已接入的对端连接。
+    ///
+    /// 必须显式持有：收包任务循环在自己克隆的那份 `Connection` 上，
+    /// 只丢掉 `Arc<TunBridge>` 是停不掉它的。不在关闭时逐个 `close()`，
+    /// 就会出现"房间已关，隧道却还能用"。
+    conns: Mutex<Vec<Connection>>,
 }
 
 impl TunBridge {
@@ -106,6 +186,7 @@ impl TunBridge {
         host_virtual_ip: &str,
         quic_conn: Connection,
         crypto: Arc<SessionCrypto>,
+        stats: PeerStats,
     ) -> Result<Arc<Self>, TunError> {
         let my_ip: Ipv4Addr = virtual_ip
             .parse()
@@ -126,7 +207,7 @@ impl TunBridge {
             tun.add_route(host_ip, 32).await?;
         }
         let bridge = Self::from_tun(tun, host_ip, my_ip, guest_network, false);
-        bridge.attach_peer(quic_conn, crypto, None).await?;
+        bridge.attach_peer(quic_conn, crypto, None, stats).await?;
         Ok(bridge)
     }
 
@@ -167,6 +248,7 @@ impl TunBridge {
             default_peer: Mutex::new(None),
             closed: std::sync::atomic::AtomicBool::new(false),
             tx_packets: AtomicU64::new(0),
+            conns: Mutex::new(Vec::new()),
         });
         let reader = bridge.clone();
         tokio::spawn(async move {
@@ -184,10 +266,12 @@ impl TunBridge {
         conn: Connection,
         crypto: Arc<SessionCrypto>,
         peer_hint: Option<Ipv4Addr>,
+        stats: PeerStats,
     ) -> Result<(), TunError> {
         let forwarder = PeerForwarder {
             conn: conn.clone(),
             crypto,
+            stats,
         };
         tracing::info!(
             "[TUN] 数据报通道就绪 (local={}, peer_hint={:?}, host={}, max_datagram={:?})",
@@ -196,6 +280,7 @@ impl TunBridge {
             self.is_host,
             conn.max_datagram_size()
         );
+        self.conns.lock().await.push(conn.clone());
         if let Some(ip) = peer_hint {
             self.peers.lock().await.insert(ip, forwarder.clone());
         }
@@ -289,6 +374,14 @@ impl TunBridge {
     pub async fn close(&self) {
         self.closed
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        // 必须显式关掉每条连接。收包任务克隆了自己的连接句柄，光丢引用停不掉它，
+        // 于是会出现"房间已关，旧会话却还能收发"。关掉之后 `read_datagram()`
+        // 立刻返回错误，任务自然退出，对端也能收到断开通知。
+        for conn in self.conns.lock().await.drain(..) {
+            conn.close(0u32.into(), b"tunnel closed");
+        }
+        self.peers.lock().await.clear();
+        *self.default_peer.lock().await = None;
         self.tun.close().await;
     }
 
@@ -297,6 +390,83 @@ impl TunBridge {
     }
     pub fn my_vip(&self) -> Ipv4Addr {
         self.my_vip
+    }
+}
+
+/// 内层流标识，用于按流拆分重放窗口。
+///
+/// 重放窗口若按会话全局维护，隧道里一条突发流量（比如传文件）就会把窗口整体
+/// 往前推，另一条几乎静默的流（比如游戏）延迟到达的**合法**包便会被判成
+/// "已滑出窗口"丢弃。积累到心跳也被误伤时，整条隧道掉线重连——这正是
+/// "遇到瞬时流量就掉线、日志提示包被丢弃"的成因。
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct FlowKey {
+    protocol: u8,
+    source: Ipv4Addr,
+    source_port: u16,
+    destination: Ipv4Addr,
+    destination_port: u16,
+}
+
+/// 从已解密的 IP 包里提取流标识。
+///
+/// 没有端口概念的协议（ICMP 等）端口取 0，相当于按（协议, 源, 目的）粗粒度
+/// 共享一个窗口——这类流量速率很低，不会触发误杀。
+fn flow_key(header: &Ipv4Header, packet: &[u8]) -> FlowKey {
+    let header_len = ((packet[0] & 0x0f) as usize) * 4;
+    let (source_port, destination_port) = match header.protocol {
+        6 | 17 if packet.len() >= header_len + 4 => (
+            u16::from_be_bytes([packet[header_len], packet[header_len + 1]]),
+            u16::from_be_bytes([packet[header_len + 2], packet[header_len + 3]]),
+        ),
+        _ => (0, 0),
+    };
+    FlowKey {
+        protocol: header.protocol,
+        source: header.source_addr(),
+        source_port,
+        destination: header.destination_addr(),
+        destination_port,
+    }
+}
+
+/// 每个对端连接最多跟踪多少条流。
+///
+/// 防的是对端伪造海量五元组把内存吃光。正常场景（哪怕 BT 那种同时几百个
+/// 对等连接）远用不到这个量级，触发上限只按 FIFO 淘汰最老的流。
+const MAX_TRACKED_FLOWS: usize = 4096;
+
+/// 按内层流拆分的重放检测表。只被单个收包任务顺序访问，无需加锁。
+struct FlowReplayTable {
+    windows: HashMap<FlowKey, ReplayWindow>,
+    insertion_order: VecDeque<FlowKey>,
+}
+
+impl FlowReplayTable {
+    fn new() -> Self {
+        Self {
+            windows: HashMap::new(),
+            insertion_order: VecDeque::new(),
+        }
+    }
+
+    /// 该流的这个计数器是否可接受；可接受时顺带记账。
+    fn accept(&mut self, key: FlowKey, counter: u64) -> bool {
+        if !self.windows.contains_key(&key) {
+            if self.windows.len() >= MAX_TRACKED_FLOWS {
+                if let Some(oldest) = self.insertion_order.pop_front() {
+                    self.windows.remove(&oldest);
+                }
+            }
+            self.windows.insert(key, ReplayWindow::new());
+            self.insertion_order.push_back(key);
+        }
+        let window = self.windows.get(&key).expect("刚插入过，一定存在");
+        if !window.check(counter) {
+            return false;
+        }
+        window.accept(counter);
+        true
     }
 }
 
@@ -314,18 +484,37 @@ async fn receive_datagrams(
     host_vip: Ipv4Addr,
     guest_network: Ipv4Addr,
 ) -> Result<(), String> {
+    let mut flows = FlowReplayTable::new();
+    let mut loss = LossMeter::new(Instant::now());
     loop {
         let datagram = conn.read_datagram().await.map_err(|e| e.to_string())?;
+        if let Some((stats, user)) = &sender.stats {
+            let (stats, user, n) = (stats.clone(), user.clone(), datagram.len());
+            tokio::spawn(async move { stats.record_receive(&user, n).await });
+        }
 
-        // 解密失败不是致命错误：可能是重放、乱序过旧、或途中损坏。
+        // 解密失败不是致命错误：可能是认证不通过或途中损坏。
         // 丢弃这一个包继续跑，绝不能因此中断整条隧道。
-        let packet = match sender.crypto.open(&datagram) {
-            Ok(p) => p,
+        let (counter, packet) = match sender.crypto.open(&datagram) {
+            Ok(v) => v,
             Err(e) => {
                 debug!("[TUN] 丢弃无法解密的数据报: {}", e);
                 continue;
             }
         };
+        // 计数器空洞就是入方向丢包，必须在重放判定**之前**记——
+        // 重放判定会把重复包挡掉，放在后面就统计不到真实到达情况了。
+        loss.on_received(counter);
+        if let Some(bp) = loss.poll(Instant::now()) {
+            if let Some((stats, user)) = &sender.stats {
+                let (stats, user) = (stats.clone(), user.clone());
+                tokio::spawn(async move { stats.update_inbound_loss(&user, bp).await });
+            }
+            if bp > 0 {
+                tracing::info!("[TUN] 入方向丢包 {:.2}%", bp as f64 / 100.0);
+            }
+        }
+
         let len = packet.len();
         if !(20..=MAX_PACKET).contains(&len) {
             debug!("[TUN] 丢弃长度异常的包: {}", len);
@@ -334,6 +523,12 @@ async fn receive_datagrams(
         let Some(header) = Ipv4Header::from_bytes(&packet) else {
             continue;
         };
+        // 重放判定按内层流拆分，必须在拿到明文之后做——五元组在解密前不可见。
+        let key = flow_key(header, &packet);
+        if !flows.accept(key, counter) {
+            debug!("[TUN] 丢弃重复/过旧的 overlay 报文 (counter={counter})");
+            continue;
+        }
         let source = header.source_addr();
         let valid_source = if is_host {
             source != host_vip && same_prefix24(source, guest_network)
@@ -437,6 +632,106 @@ fn adapter_name(ip: Ipv4Addr) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key(port: u16) -> FlowKey {
+        FlowKey {
+            protocol: 17,
+            source: Ipv4Addr::new(172, 16, 0, 1),
+            source_port: port,
+            destination: Ipv4Addr::new(172, 16, 0, 2),
+            destination_port: 25565,
+        }
+    }
+
+    /// 本次修复的核心承诺：一条流的突发不得把另一条安静流的包判成"过旧"。
+    ///
+    /// 窗口若按会话全局维护，突发流量会把窗口整体推过去，安静流延迟到达的
+    /// 合法包就会被丢弃，积累到心跳被误伤时整条隧道掉线——这正是
+    /// "遇到瞬时流量就掉线"的成因。
+    #[test]
+    fn a_burst_on_one_flow_must_not_evict_another() {
+        let mut table = FlowReplayTable::new();
+        let quiet = key(4000);
+        let bursty = key(5000);
+
+        // 安静流先发一个包（计数器较小）
+        assert!(table.accept(quiet, 10));
+
+        // 突发流把会话计数器推得很远——远超单个窗口宽度
+        for c in 100..100_000u64 {
+            table.accept(bursty, c);
+        }
+
+        // 安静流随后到达的包仍然必须被接受
+        assert!(
+            table.accept(quiet, 11),
+            "突发流量不得让安静流的后续包被判成过旧"
+        );
+        // 它自己的重复包照样要拒
+        assert!(!table.accept(quiet, 11), "同一条流内的重复仍要拒绝");
+    }
+
+    /// 跟踪的流数必须有上限，否则对端伪造海量五元组就能把内存吃光
+    #[test]
+    fn tracked_flows_are_bounded() {
+        let mut table = FlowReplayTable::new();
+        for port in 0..(MAX_TRACKED_FLOWS as u32 * 2) {
+            table.accept(key(port as u16), port as u64);
+        }
+        assert!(table.windows.len() <= MAX_TRACKED_FLOWS);
+    }
+
+    /// 没有端口的协议（ICMP）落到同一个键，但不同协议之间必须分开
+    #[test]
+    fn flow_key_separates_protocols() {
+        let icmp = FlowKey {
+            protocol: 1,
+            source_port: 0,
+            destination_port: 0,
+            ..key(0)
+        };
+        let udp = key(0);
+        assert_ne!(icmp.protocol, udp.protocol);
+        let mut table = FlowReplayTable::new();
+        assert!(table.accept(icmp, 5));
+        assert!(table.accept(udp, 5), "不同协议是不同的流，不该互相判重放");
+    }
+
+    /// 入方向丢包：计数器空洞就是丢的包
+    #[test]
+    fn loss_meter_measures_counter_gaps() {
+        let t = Instant::now();
+        let mut m = LossMeter::new(t);
+        // 0..100 只收到偶数，即丢一半
+        for c in (0..100u64).step_by(2) {
+            m.on_received(c);
+        }
+        let bp = m.poll(t + LOSS_WINDOW).expect("窗口到期应结算");
+        assert!(
+            (4800..=5100).contains(&bp),
+            "丢一半应报 ~50%，实得 {}bp",
+            bp
+        );
+    }
+
+    #[test]
+    fn loss_meter_reports_zero_on_clean_link() {
+        let t = Instant::now();
+        let mut m = LossMeter::new(t);
+        for c in 0..100u64 {
+            m.on_received(c);
+        }
+        assert_eq!(m.poll(t + LOSS_WINDOW), Some(0));
+    }
+
+    /// 窗口没到期不该结算，否则样本太少、丢包率全是噪声
+    #[test]
+    fn loss_meter_waits_for_the_window() {
+        let t = Instant::now();
+        let mut m = LossMeter::new(t);
+        m.on_received(0);
+        assert_eq!(m.poll(t), None);
+    }
 
     #[test]
     fn adapter_name_is_unique_per_virtual_ip() {
