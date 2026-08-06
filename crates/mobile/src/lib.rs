@@ -17,11 +17,9 @@ use std::time::Duration;
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc;
 
-mod session;
-
 static NEXT_HANDLE: AtomicI64 = AtomicI64::new(1);
 static NEXT_STREAM: AtomicI64 = AtomicI64::new(1);
-pub(crate) static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
+static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     // 2 个 worker 线程在 relay 场景下容易被同步 JNI 回调（见 ip_packet）和
     // block_on 调用叠加占满，导致整个 Runtime 上所有连接一起卡死。
     // 提升到 4 个线程：在典型 Android 设备（4核以上）上开销可接受，

@@ -74,18 +74,6 @@ jobs:
       - name: Install NSIS
         shell: pwsh
         run: choco install nsis --no-progress --yes
-      # checks job 跑在 ubuntu 上，检查 Tauri crate 需要 webkit2gtk 整套系统依赖，
-      # 因此它用了 --exclude phantom-p2p。后果是桌面端的告警与死代码长期不可见：
-      # 编译错误会被下面的构建步骤挡住，但告警埋在 tauri build 的输出里没人看得到
-      # （watch_for_silent_upgrade 这个从未被调用的函数就这么藏了很久）。
-      # 这里单独 check 一次，让告警有个自己的步骤。Windows 上没有额外系统依赖，
-      # 且结果会进 cargo 缓存供随后的构建复用。
-      - name: Check the desktop crate
-        shell: pwsh
-        run: |
-          npm ci
-          npm run build
-          cargo check --locked -p phantom-p2p
       - name: Build Windows package
         shell: cmd
         run: build\build-windows.bat

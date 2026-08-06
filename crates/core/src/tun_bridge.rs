@@ -9,10 +9,10 @@
 //! 过期的实时包仍被重传、内层 TCP 与外层重传叠加会导致吞吐崩塌。
 //! 内层协议自己负责可靠性——TCP 本就会重传，UDP 本就允许丢。
 
-use crate::crypto::{ReplayWindow, SessionCrypto};
+use crate::crypto::SessionCrypto;
 use crate::tun::{Ipv4Header, TunDevice, TunError};
 use quinn::Connection;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -300,86 +300,6 @@ impl TunBridge {
     }
 }
 
-/// 内层流标识，用于按流拆分重放检测窗口。
-///
-/// `overlay 报文重放或过旧` 的重放窗口曾经是整条隧道会话共享一个：
-/// 隧道里混跑着多条互不相关的流量时（比如同时有人在下 BT、也有人在
-/// 手动 ping），一条流的突发会把共享窗口往前推，导致另一条几乎静默的流
-/// 延迟到达的合法包被误判成"已滑出窗口"而丢弃——现象就是"能打洞成功，
-/// 但过几分钟 TUN 转发开始规律性丢包直至整条隧道断线重连"。按五元组
-/// 把窗口拆开后，一条流的突发不再能连累另一条流。
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct FlowKey {
-    protocol: u8,
-    source: Ipv4Addr,
-    source_port: u16,
-    destination: Ipv4Addr,
-    destination_port: u16,
-}
-
-/// 从已解密的 IP 包里提取流标识。没有端口概念的协议（比如 ICMP）
-/// 端口取 0，相当于按（协议, 源, 目的）这一组粗粒度地共享一个窗口——
-/// 这类流量本身速率很低，不会触发误杀。
-fn flow_key(header: &Ipv4Header, packet: &[u8]) -> FlowKey {
-    let header_len = ((packet[0] & 0x0f) as usize) * 4;
-    let (source_port, destination_port) = match header.protocol {
-        6 | 17 if packet.len() >= header_len + 4 => (
-            u16::from_be_bytes([packet[header_len], packet[header_len + 1]]),
-            u16::from_be_bytes([packet[header_len + 2], packet[header_len + 3]]),
-        ),
-        _ => (0, 0),
-    };
-    FlowKey {
-        protocol: header.protocol,
-        source: header.source_addr(),
-        source_port,
-        destination: header.destination_addr(),
-        destination_port,
-    }
-}
-
-/// 每个对端连接跟踪的流数量上限。
-///
-/// 只是防止对端伪造海量不同五元组的包把内存耗光；正常场景（哪怕是
-/// BT 那种同时几百个对等连接）远用不到这个量级，触发上限只会按 FIFO
-/// 淘汰最老的流，不影响正常流量。
-const MAX_TRACKED_FLOWS: usize = 4096;
-
-/// 按内层流拆分的重放检测表。只被单个 `receive_datagrams` 任务
-/// 顺序访问，不需要加锁。
-struct FlowReplayTable {
-    windows: HashMap<FlowKey, ReplayWindow>,
-    insertion_order: VecDeque<FlowKey>,
-}
-
-impl FlowReplayTable {
-    fn new() -> Self {
-        Self {
-            windows: HashMap::new(),
-            insertion_order: VecDeque::new(),
-        }
-    }
-
-    /// 该流的这个计数器是否可接受；可接受时顺带记账。
-    fn accept(&mut self, key: FlowKey, counter: u64) -> bool {
-        if !self.windows.contains_key(&key) {
-            if self.windows.len() >= MAX_TRACKED_FLOWS {
-                if let Some(oldest) = self.insertion_order.pop_front() {
-                    self.windows.remove(&oldest);
-                }
-            }
-            self.windows.insert(key, ReplayWindow::new());
-            self.insertion_order.push_back(key);
-        }
-        let window = self.windows.get(&key).expect("刚插入过，一定存在");
-        if !window.check(counter) {
-            return false;
-        }
-        window.accept(counter);
-        true
-    }
-}
-
 /// 接收对端数据报，解密后写入 TUN。
 ///
 /// 与旧的流式实现相比，这里**丢包不影响后续包**——数据报之间彼此独立，
@@ -394,14 +314,13 @@ async fn receive_datagrams(
     host_vip: Ipv4Addr,
     guest_network: Ipv4Addr,
 ) -> Result<(), String> {
-    let mut flows = FlowReplayTable::new();
     loop {
         let datagram = conn.read_datagram().await.map_err(|e| e.to_string())?;
 
-        // 解密失败不是致命错误：可能是认证不通过、或途中损坏。
+        // 解密失败不是致命错误：可能是重放、乱序过旧、或途中损坏。
         // 丢弃这一个包继续跑，绝不能因此中断整条隧道。
-        let (counter, packet) = match sender.crypto.open(&datagram) {
-            Ok(v) => v,
+        let packet = match sender.crypto.open(&datagram) {
+            Ok(p) => p,
             Err(e) => {
                 debug!("[TUN] 丢弃无法解密的数据报: {}", e);
                 continue;
@@ -415,13 +334,6 @@ async fn receive_datagrams(
         let Some(header) = Ipv4Header::from_bytes(&packet) else {
             continue;
         };
-        // 重放判定按内层流拆分（见 FlowKey 文档），必须在这里、拿到
-        // 明文之后才能做——五元组在解密前是不可见的。
-        let key = flow_key(header, &packet);
-        if !flows.accept(key, counter) {
-            debug!("[TUN] 丢弃无法解密的数据报: overlay 报文重放或过旧 (counter={counter})");
-            continue;
-        }
         let source = header.source_addr();
         let valid_source = if is_host {
             source != host_vip && same_prefix24(source, guest_network)

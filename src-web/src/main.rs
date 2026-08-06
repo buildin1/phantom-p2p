@@ -2,7 +2,7 @@ use clap::Parser;
 use std::net::SocketAddr;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-mod host;
+mod runtime;
 mod web_server;
 
 #[derive(Parser, Debug)]
@@ -39,10 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 与桌面端一致的分层日志：按用途拆文件 + 按大小轮转 + 重复抑制，
     // 这样 `log/` 目录可以直接打包上报给服务端聚合分析。
     std::env::set_var("RUST_LOG", filter);
-    if let Err(e) = phantom_core::logging::init(
-        &phantom_core::runtime::default_log_directory(),
-        args.verbose,
-    ) {
+    if let Err(e) = phantom_core::logging::init(&runtime::log_directory(), args.verbose) {
         eprintln!("[日志] 分层日志初始化失败，仅输出到控制台: {}", e);
         tracing_subscriber::registry()
             .with(tracing_subscriber::EnvFilter::new(filter))
@@ -53,12 +50,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("PhantomP2P Linux Headless {}", env!("CARGO_PKG_VERSION"));
     println!("Linux TUN requires root or CAP_NET_ADMIN.");
 
-    let web_host = host::WebHost::new(args.bind.port());
-    let runtime = phantom_core::runtime::SessionRuntime::new(web_host.clone())?;
+    let runtime = runtime::HeadlessRuntime::new(args.bind.port())?;
     let signal_arg = args
         .signal
         .unwrap_or_else(|| phantom_core::config::USER_MODE_SIGNAL_SERVER.to_string());
     let signal_url = phantom_core::config::runtime_signal_server(&signal_arg);
     runtime.start(signal_url, !args.no_auto_room).await;
-    web_server::start_web_server(args.bind, runtime, web_host).await
+    web_server::start_web_server(args.bind, runtime).await
 }
