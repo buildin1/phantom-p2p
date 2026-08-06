@@ -168,19 +168,6 @@ impl SessionCrypto {
     }
 }
 
-/// 读出一个已加密报文的计数器，不做解密。
-///
-/// 丢包修复层需要按计数器索引已发出的报文（见 [`crate::repair`]），
-/// 但它不该自己去拆报文格式——格式知识留在本模块里，改格式时只有一处要动。
-pub fn counter_of(packet: &[u8]) -> Option<u64> {
-    if packet.len() < COUNTER_LEN {
-        return None;
-    }
-    let mut c = [0u8; COUNTER_LEN];
-    c.copy_from_slice(&packet[..COUNTER_LEN]);
-    Some(u64::from_be_bytes(c))
-}
-
 /// 计数器 → 12 字节 nonce（前 4 字节留零）
 fn nonce_from(counter: u64) -> Nonce {
     let mut n = [0u8; 12];

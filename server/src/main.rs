@@ -205,11 +205,6 @@ struct AppState {
     relay_registry: relay::SharedRegistry,
     /// 日志上传凭据注册表（未启用时为 None）
     log_uploads: Option<log_upload::UploadRegistry>,
-    /// 当前获准借用中继补包的房间。
-    ///
-    /// 中继的硬约束是带宽，用并发授权数给它封顶——见
-    /// [`config::RelayConfig::max_assist_rooms`]。
-    relay_assist_rooms: HashSet<String>,
     /// 运行时配置
     config: Arc<config::ServerConfig>,
 }
@@ -247,7 +242,6 @@ impl AppState {
             rate_limit_connections: HashMap::new(),
             relay_registry,
             log_uploads,
-            relay_assist_rooms: HashSet::new(),
             config,
         }
     }
@@ -561,12 +555,6 @@ async fn handle_client_message(session_id: &str, msg: ClientMessage, state: &Sha
                 }
                 ClientMessage::RelayRequest => {
                     handle_relay_request(session_id, state).await;
-                }
-                ClientMessage::RelayAssistRequest { loss_bp } => {
-                    handle_relay_assist_request(session_id, loss_bp, state).await;
-                }
-                ClientMessage::RelayAssistRelease => {
-                    handle_relay_assist_release(session_id, state).await;
                 }
                 ClientMessage::RequestFixedHostIp => {
                     handle_request_fixed_host_ip(session_id, state).await;
@@ -1525,89 +1513,6 @@ async fn spawn_relay_preallocation(room_code: &str, state: &SharedState) {
 }
 
 /// 处理中继请求 — 生成 token 并向房间内双方下发同一个 RelayReady
-/// 处理「借用中继补包」的求援。
-///
-/// 与整体切中继不同，这里只放行**补包**流量：原包继续走 P2P，中继只承担
-/// 丢掉的那一小部分。同样丢包程度下中继带宽占用低数倍，所以同一条 50Mbps
-/// 中继能同时照顾的房间数高得多。
-///
-/// 带宽是硬约束，因此用并发授权数封顶；排满就直接拒绝，
-/// 客户端会退回纯 P2P 补包。宁可让一个房间体验差一点，
-/// 也不能让所有房间一起被拖垮。
-async fn handle_relay_assist_request(session_id: &str, loss_bp: u16, state: &SharedState) {
-    let mut st = state.lock().await;
-    let (room_code, sender) = match st.sessions.get(session_id) {
-        Some(s) => match &s.room_code {
-            Some(code) => (code.clone(), s.sender.clone()),
-            None => return,
-        },
-        None => return,
-    };
-
-    let cap = st.config.relay.max_assist_rooms;
-    let already = st.relay_assist_rooms.contains(&room_code);
-    if !already && st.relay_assist_rooms.len() >= cap {
-        warn!(
-            "[中继补包] 房间 {} 求援被拒：已有 {} 个房间在用，达到上限 {}",
-            room_code,
-            st.relay_assist_rooms.len(),
-            cap
-        );
-        let _ = sender.send(ServerMessage::RelayAssistDenied {
-            reason: "中继带宽已满，请稍后重试".to_string(),
-        });
-        return;
-    }
-
-    // 复用房间既有的中继 token；没有就现签一个
-    let token = match st.rooms.get(&room_code).map(|r| &r.state) {
-        Some(RoomState::Relaying { token, .. }) => token.clone(),
-        _ => {
-            let token = format!("assist-{}-{}", room_code, session_id);
-            let registry = st.relay_registry.clone();
-            let mut reg = registry.lock().await;
-            reg.register_token(token.clone());
-            token
-        }
-    };
-
-    st.relay_assist_rooms.insert(room_code.clone());
-    let addr = st.config.relay.public_addr.clone();
-    let port = st.config.relay.quic_port;
-    info!(
-        "[中继补包] 房间 {} 获准借用中继（丢包 {:.2}%，当前 {}/{}）",
-        room_code,
-        loss_bp as f64 / 100.0,
-        st.relay_assist_rooms.len(),
-        cap
-    );
-    let _ = sender.send(ServerMessage::RelayAssistGranted {
-        relay_addr: addr,
-        relay_quic_port: port,
-        token,
-    });
-}
-
-/// 链路恢复后客户端主动交还额度，把带宽让给别的房间
-async fn handle_relay_assist_release(session_id: &str, state: &SharedState) {
-    let mut st = state.lock().await;
-    let Some(room_code) = st
-        .sessions
-        .get(session_id)
-        .and_then(|s| s.room_code.clone())
-    else {
-        return;
-    };
-    if st.relay_assist_rooms.remove(&room_code) {
-        info!(
-            "[中继补包] 房间 {} 交还额度，当前 {}/{}",
-            room_code,
-            st.relay_assist_rooms.len(),
-            st.config.relay.max_assist_rooms
-        );
-    }
-}
-
 async fn handle_relay_request(session_id: &str, state: &SharedState) {
     let (room_code, relay_addr, relay_registry, requester_sender, existing_ready, requester_role) = {
         let st = state.lock().await;
@@ -2198,17 +2103,6 @@ fn release_room_relay_token_if_needed(
 fn do_close_room_inner(host_session_id: &str, room_code: &str, reason: &str, st: &mut AppState) {
     if let Some(room) = st.rooms.remove(room_code) {
         release_room_relay_token_if_needed(&room.state, st.relay_registry.clone(), room_code);
-        // 房间没了就把中继补包额度收回来。客户端正常退出时会主动交还，
-        // 但崩溃/断网就不会——不在这里兜底的话额度会一直泄漏，
-        // 直到上限被占满、后续房间全部求援被拒。
-        if st.relay_assist_rooms.remove(room_code) {
-            info!(
-                "[中继补包] 房间 {} 关闭，回收额度，当前 {}/{}",
-                room_code,
-                st.relay_assist_rooms.len(),
-                st.config.relay.max_assist_rooms
-            );
-        }
 
         // 记录到数据库
         if let Some(db) = database::get_database() {
