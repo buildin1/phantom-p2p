@@ -213,7 +213,13 @@ pub async fn start_host_tunnel(
             // 连接一建立就把它接入 TUN 桥，之后只等连接结束。
             match (tun_bridge.clone(), peer_crypto.clone()) {
                 (Some(bridge), Some(crypto)) => {
-                    if let Err(e) = bridge.attach_peer(conn.clone(), crypto, None).await {
+                    let peer_stats = mapped_user_id
+                        .as_ref()
+                        .map(|u| (stats_manager.clone(), u.clone()));
+                    if let Err(e) = bridge
+                        .attach_peer(conn.clone(), crypto, None, peer_stats)
+                        .await
+                    {
                         warn!("[TUN] Host 接入对端数据报通道失败: {}", e);
                     }
                 }
@@ -693,7 +699,11 @@ async fn relay_host_datagram_loop(
     spawn_quic_monitor(conn.clone(), stats_manager.clone(), user_id.clone());
     match (tun_bridge, peer_crypto) {
         (Some(bridge), Some(crypto)) => {
-            if let Err(e) = bridge.attach_peer(conn.clone(), crypto, None).await {
+            let peer_stats = Some((stats_manager.clone(), user_id.clone()));
+            if let Err(e) = bridge
+                .attach_peer(conn.clone(), crypto, None, peer_stats)
+                .await
+            {
                 warn!("[TUN] 中继 Host 接入数据报通道失败: {}", e);
                 return;
             }
@@ -783,9 +793,16 @@ impl TunnelConnManager {
     }
 
     /// 关闭管理器（清除连接）
+    /// 关闭管理器。
+    ///
+    /// 必须**真的关掉** QUIC 连接，而不只是清掉这里的引用：数据面的收包任务
+    /// 各自克隆了连接句柄，清引用对它们毫无影响。以前只置 None，结果关了房间
+    /// 之后旧会话仍然能收发，对端也收不到任何断开通知。
     pub async fn close(&self) {
         let mut guard = self.conn.write().await;
-        *guard = None;
+        if let Some(conn) = guard.take() {
+            conn.close(0u32.into(), b"tunnel closed");
+        }
     }
 
     /// 当前活跃流数量

@@ -1372,6 +1372,7 @@ async fn request_relay(
 async fn start_tun_bridge(
     app: AppHandle,
     punch_state: tauri::State<'_, PunchState>,
+    stats_state: tauri::State<'_, StatsState>,
 ) -> Result<(), String> {
     // 防止重复启动
     if punch_state
@@ -1419,10 +1420,23 @@ async fn start_tun_bridge(
         .await
         .clone()
         .ok_or("overlay 会话密钥尚未协商完成")?;
-    let bridge =
-        tun_bridge::TunBridge::start(&subnet, &virtual_ip, &host_virtual_ip, quic_conn, crypto)
-            .await
-            .map_err(|e| format!("启动 TUN 桥接失败: {}", e))?;
+    // Guest 只有一条对端连接，取它作为流量与丢包统计的归属。
+    // 没有它的话 tun_bridge 无处上报，带宽会一直显示 0。
+    let peer_stats = stats_state
+        .manager
+        .first_connection_id()
+        .await
+        .map(|user| (stats_state.manager.clone(), user));
+    let bridge = tun_bridge::TunBridge::start(
+        &subnet,
+        &virtual_ip,
+        &host_virtual_ip,
+        quic_conn,
+        crypto,
+        peer_stats,
+    )
+    .await
+    .map_err(|e| format!("启动 TUN 桥接失败: {}", e))?;
 
     *punch_state.tun_bridge.lock().await = Some(bridge);
     punch_state

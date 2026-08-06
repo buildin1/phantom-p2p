@@ -37,6 +37,9 @@ pub struct ConnectionStats {
     pub quic_sent_packets: u64,
     /// QUIC 路径层丢包计数（来自 quinn::Connection::stats）
     pub quic_lost_packets: u64,
+    /// 实测**入方向**丢包率（万分之一）。由 overlay 计数器空洞算得，
+    /// 尚无观测时为 None。
+    pub inbound_loss_bp: Option<u16>,
     /// 发送的字节数
     pub bytes_sent: u64,
     /// 接收的字节数
@@ -57,6 +60,7 @@ impl ConnectionStats {
             packets_lost: 0,
             quic_sent_packets: 0,
             quic_lost_packets: 0,
+            inbound_loss_bp: None,
             bytes_sent: 0,
             bytes_received: 0,
             connection_mode,
@@ -73,8 +77,16 @@ impl ConnectionStats {
     }
 
     /// 获取丢包率 (百分比)
+    ///
+    /// 优先用**入方向**实测值（overlay 计数器空洞，见 `tun_bridge`）。
+    ///
+    /// QUIC 的路径统计只是兜底：它测的是"**我发出去**的包丢了多少"（出方向），
+    /// 而真正毁掉体验的是"对端发给我、我没收到"的包——那份数据只存在于**对端**
+    /// 的 QUIC 栈里，本地怎么读都读不到。两者方向相反，不能混为一谈。
     pub fn get_packet_loss_rate(&self) -> f64 {
-        // 优先使用 QUIC 路径层统计，反映真实网络丢包
+        if let Some(bp) = self.inbound_loss_bp {
+            return bp as f64 / 100.0;
+        }
         if self.quic_sent_packets > 0 {
             return (self.quic_lost_packets as f64 / self.quic_sent_packets as f64) * 100.0;
         }
@@ -223,6 +235,17 @@ impl StatsManager {
         if let Some(stats) = conns.get_mut(user_id) {
             stats.quic_sent_packets = sent_packets;
             stats.quic_lost_packets = lost_packets;
+        }
+    }
+
+    /// 更新实测的**入方向**丢包率（万分之一）。
+    ///
+    /// 由 `tun_bridge` 按 overlay 计数器空洞算出。这是唯一能反映
+    /// "对端发给我、我没收到"的口径，也是唯一与体验相关的那个方向。
+    pub async fn update_inbound_loss(&self, user_id: &str, loss_bp: u16) {
+        let mut conns = self.connections.write().await;
+        if let Some(stats) = conns.get_mut(user_id) {
+            stats.inbound_loss_bp = Some(loss_bp);
         }
     }
 
