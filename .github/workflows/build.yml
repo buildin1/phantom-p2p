@@ -2,7 +2,10 @@ name: Build PhantomP2P
 
 on:
   push:
-    branches: [main]
+    # dev 是验证分支：只构建 Windows x64（客户端 + 服务端），一轮几分钟就能拿到
+    # 可实测的产物。跨平台构建留到进 main 之后——本地无法交叉编译，改动的正确性
+    # 只能靠真机验证，先在一个平台上确认能用，比每次等全平台构建高效得多。
+    branches: [main, dev]
     # 打 v* 标签触发发布：构建全部平台并自动发 GitHub Release
     tags: ['v*']
   pull_request:
@@ -85,7 +88,7 @@ jobs:
 
   windows-arm64:
     name: Windows ARM64
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'windows-arm64' }}
+    if: ${{ github.ref != 'refs/heads/dev' && (github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'windows-arm64') }}
     runs-on: windows-11-arm
     needs: checks
     steps:
@@ -159,7 +162,7 @@ jobs:
 
   macos:
     name: macOS ${{ matrix.arch }}
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || startsWith(inputs.platform, 'macos-') }}
+    if: ${{ github.ref != 'refs/heads/dev' && (github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || startsWith(inputs.platform, 'macos-')) }}
     runs-on: ${{ matrix.runner }}
     needs: checks
     strategy:
@@ -213,7 +216,7 @@ jobs:
 
   linux-x64:
     name: Linux x64
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'linux-x64' }}
+    if: ${{ github.ref != 'refs/heads/dev' && (github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'linux-x64') }}
     runs-on: ubuntu-22.04
     needs: checks
     steps:
@@ -247,7 +250,7 @@ jobs:
 
   linux-arm64:
     name: Linux ARM64
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'linux-arm64' }}
+    if: ${{ github.ref != 'refs/heads/dev' && (github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'linux-arm64') }}
     runs-on: ubuntu-22.04
     needs: checks
     steps:
