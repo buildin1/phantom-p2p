@@ -1,4 +1,4 @@
-use crate::host::WebHost;
+use crate::runtime::HeadlessRuntime;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -10,16 +10,13 @@ use axum::{
     Json, Router,
 };
 use futures_util::{SinkExt, StreamExt};
-use phantom_core::runtime::SessionRuntime;
 use serde_json::{json, Value};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 #[derive(Clone)]
 struct WebState {
-    runtime: Arc<SessionRuntime>,
-    /// 事件订阅端归宿主所有：core 只负责 emit，不关心谁在听。
-    host: Arc<WebHost>,
+    runtime: Arc<HeadlessRuntime>,
 }
 
 /// Number of consecutive ports to probe after the requested one before giving up.
@@ -58,12 +55,10 @@ async fn bind_with_port_fallback(
 
 pub async fn start_web_server(
     bind_addr: SocketAddr,
-    runtime: Arc<SessionRuntime>,
-    host: Arc<WebHost>,
+    runtime: Arc<HeadlessRuntime>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let state = WebState {
         runtime: runtime.clone(),
-        host,
     };
     let app = Router::new()
         .route("/", get(serve_index))
@@ -128,13 +123,10 @@ async fn handle_invoke(
 }
 
 async fn handle_websocket(ws: WebSocketUpgrade, State(state): State<WebState>) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(socket, state.runtime, state.host))
+    ws.on_upgrade(move |socket| handle_socket(socket, state.runtime))
 }
 
-async fn handle_socket(socket: WebSocket, runtime: Arc<SessionRuntime>, host: Arc<WebHost>) {
-    // 先订阅再发快照：反过来的话，两者之间产生的事件会丢失。
-    let mut events = host.subscribe();
-
+async fn handle_socket(socket: WebSocket, runtime: Arc<HeadlessRuntime>) {
     let (mut sender, mut receiver) = socket.split();
     for event in runtime.snapshot().await {
         let Ok(text) = serde_json::to_string(&event) else {
@@ -145,6 +137,7 @@ async fn handle_socket(socket: WebSocket, runtime: Arc<SessionRuntime>, host: Ar
         }
     }
 
+    let mut events = runtime.subscribe();
     loop {
         tokio::select! {
             event = events.recv() => {

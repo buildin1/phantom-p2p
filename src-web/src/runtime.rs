@@ -1,15 +1,4 @@
-//! 平台无关的会话运行时。
-//!
-//! 连接的完整编排——信令 → NAT 探测 → 三阶段打洞 → 建隧道 → 中继回退——
-//! 在三个客户端之间是同一件事，因此实现只留这一份：桌面端（`src-tauri`）、
-//! headless 端（`src-web`）与 Android（`crates/mobile` 的 JNI 桥）都调用它。
-//!
-//! 各宿主之间真正的差异只有三点，由 [`RuntimeHost`] 注入：事件如何投递给界面、
-//! 日志写到哪里、数据目录在哪里。Android 的日志必须落在应用外部目录
-//! （`getExternalFilesDir`）才能在未 root 的设备上取到，这正是日志根目录
-//! 不能在 core 里写死的原因。
-
-use crate::{
+use phantom_core::{
     config::ClientConfig, identity::Identity, network, punch, puncher, signal, stats, tun_bridge,
     tunnel,
 };
@@ -20,40 +9,17 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::{watch, Mutex, RwLock};
+use tokio::sync::{broadcast, watch, Mutex, RwLock};
 
-/// 宿主平台需要提供给运行时的能力。
-///
-/// 实现要点：[`emit`](RuntimeHost::emit) 会在信令消息循环里被同步调用，
-/// 实现必须立即返回，不能阻塞——耗时的投递自行转异步。
-pub trait RuntimeHost: Send + Sync + 'static {
-    /// 把事件投递给界面。桌面端走 Tauri 的 `emit`，headless 端走 broadcast
-    /// 通道再转 SSE，Android 走 JNI 回调。
-    fn emit(&self, event: &str, data: Value);
-
-    /// 日志根目录。桌面端在配置目录下的 `log/`；Android 必须是
-    /// `getExternalFilesDir()`，否则无 root 的设备根本读不到日志。
-    fn log_dir(&self) -> PathBuf;
-
-    /// 身份密钥与配置的存放目录。
-    fn data_dir(&self) -> PathBuf {
-        ClientConfig::config_path()
-            .parent()
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| PathBuf::from("."))
-    }
-}
-
-/// 桌面端与 headless 端共用的日志目录：配置目录下的 `log/`。
-/// Android 不适用，见 [`RuntimeHost::log_dir`]。
-pub fn default_log_directory() -> PathBuf {
+/// 日志目录。与桌面端一致放在配置目录下的 `log/`，
+/// 这样"打包整个目录上报"的逻辑两端可以共用。
+pub fn log_directory() -> std::path::PathBuf {
     ClientConfig::config_path()
         .parent()
         .map(|d| d.join("log"))
-        .unwrap_or_else(|| PathBuf::from("log"))
+        .unwrap_or_else(|| std::path::PathBuf::from("log"))
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -64,6 +30,7 @@ pub struct UiEvent {
 
 #[derive(Clone)]
 struct RelayInfo {
+    room_code: String,
     relay_addr: String,
     relay_quic_port: u16,
     token: String,
@@ -92,16 +59,12 @@ struct RuntimeState {
     punch_sessions: PunchSessions,
     /// 打洞阶段协商出的 overlay 会话密钥。
     /// P2P 与中继两条路径共用同一份——中继只做盲转发，看不到明文。
-    peer_crypto: Option<Arc<crate::crypto::SessionCrypto>>,
+    peer_crypto: Option<Arc<phantom_core::crypto::SessionCrypto>>,
     relay: Option<RelayInfo>,
     conn_manager: Option<Arc<tunnel::TunnelConnManager>>,
     host_endpoint: Option<quinn::Endpoint>,
     host_peers: HashMap<String, HostPeer>,
     host_ice_tasks: HashMap<String, tokio::task::JoinHandle<()>>,
-    /// 房间里所有 Guest 共用 Host 这一条中继连接，因此要记住它对应的
-    /// token：token 没变且连接还活着时**不能重连**，否则会把正在通过它
-    /// 转发的其他 Guest 一起掐断。判定见 [`should_start_host_relay`]。
-    relay_host_token: Option<String>,
     relay_host_conn: Option<quinn::Connection>,
     tun_bridge: Option<Arc<tun_bridge::TunBridge>>,
 }
@@ -125,50 +88,52 @@ impl Default for RuntimeState {
             host_endpoint: None,
             host_peers: HashMap::new(),
             host_ice_tasks: HashMap::new(),
-            relay_host_token: None,
             relay_host_conn: None,
             tun_bridge: None,
         }
     }
 }
 
-pub struct SessionRuntime {
+pub struct HeadlessRuntime {
     signal: Arc<signal::client::SignalClient>,
     stats: Arc<stats::StatsManager>,
     state: Mutex<RuntimeState>,
     config: RwLock<ClientConfig>,
-    host: Arc<dyn RuntimeHost>,
+    events: broadcast::Sender<UiEvent>,
     overlay_ip: watch::Sender<Option<Ipv4Addr>>,
     auto_host: AtomicBool,
+    web_port: u16,
 }
 
-impl SessionRuntime {
-    /// 构造运行时。
-    ///
-    /// **必须在 Tokio 运行时上下文内调用**——内部会 `tokio::spawn` 带宽采样
-    /// 任务，脱离上下文调用会直接 panic。`#[tokio::main]` 里天然满足；
-    /// 桌面端的 Tauri `setup()` 跑在主线程上不满足，需要用
-    /// `tauri::async_runtime::block_on` 包一层；Android 的 JNI 入口同理，
-    /// 要先进入运行时再建。
-    pub fn new(host: Arc<dyn RuntimeHost>) -> Result<Arc<Self>, String> {
-        crate::ensure_rustls_crypto_provider()?;
+impl HeadlessRuntime {
+    pub fn new(web_port: u16) -> Result<Arc<Self>, String> {
+        phantom_core::ensure_rustls_crypto_provider()?;
         let config = ClientConfig::load();
-        let identity = Arc::new(Identity::load_or_generate(&host.data_dir())?);
+        let data_dir = ClientConfig::config_path()
+            .parent()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let identity = Arc::new(Identity::load_or_generate(&data_dir)?);
         let signal = Arc::new(signal::client::SignalClient::new(identity, config.dev_mode));
         let stats = Arc::new(stats::StatsManager::new(false));
         stats.clone().start_sampling_task();
+        let (events, _) = broadcast::channel(512);
         let (overlay_ip, _) = watch::channel(None);
         Ok(Arc::new(Self {
             signal,
             stats,
             state: Mutex::new(RuntimeState::default()),
             config: RwLock::new(config),
-            host,
+            events,
             overlay_ip,
             auto_host: AtomicBool::new(false),
+            web_port,
         }))
     }
 
+    pub fn subscribe(&self) -> broadcast::Receiver<UiEvent> {
+        self.events.subscribe()
+    }
     pub fn overlay_receiver(&self) -> watch::Receiver<Option<Ipv4Addr>> {
         self.overlay_ip.subscribe()
     }
@@ -176,40 +141,22 @@ impl SessionRuntime {
     pub async fn start(self: &Arc<Self>, signal_url: String, auto_host: bool) {
         self.auto_host.store(auto_host, Ordering::Relaxed);
         self.signal.connect(signal_url).await;
-        self.spawn_message_loop();
-    }
-
-    /// 界面上"连接"按钮的语义：已连接时先断开再重连。
-    ///
-    /// 与 [`start`](Self::start) 的区别只在这一步。启动时不需要它——那时必然
-    /// 是断开状态；而用户点连接时可能正连着，直接再 `connect` 会叠加一条
-    /// websocket 任务，两条同时往同一个事件通道里灌消息。
-    pub async fn connect_signal(self: &Arc<Self>, signal_url: String) {
-        if self.signal.get_state().await != signal::client::ConnectionState::Disconnected {
-            self.signal.disconnect().await;
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        if let Some(mut receiver) = self.signal.take_event_rx().await {
+            let runtime = self.clone();
+            tokio::spawn(async move {
+                while let Some(message) = receiver.recv().await {
+                    runtime.handle_server_message(message).await;
+                }
+            });
         }
-        self.signal.connect(signal_url).await;
-        self.spawn_message_loop();
-    }
-
-    /// 事件接收端只能取一次，因此重连时这里会拿到 None——
-    /// 首次启动时建立的那个循环仍在读同一个通道，无需也不能再开一个。
-    fn spawn_message_loop(self: &Arc<Self>) {
-        let runtime = self.clone();
-        tokio::spawn(async move {
-            let Some(mut receiver) = runtime.signal.take_event_rx().await else {
-                return;
-            };
-            while let Some(message) = receiver.recv().await {
-                runtime.handle_server_message(message).await;
-            }
-        });
     }
 
     fn emit<T: Serialize>(&self, event: &str, payload: T) {
         if let Ok(data) = serde_json::to_value(payload) {
-            self.host.emit(event, data);
+            let _ = self.events.send(UiEvent {
+                event: event.to_string(),
+                data,
+            });
         }
     }
 
@@ -327,16 +274,11 @@ impl SessionRuntime {
                             json!({"my_ip": virtual_ip, "host_ip": virtual_ip, "subnet": subnet}),
                         );
                         let _ = self.signal.send(ClientMessage::HostReady).await;
-                        // 房主信息如何呈现由宿主决定：headless 端打印到终端，
-                        // 桌面端与 Android 走各自的界面。core 只负责把事实发出去。
-                        self.emit(
-                            "room:host_ready",
-                            json!({
-                                "room_code": room_code,
-                                "virtual_ip": virtual_ip,
-                                "subnet": subnet,
-                            }),
-                        );
+                        println!();
+                        println!("Room code:        {}", room_code);
+                        println!("Host virtual IP:  {}", virtual_ip);
+                        println!("Overlay WebUI:    http://{}:{}", virtual_ip, self.web_port);
+                        println!();
                     }
                     Err(error) => {
                         tracing::error!("[TUN] Host device initialization failed: {}", error);
@@ -399,24 +341,26 @@ impl SessionRuntime {
                 }
             }
             ServerMessage::RelayPreAllocated {
+                room_code,
                 relay_addr,
                 relay_quic_port,
                 token,
-                ..
             } => {
                 self.state.lock().await.relay = Some(RelayInfo {
+                    room_code,
                     relay_addr,
                     relay_quic_port,
                     token,
                 });
             }
             ServerMessage::RelayReady {
+                room_code,
                 relay_addr,
                 relay_quic_port,
                 token,
-                ..
             } => {
                 let relay = RelayInfo {
+                    room_code,
                     relay_addr,
                     relay_quic_port,
                     token,
@@ -468,9 +412,9 @@ impl SessionRuntime {
     /// 打包与 HTTP 传输都是阻塞操作，放到 blocking 线程池，
     /// 避免拖住信令消息循环。
     async fn upload_logs(&self, upload_url: String, reason: String) {
-        let dir = self.host.log_dir();
+        let dir = log_directory();
         let result = tokio::task::spawn_blocking(move || {
-            let uploader = crate::log_upload::LogUploader::new(&dir);
+            let uploader = phantom_core::log_upload::LogUploader::new(&dir);
             // 先补投历史失败的包——它们往往正是"网络有问题"那次的日志
             uploader.flush_pending();
             uploader.upload_now(&upload_url, &reason)
@@ -850,9 +794,16 @@ impl SessionRuntime {
         }
     }
 
-    async fn start_relay(self: &Arc<Self>, relay: RelayInfo) -> Result<(), String> {
+    async fn start_relay(&self, relay: RelayInfo) -> Result<(), String> {
         let address = resolve_ipv4(&relay.relay_addr, relay.relay_quic_port).await?;
-        let is_host = self.state.lock().await.is_host;
+        let (is_host, tun, crypto) = {
+            let state = self.state.lock().await;
+            (
+                state.is_host,
+                state.tun_bridge.clone(),
+                state.peer_crypto.clone(),
+            )
+        };
         let user = self
             .stats
             .first_connection_id()
@@ -862,87 +813,16 @@ impl SessionRuntime {
             .add_connection(user.clone(), "relay".into())
             .await;
         if is_host {
-            // 同一个房间里每个 Guest 回落中继都会触发一次 RelayReady，
-            // 但 Host 只应该有一条中继连接。token 未变且连接仍活着时直接复用，
-            // 否则会把正在经由它转发的其他 Guest 一并掐断。
-            let should_start = {
-                let mut state = self.state.lock().await;
-                let connection_alive = state
-                    .relay_host_conn
-                    .as_ref()
-                    .map(|conn| conn.close_reason().is_none())
-                    .unwrap_or(false);
-                let start = should_start_host_relay(
-                    state.relay_host_token.as_deref(),
-                    &relay.token,
-                    state.relay_host_conn.is_some(),
-                    connection_alive,
-                );
-                if start {
-                    if let Some(old) = state.relay_host_conn.take() {
-                        old.close(0u32.into(), b"relay token changed");
-                    }
-                    state.relay_host_token = Some(relay.token.clone());
-                }
-                start
-            };
-
-            if !should_start {
-                tracing::info!("[中继] Host 中继连接已就绪，复用 token {}", relay.token);
-                self.emit("tunnel:started", "Relay");
-                return Ok(());
-            }
-
-            // 建连自带 30 秒超时，**绝不能在信令消息循环里 await**——
-            // 中继不可达时会把心跳与状态更新一起卡死整整半分钟。
-            let runtime = self.clone();
-            let token = relay.token.clone();
-            let stats = self.stats.clone();
-            tokio::spawn(async move {
-                // tun 与会话密钥在建连时刻重新取：排队等待期间它们可能已经变了
-                let (tun, crypto) = {
-                    let state = runtime.state.lock().await;
-                    (state.tun_bridge.clone(), state.peer_crypto.clone())
-                };
-                match tunnel::connect_relay_quic_host(
-                    address,
-                    token.clone(),
-                    stats,
-                    user,
-                    tun,
-                    crypto,
-                )
-                .await
-                {
-                    Ok(connection) => {
-                        let mut state = runtime.state.lock().await;
-                        // 建连期间可能已被更新的 token 顶替，那这条就是过期连接
-                        if state.relay_host_token.as_deref() == Some(token.as_str()) {
-                            state.relay_host_conn = Some(connection);
-                            drop(state);
-                            runtime.emit("tunnel:started", "Relay");
-                        } else {
-                            connection.close(0u32.into(), b"stale relay connection");
-                        }
-                    }
-                    Err(error) => {
-                        {
-                            let mut state = runtime.state.lock().await;
-                            // 失败后必须清掉 token：否则守卫会认为"同 token 且正在建立中"
-                            // 而一直拒绝重连，房间就再也回不到中继了
-                            if state.relay_host_token.as_deref() == Some(token.as_str()) {
-                                state.relay_host_token = None;
-                                if let Some(old) = state.relay_host_conn.take() {
-                                    old.close(0u32.into(), b"relay connection failed");
-                                }
-                            }
-                        }
-                        tracing::error!("[中继] Host 连接失败: {}", error);
-                        runtime.emit("tunnel:failed", json!({"mode": "Relay", "reason": error}));
-                    }
-                }
-            });
-            return Ok(());
+            let connection = tunnel::connect_relay_quic_host(
+                address,
+                relay.token,
+                self.stats.clone(),
+                user,
+                tun,
+                crypto,
+            )
+            .await?;
+            self.state.lock().await.relay_host_conn = Some(connection);
         } else {
             let connection =
                 tunnel::connect_relay_quic_guest(address, relay.token, self.stats.clone(), user)
@@ -1047,11 +927,6 @@ impl SessionRuntime {
     pub async fn invoke(self: &Arc<Self>, command: &str, payload: Value) -> Result<Value, String> {
         match command {
             "is_dev_mode" => Ok(json!(false)),
-            "get_signal_status" => Ok(json!({
-                "state": self.signal.get_state().await.to_string(),
-                "session_id": self.signal.get_session_id().await,
-                "room_code": self.signal.get_room_code().await,
-            })),
             "show_main_window" => Ok(Value::Null),
             "connect_signal" => {
                 if self.signal.get_state().await == signal::client::ConnectionState::Disconnected {
@@ -1059,12 +934,11 @@ impl SessionRuntime {
                         .get("signalUrl")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    let url = crate::config::runtime_signal_server(requested);
+                    let url = phantom_core::config::runtime_signal_server(requested);
                     self.signal.connect(url).await;
                 }
-                // 重放当前状态，让刚接上的界面立刻看到完整快照
                 for event in self.snapshot().await {
-                    self.host.emit(&event.event, event.data);
+                    let _ = self.events.send(event);
                 }
                 Ok(Value::Null)
             }
@@ -1134,6 +1008,13 @@ impl SessionRuntime {
             }
             "start_relay_tunnel" => {
                 let relay = RelayInfo {
+                    room_code: self
+                        .state
+                        .lock()
+                        .await
+                        .room_code
+                        .clone()
+                        .unwrap_or_default(),
                     relay_addr: required_string(&payload, "relayAddr")?,
                     relay_quic_port: payload
                         .get("relayQuicPort")
@@ -1258,58 +1139,4 @@ async fn resolve_ipv4(host: &str, port: u16) -> Result<SocketAddr, String> {
         "cannot resolve an IPv4 relay address for {}",
         target
     ))
-}
-
-/// Host 是否需要新建中继连接。
-///
-/// 房间里所有 Guest 共用 Host 这一条中继连接，而每个 Guest 回落中继都会
-/// 触发一次 `RelayReady`。若 token 未变且连接仍可用，重连只会把正在经由
-/// 它转发的其他 Guest 一起掐断，因此这里必须返回 false。
-fn should_start_host_relay(
-    active_token: Option<&str>,
-    requested_token: &str,
-    connection_present: bool,
-    connection_alive: bool,
-) -> bool {
-    let same_token = active_token == Some(requested_token);
-    !(same_token && (connection_alive || !connection_present))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::should_start_host_relay;
-
-    #[test]
-    fn host_relay_is_idempotent_per_room_token() {
-        // 首次请求：没有活动 token，必须建立
-        assert!(should_start_host_relay(None, "room-a", false, false));
-        // 同 token 且正在建立中（尚无连接对象）：不要重复发起
-        assert!(!should_start_host_relay(
-            Some("room-a"),
-            "room-a",
-            false,
-            false
-        ));
-        // 同 token 且连接存活：复用，绝不能重连
-        assert!(!should_start_host_relay(
-            Some("room-a"),
-            "room-a",
-            true,
-            true
-        ));
-        // 同 token 但连接已断：需要重建
-        assert!(should_start_host_relay(
-            Some("room-a"),
-            "room-a",
-            true,
-            false
-        ));
-        // 换了房间（token 变化）：必须重建
-        assert!(should_start_host_relay(
-            Some("room-a"),
-            "room-b",
-            true,
-            true
-        ));
-    }
 }

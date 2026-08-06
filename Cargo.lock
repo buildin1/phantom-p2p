@@ -3033,7 +3033,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "phantom-core"
-version = "3.1.0"
+version = "3.0.1"
 dependencies = [
  "chacha20poly1305",
  "dirs",
@@ -3067,21 +3067,19 @@ dependencies = [
 
 [[package]]
 name = "phantom-mobile"
-version = "3.1.0"
+version = "3.0.1"
 dependencies = [
  "jni",
  "once_cell",
  "parking_lot",
  "phantom-core",
  "quinn",
- "serde_json",
  "tokio",
- "tracing",
 ]
 
 [[package]]
 name = "phantom-p2p"
-version = "3.1.0"
+version = "3.0.1"
 dependencies = [
  "axum",
  "dirs",
@@ -3110,7 +3108,7 @@ dependencies = [
 
 [[package]]
 name = "phantom-p2p-web"
-version = "3.1.0"
+version = "3.0.1"
 dependencies = [
  "axum",
  "clap",
@@ -3127,7 +3125,7 @@ dependencies = [
 
 [[package]]
 name = "phantom-protocol"
-version = "3.1.0"
+version = "3.0.1"
 dependencies = [
  "ed25519-dalek",
  "rmp-serde",
@@ -3137,7 +3135,7 @@ dependencies = [
 
 [[package]]
 name = "phantom-server"
-version = "3.1.0"
+version = "3.0.1"
 dependencies = [
  "argon2",
  "axum",
