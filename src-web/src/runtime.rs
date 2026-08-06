@@ -517,6 +517,17 @@ impl HeadlessRuntime {
     }
 
     async fn start_punch(&self) -> Result<(), String> {
+        // 开发者模式的强制中继：跳过打洞直接要中继。
+        //
+        // 存在的意义是**能单独测中继链路**——打洞几乎总会成功，中继路径平时
+        // 根本走不到，出了问题也无从复现。非开发者模式下这个开关会被
+        // `apply_mode_policy` 强制关掉，普通用户不受影响。
+        if self.config.read().await.force_relay_mode {
+            tracing::warn!("[开发者模式] 强制中继已开启，跳过 P2P 打洞直接申请中继");
+            self.emit("punch:forced_relay", json!({ "enabled": true }));
+            return self.signal.send(ClientMessage::RelayRequest).await;
+        }
+
         // Host 的 socket 是长期存活的，已有候选就直接复用重报，
         // 不要重新探测——否则会毁掉已经建立的连接
         let existing = {

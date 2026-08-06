@@ -1031,6 +1031,17 @@ async fn start_punch(
     let is_dev = DEV_MODE.load(Ordering::Relaxed);
     let is_host = *punch_state.is_host.read().await;
 
+    // 开发者模式的强制中继：跳过打洞直接要中继。
+    //
+    // 存在的意义是**能单独测中继链路**——打洞几乎总会成功，中继路径平时
+    // 根本走不到，出了问题也无从复现。非开发者模式下这个开关会被
+    // `apply_mode_policy` 强制关掉，普通用户不受影响。
+    if is_dev && phantom_core::config::ClientConfig::load().force_relay_mode {
+        tracing::warn!("[开发者模式] 强制中继已开启，跳过 P2P 打洞直接申请中继");
+        let _ = app.emit("punch:forced_relay", serde_json::json!({ "enabled": true }));
+        return client.send(ClientMessage::RelayRequest).await;
+    }
+
     if is_host {
         let peer_id = peer_session_id.ok_or("Host ICE requires peer_session_id")?;
         if punch_state.host_peers.lock().await.contains_key(&peer_id) {
