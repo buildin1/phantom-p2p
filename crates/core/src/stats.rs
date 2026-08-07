@@ -33,12 +33,23 @@ pub struct ConnectionStats {
     pub packets_received: u64,
     /// 丢失的包数
     pub packets_lost: u64,
-    /// QUIC 路径层发送包计数（来自 quinn::Connection::stats）
+    /// QUIC 路径层发送包计数（来自 quinn::Connection::stats，连接建立以来的累计值）
     pub quic_sent_packets: u64,
-    /// QUIC 路径层丢包计数（来自 quinn::Connection::stats）
+    /// QUIC 路径层丢包计数（来自 quinn::Connection::stats，连接建立以来的累计值）
     pub quic_lost_packets: u64,
+    /// 上一次 `update_quic_path_stats` 时的累计值，用于算增量。
+    ///
+    /// 光有累计值算不出"最近怎么样"：连接开了几十分钟、早期一次性丢了
+    /// 500 个包之后一直很干净，累计丢包率会一直卡在一个吓人的历史值上
+    /// 不再下降；反过来，游戏中途刚出现的剧烈丢包也会被几十分钟的干净
+    /// 历史稀释成看不出来的小数点。前端要展示的是"现在怎么样"，
+    /// 必须用两次采样之间的增量算，不能直接拿累计值除累计值。
+    prev_quic_sent: u64,
+    prev_quic_lost: u64,
+    /// 按上面的增量算出的、最近一个采样区间的 QUIC 丢包率（万分之一）。
+    pub recent_quic_loss_bp: u16,
     /// 实测**入方向**丢包率（万分之一）。由 overlay 计数器空洞算得，
-    /// 尚无观测时为 None。
+    /// 本身已经是窗口化的"最近"值，尚无观测时为 None。
     pub inbound_loss_bp: Option<u16>,
     /// 发送的字节数
     pub bytes_sent: u64,
@@ -60,6 +71,9 @@ impl ConnectionStats {
             packets_lost: 0,
             quic_sent_packets: 0,
             quic_lost_packets: 0,
+            prev_quic_sent: 0,
+            prev_quic_lost: 0,
+            recent_quic_loss_bp: 0,
             inbound_loss_bp: None,
             bytes_sent: 0,
             bytes_received: 0,
@@ -76,19 +90,31 @@ impl ConnectionStats {
         self.latency_samples.iter().sum::<u64>() / self.latency_samples.len() as u64
     }
 
-    /// 获取丢包率 (百分比)
+    /// 获取丢包率 (百分比)——取"**入方向**实测值"和"最近一段 QUIC 出方向丢包率"
+    /// 两者较大值。
     ///
-    /// 优先用**入方向**实测值（overlay 计数器空洞，见 `tun_bridge`）。
+    /// 之前这里是 `inbound_loss_bp` 一旦有过任何观测（哪怕是 0）就直接 `return`，
+    /// 完全不看 QUIC 那边——而 `inbound_loss_bp` 本身是个短窗口（几秒）实时值，
+    /// 干净的那几秒一到就把上一次真实丢包的痕迹冲掉，前端 1 秒轮询一次，
+    /// 大概率轮询到的正是"已经冲干净"的那一刻，于是看起来永远是 0%，
+    /// 哪怕连接期间真的丢过包（实测联机时出现过：QUIC 自己测出 0.81% 的
+    /// 累计丢包，前端却全程显示 0%）。
     ///
-    /// QUIC 的路径统计只是兜底：它测的是"**我发出去**的包丢了多少"（出方向），
-    /// 而真正毁掉体验的是"对端发给我、我没收到"的包——那份数据只存在于**对端**
-    /// 的 QUIC 栈里，本地怎么读都读不到。两者方向相反，不能混为一谈。
+    /// 也不能反过来只信 QUIC：它的 `quic_sent_packets`/`quic_lost_packets`
+    /// 是**连接建立以来的全量累计值**，早期一次性丢过一批包之后哪怕后面
+    /// 干净几十分钟，累计比例也降不回去，一样不反映"现在怎么样"。
+    /// 所以 QUIC 这边也要用增量算最近一段的丢包率（`recent_quic_loss_bp`，
+    /// 见 `update_quic_path_stats`），不能直接拿累计值除累计值。
+    ///
+    /// 两个都是"最近"口径，取较大值：`inbound_loss_bp` 测的是对端发给我、
+    /// 我没收到的包（真正影响体验的方向），`recent_quic_loss_bp` 测的是我
+    /// 发出去的包在传输层的丢包——只要任一方向最近在丢包，都该让用户看见，
+    /// 而不是谁把谁盖掉。
     pub fn get_packet_loss_rate(&self) -> f64 {
-        if let Some(bp) = self.inbound_loss_bp {
-            return bp as f64 / 100.0;
-        }
-        if self.quic_sent_packets > 0 {
-            return (self.quic_lost_packets as f64 / self.quic_sent_packets as f64) * 100.0;
+        let inbound = self.inbound_loss_bp.unwrap_or(0);
+        let recent_quic = self.recent_quic_loss_bp;
+        if self.inbound_loss_bp.is_some() || self.quic_sent_packets > 0 {
+            return inbound.max(recent_quic) as f64 / 100.0;
         }
         if self.packets_sent == 0 {
             return 0.0;
@@ -224,7 +250,11 @@ impl StatsManager {
         }
     }
 
-    /// 更新 QUIC 路径层统计（用于实时丢包率）
+    /// 更新 QUIC 路径层统计（用于实时丢包率）。
+    ///
+    /// 调用方（`spawn_quic_monitor`）每秒传入的是**连接建立以来的累计值**，
+    /// 这里顺手用跟上一次的差值算一段"最近"的丢包率存进
+    /// `recent_quic_loss_bp`，原因见 `get_packet_loss_rate` 的说明。
     pub async fn update_quic_path_stats(
         &self,
         user_id: &str,
@@ -233,6 +263,16 @@ impl StatsManager {
     ) {
         let mut conns = self.connections.write().await;
         if let Some(stats) = conns.get_mut(user_id) {
+            // 用 saturating_sub：quinn 的累计计数器只增不减，正常不会倒退，
+            // 但连接迁移/重建等边缘情况万一真的倒退了，宁可把这次增量当 0，
+            // 也不要下溢算出一个荒谬的丢包率。
+            let delta_sent = sent_packets.saturating_sub(stats.prev_quic_sent);
+            let delta_lost = lost_packets.saturating_sub(stats.prev_quic_lost);
+            if delta_sent > 0 {
+                stats.recent_quic_loss_bp = ((delta_lost * 10_000) / delta_sent).min(10_000) as u16;
+            }
+            stats.prev_quic_sent = sent_packets;
+            stats.prev_quic_lost = lost_packets;
             stats.quic_sent_packets = sent_packets;
             stats.quic_lost_packets = lost_packets;
         }
@@ -445,4 +485,69 @@ pub struct StatsResponse {
     pub download_history: Vec<f64>,
     pub online_count: usize,
     pub players: Option<Vec<PlayerInfo>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归测试：这就是实机联机测出来的那个 bug——`inbound_loss_bp` 只要被
+    /// 观测过一次（哪怕是 0），旧代码会直接 `return`，QUIC 自己测到的
+    /// 累计丢包就永远显示不出来。
+    #[test]
+    fn quic_loss_is_not_masked_by_a_clean_inbound_reading() {
+        let mut stats = ConnectionStats::new("u1".into(), "p2p".into());
+        stats.inbound_loss_bp = Some(0); // 最近这一刻入方向是干净的
+        stats.quic_sent_packets = 1000;
+        stats.recent_quic_loss_bp = 200; // 但 QUIC 那边最近测到 2% 丢包
+        assert_eq!(stats.get_packet_loss_rate(), 2.0);
+    }
+
+    /// 入方向如果比 QUIC 那边更高，也不能被 QUIC 的低值压下去——
+    /// 两个方向哪个在丢包都要能看见。
+    #[test]
+    fn inbound_loss_wins_when_higher_than_quic() {
+        let mut stats = ConnectionStats::new("u1".into(), "p2p".into());
+        stats.inbound_loss_bp = Some(3000); // 30%
+        stats.quic_sent_packets = 1000;
+        stats.recent_quic_loss_bp = 50;
+        assert_eq!(stats.get_packet_loss_rate(), 30.0);
+    }
+
+    /// 没有任何观测时不能报丢包。
+    #[test]
+    fn reports_zero_before_any_observation() {
+        let stats = ConnectionStats::new("u1".into(), "p2p".into());
+        assert_eq!(stats.get_packet_loss_rate(), 0.0);
+    }
+
+    /// `update_quic_path_stats` 存的是**增量**丢包率，不是累计值直接相除——
+    /// 早期一次性丢了一批包之后，只要后面这次增量是干净的，`recent_quic_loss_bp`
+    /// 就该回落，不能被历史累计值锁死在高位。
+    #[tokio::test]
+    async fn quic_loss_rate_reflects_the_recent_window_not_lifetime_cumulative() {
+        let manager = StatsManager::new(true);
+        manager.add_connection("u1".into(), "p2p".into()).await;
+
+        // 第一次采样：早期一次性丢了 100/1000，累计丢包率 10%。
+        manager.update_quic_path_stats("u1", 1000, 100).await;
+        {
+            let conns = manager.connections.read().await;
+            let s = conns.get("u1").unwrap();
+            assert_eq!(s.recent_quic_loss_bp, 1000); // 10.00%
+        }
+
+        // 第二次采样：这段区间新发了 1000 个、一个没丢——
+        // 最近一段应该是 0%，不能还停在 10%。
+        manager.update_quic_path_stats("u1", 2000, 100).await;
+        {
+            let conns = manager.connections.read().await;
+            let s = conns.get("u1").unwrap();
+            assert_eq!(s.recent_quic_loss_bp, 0);
+            // 但累计丢包率字段本身还是要如实反映 QUIC 报告的全量累计值，
+            // 不能因为要算增量就把原始数据弄丢。
+            assert_eq!(s.quic_sent_packets, 2000);
+            assert_eq!(s.quic_lost_packets, 100);
+        }
+    }
 }
