@@ -54,10 +54,27 @@ const REDUNDANCY_STAGGER: Duration = Duration::from_millis(10);
 /// 冗余必须跟着实测丢包走、按流精确定向，不能全局常开去撞运营商风控。
 const REDUNDANCY_HOLD: Duration = Duration::from_secs(4);
 
-/// NACK 请求重传的最长等待时间。超过这个时间还没重传成功就放弃——
-/// 那时候内层 TCP 自己的 RACK-TLP 恢复（约 55ms）早就完成了，
-/// 补丢发出去也没有意义，白占带宽。
-const ARQ_DEADLINE: Duration = Duration::from_millis(150);
+/// NACK 请求重传的最长等待时间，**按这条连接实测的 RTT 动态算**，不能写死。
+///
+/// 曾经写死成 150ms，在低延迟链路上没问题，但拿到一条真实高丢包链路
+/// （RTT 200~330ms）实测后发现：补包机制完全没触发过一次。算一下账就知道
+/// 为什么——NACK 走完一圈至少要「重排容忍期 + NACK 单程 + 重发单程」，
+/// 单程网络延迟就接近半个 RTT，两段单程加起来接近一整个 RTT。写死
+/// 150ms 的话，NACK 还没到发送端，发送缓冲里的条目就已经被判定"过期"
+/// 清掉了——RTT 越高、越需要补包的链路，反而越注定失效。
+///
+/// 下限 [`ARQ_DEADLINE_FLOOR`] 保住原来低延迟链路上就验证过的数值；
+/// 上限 [`ARQ_DEADLINE_CEILING`] 防止极端高 RTT 链路把这个值撑到不合理。
+const ARQ_DEADLINE_FLOOR: Duration = Duration::from_millis(150);
+const ARQ_DEADLINE_CEILING: Duration = Duration::from_secs(2);
+
+/// 用当前连接的 RTT 算出这次该用的 ARQ 截止时间。
+///
+/// 取 `2×RTT + 50ms`：NACK 一圈大约要 1 个 RTT，乘 2 留出往返抖动的余量，
+/// 再加一点固定余量兜底极低 RTT 场景下的调度/处理开销。
+fn arq_deadline_for(rtt: Duration) -> Duration {
+    (rtt * 2 + Duration::from_millis(50)).clamp(ARQ_DEADLINE_FLOOR, ARQ_DEADLINE_CEILING)
+}
 
 /// 发现空洞后，先给这么久的重排容忍期——大概率只是乱序到达，不是真丢。
 /// 数据报本就无序，超过这个时间还没等到才真正当成丢包去 NACK。
@@ -73,7 +90,7 @@ const NACK_MIN_INTERVAL: Duration = Duration::from_millis(10);
 const NACK_MAX_RANGES: usize = 32;
 
 /// 发送缓冲最多保留这么多个最近发送的包，用于 NACK 命中时原样重发。
-/// 超过 `ARQ_DEADLINE` 的条目即使还在缓冲里也不会再被用来重传。
+/// 超过 ARQ 截止时间（[`arq_deadline_for`]）的条目即使还在缓冲里也不会再被用来重传。
 const SEND_BUFFER_CAP: usize = 512;
 
 /// 心跳间隔：定期把"目前发到的最大计数器"告诉对端。
@@ -231,12 +248,12 @@ impl SendBuffer {
         self.order.push_back(counter);
     }
 
-    /// 命中且仍在 ARQ 截止时间内才返回——超时的条目就算还在缓冲里也不给用，
-    /// 那时候重传已经没有意义了。
-    fn get(&self, counter: u64) -> Option<&SentEntry> {
+    /// 命中且仍在 `deadline`（按当前连接 RTT 动态算，见 [`arq_deadline_for`]）
+    /// 内才返回——超时的条目就算还在缓冲里也不给用，那时候重传已经没有意义了。
+    fn get(&self, counter: u64, deadline: Duration) -> Option<&SentEntry> {
         self.entries
             .get(&counter)
-            .filter(|e| e.sent_at.elapsed() < ARQ_DEADLINE)
+            .filter(|e| e.sent_at.elapsed() < deadline)
     }
 }
 
@@ -296,12 +313,13 @@ impl PeerForwarder {
     /// 收到对端的 NACK：命中的计数器原样从发送缓冲重发，并把命中的流标记为
     /// "需要冗余"，让后续该流的包自动补发，不用等下一次 NACK 才反应过来。
     fn handle_nack(&self, ranges: &[(u64, u16)]) {
+        let deadline = arq_deadline_for(self.conn.rtt());
         let mut flows_to_activate: Vec<FlowKey> = Vec::new();
         {
             let buffer = self.send_buffer.lock().unwrap();
             for &(start, count) in ranges {
                 for counter in start..start.saturating_add(count as u64) {
-                    let Some(entry) = buffer.get(counter) else {
+                    let Some(entry) = buffer.get(counter, deadline) else {
                         // 缓冲里没有（已经被淘汰或超过 ARQ 截止时间）——
                         // 放弃这个计数器，跟没收到 NACK 一样处理。
                         continue;
@@ -946,16 +964,20 @@ impl GapTracker {
     }
 
     /// 到了该发 NACK 的时候，取出当前该催的空洞（过了重排容忍期、
-    /// 还没过 ARQ 截止时间），按连续区间压缩，最多带 [`NACK_MAX_RANGES`] 个。
+    /// 还没过 `deadline`），按连续区间压缩，最多带 [`NACK_MAX_RANGES`] 个。
     /// 超过截止时间的空洞直接放弃，不再纳入统计。
-    fn ranges_to_nack(&mut self, now: Instant) -> Vec<(u64, u16)> {
+    ///
+    /// `deadline` 由调用方按当前连接的实测 RTT 算好传进来（见
+    /// [`arq_deadline_for`]）——固定 RTT 越高的链路越需要更长的截止时间，
+    /// 写死一个值在高延迟链路上会导致空洞在 NACK 发出去之前就被这里放弃。
+    fn ranges_to_nack(&mut self, now: Instant, deadline: Duration) -> Vec<(u64, u16)> {
         if let Some(last) = self.last_nack {
             if now.duration_since(last) < NACK_MIN_INTERVAL {
                 return Vec::new();
             }
         }
         self.pending
-            .retain(|_, first_seen| now.duration_since(*first_seen) < ARQ_DEADLINE);
+            .retain(|_, first_seen| now.duration_since(*first_seen) < deadline);
 
         let mut due: Vec<u64> = self
             .pending
@@ -991,7 +1013,8 @@ impl GapTracker {
 }
 
 fn maybe_send_nack(sender: &PeerForwarder, gaps: &mut GapTracker, now: Instant) {
-    let ranges = gaps.ranges_to_nack(now);
+    let deadline = arq_deadline_for(sender.conn.rtt());
+    let ranges = gaps.ranges_to_nack(now, deadline);
     if !ranges.is_empty() {
         sender.send_control(encode_nack(&ranges));
     }
@@ -1519,12 +1542,18 @@ mod tests {
         let mut g = GapTracker::new();
         g.observe(1, t);
         g.observe(3, t); // 2 还没到，但可能只是乱序
-        assert!(g.ranges_to_nack(t).is_empty(), "重排容忍期内不该立刻 NACK");
+        assert!(
+            g.ranges_to_nack(t, ARQ_DEADLINE_FLOOR).is_empty(),
+            "重排容忍期内不该立刻 NACK"
+        );
         // 2 姗姗来迟
         g.observe(2, t + Duration::from_millis(5));
         assert!(
-            g.ranges_to_nack(t + REORDER_GRACE + Duration::from_millis(1))
-                .is_empty(),
+            g.ranges_to_nack(
+                t + REORDER_GRACE + Duration::from_millis(1),
+                ARQ_DEADLINE_FLOOR
+            )
+            .is_empty(),
             "已经补上的空洞不该再出现在 NACK 里"
         );
     }
@@ -1535,7 +1564,10 @@ mod tests {
         let mut g = GapTracker::new();
         g.observe(1, t);
         g.observe(5, t); // 2、3、4 缺失
-        let ranges = g.ranges_to_nack(t + REORDER_GRACE + Duration::from_millis(1));
+        let ranges = g.ranges_to_nack(
+            t + REORDER_GRACE + Duration::from_millis(1),
+            ARQ_DEADLINE_FLOOR,
+        );
         assert_eq!(ranges, vec![(2, 3)], "连续缺失应该压缩成一个区间");
     }
 
@@ -1545,9 +1577,9 @@ mod tests {
         let mut g = GapTracker::new();
         g.observe(1, t);
         g.observe(5, t);
-        let too_late = t + ARQ_DEADLINE + Duration::from_millis(1);
+        let too_late = t + ARQ_DEADLINE_FLOOR + Duration::from_millis(1);
         assert!(
-            g.ranges_to_nack(too_late).is_empty(),
+            g.ranges_to_nack(too_late, ARQ_DEADLINE_FLOOR).is_empty(),
             "超过 ARQ 截止时间的空洞必须放弃，不能一直 NACK 下去"
         );
     }
@@ -1559,21 +1591,74 @@ mod tests {
         g.observe(1, t);
         g.observe(5, t);
         let due = t + REORDER_GRACE + Duration::from_millis(1);
-        let first = g.ranges_to_nack(due);
+        let first = g.ranges_to_nack(due, ARQ_DEADLINE_FLOOR);
         assert!(!first.is_empty(), "第一次该发");
-        let second = g.ranges_to_nack(due + Duration::from_millis(1));
+        let second = g.ranges_to_nack(due + Duration::from_millis(1), ARQ_DEADLINE_FLOOR);
         assert!(second.is_empty(), "限速窗口内不该再发一次");
     }
 
+    /// 这是这版要修的那个真实 bug 的回归测试：高 RTT 链路上，固定 150ms
+    /// 的截止时间会让空洞在 NACK 发出去之前就被放弃——实测 RTT 300ms 的
+    /// 链路上补包机制因此完全没触发过。改成动态计算之后，同样的空洞在
+    /// 高 RTT 下必须还活着。
     #[test]
-    fn send_buffer_hits_are_only_valid_within_arq_deadline() {
+    fn gap_tracker_survives_high_rtt_with_dynamic_deadline() {
+        let t = Instant::now();
+        let mut g = GapTracker::new();
+        g.observe(1, t);
+        g.observe(5, t);
+        let rtt = Duration::from_millis(300);
+        let deadline = arq_deadline_for(rtt);
+        // 固定 150ms 的旧行为：这个时间点空洞早就该被放弃了
+        let one_rtt_later = t + rtt;
+        assert!(
+            !g.ranges_to_nack(one_rtt_later, deadline).is_empty(),
+            "按 300ms RTT 动态算出的截止时间，不该在仅过了 1 个 RTT 时就放弃空洞"
+        );
+    }
+
+    #[test]
+    fn arq_deadline_scales_with_rtt_but_stays_within_bounds() {
+        assert_eq!(
+            arq_deadline_for(Duration::from_millis(1)),
+            ARQ_DEADLINE_FLOOR,
+            "极低 RTT 不该把截止时间压到比原来验证过的下限还小"
+        );
+        let high = arq_deadline_for(Duration::from_millis(300));
+        assert!(
+            high > Duration::from_millis(300),
+            "300ms RTT 下算出的截止时间应该明显盖过 1 个 RTT，不能刚好卡线"
+        );
+        assert_eq!(
+            arq_deadline_for(Duration::from_secs(30)),
+            ARQ_DEADLINE_CEILING,
+            "极端高 RTT 必须封顶，不能无限增长"
+        );
+    }
+
+    #[test]
+    fn send_buffer_hits_are_only_valid_within_the_given_deadline() {
         let t = Instant::now();
         let mut buf = SendBuffer::new();
         buf.push(42, vec![1, 2, 3], None, t);
-        assert!(buf.get(42).is_some(), "刚发的应该能命中");
+        assert!(
+            buf.get(42, ARQ_DEADLINE_FLOOR).is_some(),
+            "刚发的应该能命中"
+        );
         // 模拟时间流逝：直接构造一个"很久以前"发送的条目来验证截止时间生效
-        buf.entries.get_mut(&42).unwrap().sent_at = t - ARQ_DEADLINE - Duration::from_millis(1);
-        assert!(buf.get(42).is_none(), "超过 ARQ 截止时间的条目不该再被命中");
+        buf.entries.get_mut(&42).unwrap().sent_at =
+            t - ARQ_DEADLINE_FLOOR - Duration::from_millis(1);
+        assert!(
+            buf.get(42, ARQ_DEADLINE_FLOOR).is_none(),
+            "超过截止时间的条目不该再被命中"
+        );
+        // 同一个条目，换一个按高 RTT 算出来的更长截止时间，应该又能命中——
+        // 这正是这次要修的行为：截止时间必须跟着连接的 RTT 走。
+        assert!(
+            buf.get(42, arq_deadline_for(Duration::from_millis(300)))
+                .is_some(),
+            "高 RTT 链路算出的更长截止时间应该能救回同一个条目"
+        );
     }
 
     #[test]
@@ -1583,9 +1668,14 @@ mod tests {
         for i in 0..SEND_BUFFER_CAP as u64 {
             buf.push(i, vec![0], None, t);
         }
-        assert!(buf.get(0).is_some());
+        assert!(buf.get(0, ARQ_DEADLINE_FLOOR).is_some());
         buf.push(SEND_BUFFER_CAP as u64, vec![0], None, t);
-        assert!(buf.get(0).is_none(), "满了之后应该淘汰最老的条目");
-        assert!(buf.get(SEND_BUFFER_CAP as u64).is_some());
+        assert!(
+            buf.get(0, ARQ_DEADLINE_FLOOR).is_none(),
+            "满了之后应该淘汰最老的条目"
+        );
+        assert!(buf
+            .get(SEND_BUFFER_CAP as u64, ARQ_DEADLINE_FLOOR)
+            .is_some());
     }
 }
