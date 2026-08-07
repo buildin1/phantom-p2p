@@ -15,8 +15,9 @@ use crate::tun::{Ipv4Header, TunDevice, TunError};
 use quinn::Connection;
 use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex as SyncMutex;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
@@ -30,6 +31,140 @@ pub type PeerStats = Option<(Arc<StatsManager>, String)>;
 
 /// 入方向丢包率的结算窗口
 const LOSS_WINDOW: Duration = Duration::from_secs(2);
+
+/// 冗余包相对原包的发送延迟。
+///
+/// 定时器驱动是唯一能跑赢内层 TCP 自愈的手段——见《抗丢包方案设计》第四节：
+/// 反应式重传和"等下一个正常包顺路捎带"都要等到下一个包才能触发，游戏
+/// 20~30 包/秒的间隔（33~50ms）本身就追不上内层 TCP 约 55ms 的 RACK-TLP
+/// 自愈窗口。15ms 后补发一次，最坏情况恢复时间约等于延迟+单程时延，
+/// 能跑赢那 55ms。
+const REDUNDANCY_DELAY: Duration = Duration::from_millis(15);
+
+/// 补发多份时，相邻两份之间的错峰间隔。
+///
+/// 不能紧挨着发——一次突发丢包会把挨在一起的两份一起带走，冗余等于白加。
+/// 错开发送才是为突发丢包地区留的余量。
+const REDUNDANCY_STAGGER: Duration = Duration::from_millis(10);
+
+/// 一条流检测到丢包后，主动冗余保持开启的时长。
+///
+/// 期间内这条流安静下来（没有新的 NACK 命中）就让它自然过期关闭，
+/// 不需要显式的"关闭"事件——干净的流完全不产生冗余流量，这是刻意的：
+/// 冗余必须跟着实测丢包走、按流精确定向，不能全局常开去撞运营商风控。
+const REDUNDANCY_HOLD: Duration = Duration::from_secs(4);
+
+/// NACK 请求重传的最长等待时间。超过这个时间还没重传成功就放弃——
+/// 那时候内层 TCP 自己的 RACK-TLP 恢复（约 55ms）早就完成了，
+/// 补丢发出去也没有意义，白占带宽。
+const ARQ_DEADLINE: Duration = Duration::from_millis(150);
+
+/// 发现空洞后，先给这么久的重排容忍期——大概率只是乱序到达，不是真丢。
+/// 数据报本就无序，超过这个时间还没等到才真正当成丢包去 NACK。
+const REORDER_GRACE: Duration = Duration::from_millis(20);
+
+/// NACK 最多多久发一次，把这段时间内新发现的空洞打包一起发。
+///
+/// 不限速的话，一次突发丢包会让 NACK 自己的包速率瞬间顶高，正撞运营商
+/// 对 UDP 流量的风控——补救丢包的机制反倒成了触发风控的原因，本末倒置。
+const NACK_MIN_INTERVAL: Duration = Duration::from_millis(10);
+
+/// 一条 NACK 最多带多少个区间，避免链路极端时把 NACK 本身的报文撑爆。
+const NACK_MAX_RANGES: usize = 32;
+
+/// 发送缓冲最多保留这么多个最近发送的包，用于 NACK 命中时原样重发。
+/// 超过 `ARQ_DEADLINE` 的条目即使还在缓冲里也不会再被用来重传。
+const SEND_BUFFER_CAP: usize = 512;
+
+/// 心跳间隔：定期把"目前发到的最大计数器"告诉对端。
+///
+/// 主动冗余和 NACK 都只能补"两个已知序号之间"的空洞——如果对端发的最后
+/// 几个包全丢了，本端根本不知道那些序号存在过（没有后续包暴露这个空洞）。
+/// 心跳把发送端自己知道的最大计数器带过去，接收端一比对就能发现尾部缺口，
+/// 照样能触发 NACK 补上。
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 控制报文标签，取值故意避开合法 IPv4 首字节。
+///
+/// IPv4 首字节高 4 位固定是版本号 4（即 0x40~0x4F），所以任何高 4 位不是 4
+/// 的字节都不可能是一个真实 IP 包的开头。解密后不用再包一层信封、
+/// 不用额外占用报文空间，直接看首字节就能把控制报文和数据报文分开。
+const CTRL_NACK: u8 = 0xF1;
+const CTRL_HEARTBEAT: u8 = 0xF2;
+
+fn looks_like_ipv4(first_byte: u8) -> bool {
+    first_byte >> 4 == 4
+}
+
+/// 从密文头部读出计数器，仅用于日志把原包和补包对应起来——不解密。
+/// 报文格式见 `crypto.rs`：`[8字节大端计数器][密文+16字节tag]`。
+fn counter_of(sealed: &[u8]) -> u64 {
+    sealed
+        .get(..8)
+        .map(|b| u64::from_be_bytes(b.try_into().unwrap()))
+        .unwrap_or(0)
+}
+
+/// 按最近一次测得的入方向丢包率，决定冗余档位（额外补发份数，不含原包）。
+///
+/// 对应《抗丢包方案设计》第 4.5 节的分档：基线 2 份（额外 1 份），
+/// 10~20% 升到 3 份，20%+ 升到 4 份。
+fn tier_for_bp(bp: u16) -> u8 {
+    if bp >= 2000 {
+        3
+    } else if bp >= 1000 {
+        2
+    } else {
+        1
+    }
+}
+
+/// 编码一条 NACK：`[0xF1][u16 区间数][ (u64 起始计数器, u16 区间长度) ... ]`
+fn encode_nack(ranges: &[(u64, u16)]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(3 + ranges.len() * 10);
+    buf.push(CTRL_NACK);
+    buf.extend_from_slice(&(ranges.len() as u16).to_be_bytes());
+    for &(start, len) in ranges {
+        buf.extend_from_slice(&start.to_be_bytes());
+        buf.extend_from_slice(&len.to_be_bytes());
+    }
+    buf
+}
+
+fn decode_nack(payload: &[u8]) -> Option<Vec<(u64, u16)>> {
+    if payload.len() < 3 || payload[0] != CTRL_NACK {
+        return None;
+    }
+    let count = u16::from_be_bytes([payload[1], payload[2]]) as usize;
+    let expected = 3 + count * 10;
+    if payload.len() < expected {
+        return None;
+    }
+    let mut ranges = Vec::with_capacity(count);
+    let mut offset = 3;
+    for _ in 0..count {
+        let start = u64::from_be_bytes(payload[offset..offset + 8].try_into().unwrap());
+        let len = u16::from_be_bytes([payload[offset + 8], payload[offset + 9]]);
+        ranges.push((start, len));
+        offset += 10;
+    }
+    Some(ranges)
+}
+
+/// 编码一条心跳：`[0xF2][u64 目前发到的最大计数器]`
+fn encode_heartbeat(highest: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(9);
+    buf.push(CTRL_HEARTBEAT);
+    buf.extend_from_slice(&highest.to_be_bytes());
+    buf
+}
+
+fn decode_heartbeat(payload: &[u8]) -> Option<u64> {
+    if payload.len() != 9 || payload[0] != CTRL_HEARTBEAT {
+        return None;
+    }
+    Some(u64::from_be_bytes(payload[1..9].try_into().unwrap()))
+}
 
 /// TUN 设备 MTU。
 ///
@@ -53,6 +188,66 @@ pub const TUN_MTU: u16 = 1160;
 /// 要么入队要么立刻报错，不会像 `write_all` 那样被拥塞卡住。
 /// 因此原先"每对端一条 channel + 专用任务 + 写超时"的整套机制不再需要——
 /// 那套机制本就是为了绕开流写入会阻塞 TUN 读循环的问题。
+/// 发送缓冲里的一条记录：发过什么、属于哪条流、什么时候发的。
+///
+/// `flow` 是 `None` 时（比如控制报文自己）不会驱动任何流的冗余升级，
+/// 但仍然可以被 NACK 命中原样重发。
+struct SentEntry {
+    bytes: Vec<u8>,
+    flow: Option<FlowKey>,
+    sent_at: Instant,
+}
+
+/// 按计数器索引的发送缓冲，支持 O(1) 命中 + FIFO 淘汰。
+///
+/// 跟 [`FlowReplayTable`] 是同一个思路：`HashMap` 给查找，`VecDeque` 给淘汰顺序。
+struct SendBuffer {
+    entries: HashMap<u64, SentEntry>,
+    order: VecDeque<u64>,
+}
+
+impl SendBuffer {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn push(&mut self, counter: u64, bytes: Vec<u8>, flow: Option<FlowKey>, now: Instant) {
+        if self.order.len() >= SEND_BUFFER_CAP {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(
+            counter,
+            SentEntry {
+                bytes,
+                flow,
+                sent_at: now,
+            },
+        );
+        self.order.push_back(counter);
+    }
+
+    /// 命中且仍在 ARQ 截止时间内才返回——超时的条目就算还在缓冲里也不给用，
+    /// 那时候重传已经没有意义了。
+    fn get(&self, counter: u64) -> Option<&SentEntry> {
+        self.entries
+            .get(&counter)
+            .filter(|e| e.sent_at.elapsed() < ARQ_DEADLINE)
+    }
+}
+
+/// 一条内层流当前的冗余状态。
+#[derive(Clone, Copy)]
+struct RedundancyState {
+    until: Instant,
+    /// 额外补发的份数（不含原包）。1~3，对应总共 2~4 份，见 [`tier_for_bp`]。
+    extra_copies: u8,
+}
+
 #[derive(Clone)]
 struct PeerForwarder {
     conn: Connection,
@@ -60,6 +255,108 @@ struct PeerForwarder {
     /// 机密性必须由这一层保证。
     crypto: Arc<SessionCrypto>,
     stats: PeerStats,
+    /// 最近发送过的包，供 NACK 命中时原样重发；也用来把命中的计数器映射回
+    /// 具体是哪条流，驱动那条流开启主动冗余。
+    ///
+    /// 用 `std::sync::Mutex` 而不是 `tokio::sync::Mutex`：`try_forward` 必须
+    /// 保持同步、非阻塞（见其文档注释），临界区只是几次 map 操作、不跨
+    /// `await`，用同步锁更轻。
+    send_buffer: Arc<SyncMutex<SendBuffer>>,
+    /// 每条内层流的冗余状态，只由 NACK 命中后精确开启——不是本连接的入方向
+    /// 丢包就全连接一刀切。见 `handle_nack`。
+    flow_redundancy: Arc<SyncMutex<HashMap<FlowKey, RedundancyState>>>,
+    /// 目前为止发送过的最大计数器，心跳用来告诉对端"我发到哪了"。
+    highest_sent: Arc<AtomicU64>,
+    /// 最近一次测得的入方向丢包档位（1~3），新开启一条流的冗余时按这个定份数。
+    current_tier: Arc<AtomicU8>,
+}
+
+impl PeerForwarder {
+    /// 加密并投递一条控制报文（NACK / 心跳）。
+    ///
+    /// 复用跟数据报文完全相同的加密、计数器分配与重放窗口——不用另起一套
+    /// 认证机制，控制报文也顺带享受重放保护和抗篡改。丢了不重传，靠上层
+    /// 自己的周期性重复（心跳每秒一次、NACK 会在下一个空洞仍然存在时再发）
+    /// 自愈。
+    fn send_control(&self, payload: Vec<u8>) {
+        match self.crypto.seal(&payload) {
+            Ok(sealed) => {
+                let _ = self.conn.send_datagram(sealed.into());
+            }
+            Err(e) => {
+                debug!("[TUN] 控制报文加密失败: {}", e);
+            }
+        }
+    }
+
+    fn set_tier(&self, tier: u8) {
+        self.current_tier.store(tier, Ordering::Relaxed);
+    }
+
+    /// 收到对端的 NACK：命中的计数器原样从发送缓冲重发，并把命中的流标记为
+    /// "需要冗余"，让后续该流的包自动补发，不用等下一次 NACK 才反应过来。
+    fn handle_nack(&self, ranges: &[(u64, u16)]) {
+        let mut flows_to_activate: Vec<FlowKey> = Vec::new();
+        {
+            let buffer = self.send_buffer.lock().unwrap();
+            for &(start, count) in ranges {
+                for counter in start..start.saturating_add(count as u64) {
+                    let Some(entry) = buffer.get(counter) else {
+                        // 缓冲里没有（已经被淘汰或超过 ARQ 截止时间）——
+                        // 放弃这个计数器，跟没收到 NACK 一样处理。
+                        continue;
+                    };
+                    let conn = self.conn.clone();
+                    let bytes = entry.bytes.clone();
+                    tokio::spawn(async move {
+                        match conn.send_datagram(bytes.into()) {
+                            Ok(()) => {
+                                tracing::info!("[TUN] tx-nack-resend counter={}", counter);
+                            }
+                            Err(e) => {
+                                debug!("[TUN] NACK 重传失败 counter={}: {}", counter, e);
+                            }
+                        }
+                    });
+                    if let Some(flow) = entry.flow {
+                        flows_to_activate.push(flow);
+                    }
+                }
+            }
+        }
+
+        if flows_to_activate.is_empty() {
+            return;
+        }
+        let tier = self.current_tier.load(Ordering::Relaxed).max(1);
+        let until = Instant::now() + REDUNDANCY_HOLD;
+        let mut fr = self.flow_redundancy.lock().unwrap();
+        for flow in flows_to_activate {
+            let was_active = fr
+                .get(&flow)
+                .map(|s| s.until > Instant::now())
+                .unwrap_or(false);
+            fr.insert(
+                flow,
+                RedundancyState {
+                    until,
+                    extra_copies: tier,
+                },
+            );
+            if !was_active {
+                tracing::info!(
+                    "[TUN] 流(proto={} {}:{} -> {}:{}) 检测到丢包，开启主动冗余（{} 份，保持 {:?}）",
+                    flow.protocol,
+                    flow.source,
+                    flow.source_port,
+                    flow.destination,
+                    flow.destination_port,
+                    tier + 1,
+                    REDUNDANCY_HOLD
+                );
+            }
+        }
+    }
 }
 
 /// 一个窗口至少要攒够这么多样本才结算。
@@ -175,6 +472,11 @@ impl PeerForwarder {
         };
         // 超出对端通告的数据报上限时直接拒发——发出去也会被丢，
         // 而且这说明 TUN_MTU 相对当前路径设得过大，值得记一笔。
+        //
+        // 这里是运行时逐包降级，不是接入连接时的一次性强校验——上一版实现
+        // 在 attach_peer 里做过后者，一旦路径 MTU 探测还没跑完就整条连接拒收，
+        // TUN 网卡装上了但什么都转发不了，见《抗丢包方案设计》第二节。
+        // 这个校验必须一直保持"只丢这一个包"的形态，不能再收紧成"拒绝整条连接"。
         if let Some(limit) = self.conn.max_datagram_size() {
             if sealed.len() > limit {
                 warn!(
@@ -185,8 +487,36 @@ impl PeerForwarder {
                 return false;
             }
         }
+        let counter = counter_of(&sealed);
         let len = sealed.len();
-        match self.conn.send_datagram(sealed.into()) {
+
+        // 按这个包**自己所属的流**查冗余状态，不是按整条连接——同一条连接里
+        // 没在丢包的流不会被这条包连累多发。
+        let flow = Ipv4Header::from_bytes(packet).map(|h| flow_key(h, packet));
+        let extra_copies = flow
+            .and_then(|f| {
+                let fr = self.flow_redundancy.lock().unwrap();
+                fr.get(&f)
+                    .filter(|s| s.until > Instant::now())
+                    .map(|s| s.extra_copies)
+            })
+            .unwrap_or(0);
+        // 冗余份必须复用这份密文字节原样重发，不能对同一个包再调一次
+        // `crypto.seal()`——那样会拿到不同计数器的两个包，现有重放窗口就
+        // 没法把它们当成同一个包去重了。只有确定要发冗余份时才克隆，
+        // 干净链路上这里零额外开销。
+        let redundant_bytes = (extra_copies > 0).then(|| sealed.clone());
+
+        // 记进发送缓冲，供后续命中 NACK 时原样重发；同时刷新心跳要带的
+        // "最大计数器"。必须在真正调用 send_datagram 之前记，晚了的话
+        // 一个几乎同时到达的 NACK 会查不到刚发出去的这个计数器。
+        self.send_buffer
+            .lock()
+            .unwrap()
+            .push(counter, sealed.clone(), flow, Instant::now());
+        self.highest_sent.fetch_max(counter, Ordering::Relaxed);
+
+        let sent = match self.conn.send_datagram(sealed.into()) {
             Ok(()) => {
                 // 数据面迁到 DATAGRAM 之后，这个埋点一直没跟着迁过来，
                 // 于是不管传多少数据带宽都显示 0。
@@ -194,13 +524,56 @@ impl PeerForwarder {
                     let (stats, user) = (stats.clone(), user.clone());
                     tokio::spawn(async move { stats.record_send(&user, len).await });
                 }
+                tracing::info!("[TUN] tx-orig counter={} bytes={}", counter, len);
                 true
             }
             Err(e) => {
                 debug!("[TUN] 数据报发送失败: {}", e);
                 false
             }
+        };
+
+        // 只在原包真的发出去之后才补冗余份——原包都没发出去，补一份没意义。
+        if sent {
+            if let Some(bytes) = redundant_bytes {
+                let conn = self.conn.clone();
+                let stats = self.stats.clone();
+                tokio::spawn(async move {
+                    for i in 0..extra_copies {
+                        tokio::time::sleep(REDUNDANCY_DELAY + REDUNDANCY_STAGGER * i as u32)
+                            .await;
+                        match conn.send_datagram(bytes.clone().into()) {
+                            Ok(()) => {
+                                if let Some((stats, user)) = &stats {
+                                    let (stats, user) = (stats.clone(), user.clone());
+                                    tokio::spawn(
+                                        async move { stats.record_send(&user, len).await },
+                                    );
+                                }
+                                tracing::info!(
+                                    "[TUN] tx-repair counter={} bytes={} copy={}/{}",
+                                    counter,
+                                    len,
+                                    i + 1,
+                                    extra_copies
+                                );
+                            }
+                            Err(e) => {
+                                debug!(
+                                    "[TUN] 补包发送失败 counter={} copy={}/{}: {}",
+                                    counter,
+                                    i + 1,
+                                    extra_copies,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                });
+            }
         }
+
+        sent
     }
 }
 
@@ -319,6 +692,10 @@ impl TunBridge {
             conn: conn.clone(),
             crypto,
             stats,
+            send_buffer: Arc::new(SyncMutex::new(SendBuffer::new())),
+            flow_redundancy: Arc::new(SyncMutex::new(HashMap::new())),
+            highest_sent: Arc::new(AtomicU64::new(0)),
+            current_tier: Arc::new(AtomicU8::new(1)),
         };
         tracing::info!(
             "[TUN] 数据报通道就绪 (local={}, peer_hint={:?}, host={}, max_datagram={:?})",
@@ -336,6 +713,24 @@ impl TunBridge {
             *default = Some(forwarder.clone());
         }
         drop(default);
+
+        // 每秒把"目前发到的最大计数器"告诉对端，让它能发现尾部丢包——
+        // 最后几个包全丢的话，没有后续包能暴露这个空洞，只能靠心跳。
+        // 连接关掉之后 `send_datagram` 会持续报错，靠这个自然退出，
+        // 不需要额外的取消信号。
+        {
+            let heartbeat = forwarder.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+                    if heartbeat.conn.close_reason().is_some() {
+                        break;
+                    }
+                    let highest = heartbeat.highest_sent.load(Ordering::Relaxed);
+                    heartbeat.send_control(encode_heartbeat(highest));
+                }
+            });
+        }
 
         let tun = self.tun.clone();
         let peers = self.peers.clone();
@@ -517,6 +912,92 @@ impl FlowReplayTable {
     }
 }
 
+/// 跟踪本端观测到、但还没到达的计数器，驱动 NACK 请求重传。
+///
+/// 计数器是本连接**全局**的（`crypto.rs` 里 `SessionCrypto` 只有一个
+/// `tx_counter`，不分流），所以这里也不分流——分流靠的是发送端自己的
+/// [`SendBuffer`]，NACK 只管"这个计数器要不要重发"，回填哪条流是发送端
+/// 命中缓冲之后才知道的事。
+struct GapTracker {
+    highest_processed: u64,
+    /// 计数器 -> 首次发现缺失的时间
+    pending: HashMap<u64, Instant>,
+    last_nack: Option<Instant>,
+}
+
+impl GapTracker {
+    fn new() -> Self {
+        Self {
+            highest_processed: 0,
+            pending: HashMap::new(),
+            last_nack: None,
+        }
+    }
+
+    /// 收到一个已解密、已认证的计数器就调用——不管内容是数据还是控制报文，
+    /// 目的只是记录"这个序号存在过"。
+    fn observe(&mut self, counter: u64, now: Instant) {
+        self.pending.remove(&counter);
+        if counter > self.highest_processed {
+            for missing in (self.highest_processed + 1)..counter {
+                self.pending.entry(missing).or_insert(now);
+            }
+            self.highest_processed = counter;
+        }
+    }
+
+    /// 到了该发 NACK 的时候，取出当前该催的空洞（过了重排容忍期、
+    /// 还没过 ARQ 截止时间），按连续区间压缩，最多带 [`NACK_MAX_RANGES`] 个。
+    /// 超过截止时间的空洞直接放弃，不再纳入统计。
+    fn ranges_to_nack(&mut self, now: Instant) -> Vec<(u64, u16)> {
+        if let Some(last) = self.last_nack {
+            if now.duration_since(last) < NACK_MIN_INTERVAL {
+                return Vec::new();
+            }
+        }
+        self.pending
+            .retain(|_, first_seen| now.duration_since(*first_seen) < ARQ_DEADLINE);
+
+        let mut due: Vec<u64> = self
+            .pending
+            .iter()
+            .filter(|(_, first_seen)| now.duration_since(**first_seen) >= REORDER_GRACE)
+            .map(|(c, _)| *c)
+            .collect();
+        if due.is_empty() {
+            return Vec::new();
+        }
+        due.sort_unstable();
+
+        let mut ranges = Vec::new();
+        let mut start = due[0];
+        let mut len: u16 = 1;
+        for &c in &due[1..] {
+            if c == start + len as u64 && len < u16::MAX {
+                len += 1;
+            } else {
+                ranges.push((start, len));
+                if ranges.len() >= NACK_MAX_RANGES {
+                    self.last_nack = Some(now);
+                    return ranges;
+                }
+                start = c;
+                len = 1;
+            }
+        }
+        ranges.push((start, len));
+        self.last_nack = Some(now);
+        ranges
+    }
+}
+
+fn maybe_send_nack(sender: &PeerForwarder, gaps: &mut GapTracker, now: Instant) {
+    let ranges = gaps.ranges_to_nack(now);
+    if !ranges.is_empty() {
+        sender.send_control(encode_nack(&ranges));
+    }
+}
+
 /// 接收对端数据报，解密后写入 TUN。
 ///
 /// 与旧的流式实现相比，这里**丢包不影响后续包**——数据报之间彼此独立，
@@ -533,6 +1014,7 @@ async fn receive_datagrams(
 ) -> Result<(), String> {
     let mut flows = FlowReplayTable::new();
     let mut loss = LossMeter::new(Instant::now());
+    let mut gaps = GapTracker::new();
     loop {
         let datagram = conn.read_datagram().await.map_err(|e| e.to_string())?;
         if let Some((stats, user)) = &sender.stats {
@@ -549,9 +1031,43 @@ async fn receive_datagrams(
                 continue;
             }
         };
+
+        let now = Instant::now();
+        // 空洞跟踪不分数据/控制报文——两者共用同一个计数器序列，只要序号
+        // 存在过就要记，驱动 NACK 的是"序号没到"，不是"内容是什么"。
+        gaps.observe(counter, now);
+
+        // 控制报文（NACK/心跳）不是 IP 包，标签取值故意避开合法 IPv4 首字节
+        // （版本号固定是 4），解密后不用再包一层信封就能跟数据报文分开，
+        // 走独立分支处理，不进入下面的丢包统计/重放判定/TUN 写入流程。
+        if let Some(&tag) = packet.first() {
+            if !looks_like_ipv4(tag) {
+                match tag {
+                    CTRL_NACK => {
+                        if let Some(ranges) = decode_nack(&packet) {
+                            sender.handle_nack(&ranges);
+                        } else {
+                            debug!("[TUN] 收到格式错误的 NACK");
+                        }
+                    }
+                    CTRL_HEARTBEAT => {
+                        if let Some(highest) = decode_heartbeat(&packet) {
+                            gaps.observe(highest, now);
+                        } else {
+                            debug!("[TUN] 收到格式错误的心跳");
+                        }
+                    }
+                    _ => {
+                        debug!("[TUN] 未知控制报文标签: 0x{:02x}", tag);
+                    }
+                }
+                maybe_send_nack(&sender, &mut gaps, now);
+                continue;
+            }
+        }
+
         // 计数器空洞就是入方向丢包，必须在重放判定**之前**记——
         // 重放判定会把重复包挡掉，放在后面就统计不到真实到达情况了。
-        let now = Instant::now();
         loss.on_received(counter, now);
         if let Some(bp) = loss.poll(now) {
             if let Some((stats, user)) = &sender.stats {
@@ -560,21 +1076,28 @@ async fn receive_datagrams(
             }
             if bp > 0 {
                 tracing::info!("[TUN] 入方向丢包 {:.2}%", bp as f64 / 100.0);
+                // 这里只更新档位（额外补发几份），不直接开冗余——
+                // 真正按流精确开启冗余是 `handle_nack` 命中之后才做的事，
+                // 见那里的说明。
+                sender.set_tier(tier_for_bp(bp));
             }
         }
 
         let len = packet.len();
         if !(20..=MAX_PACKET).contains(&len) {
             debug!("[TUN] 丢弃长度异常的包: {}", len);
+            maybe_send_nack(&sender, &mut gaps, now);
             continue;
         }
         let Some(header) = Ipv4Header::from_bytes(&packet) else {
+            maybe_send_nack(&sender, &mut gaps, now);
             continue;
         };
         // 重放判定按内层流拆分，必须在拿到明文之后做——五元组在解密前不可见。
         let key = flow_key(header, &packet);
         if !flows.accept(key, counter) {
             debug!("[TUN] 丢弃重复/过旧的 overlay 报文 (counter={counter})");
+            maybe_send_nack(&sender, &mut gaps, now);
             continue;
         }
         let source = header.source_addr();
@@ -588,6 +1111,7 @@ async fn receive_datagrams(
                 "[TUN] rejected virtual packet source {} (host={}, expected host={})",
                 source, is_host, host_vip
             );
+            maybe_send_nack(&sender, &mut gaps, now);
             continue;
         }
         // A virtual IP may be reused after a Guest reconnects or switches
@@ -615,6 +1139,7 @@ async fn receive_datagrams(
                 len
             );
         }
+        maybe_send_nack(&sender, &mut gaps, now);
     }
 }
 
@@ -919,5 +1444,144 @@ mod tests {
             "MTU {} 过小会导致大量分片，严重拖累吞吐",
             TUN_MTU
         );
+    }
+
+    /// 控制报文的标签必须避开合法 IPv4 首字节（版本号固定占高 4 位 = 4），
+    /// 否则控制报文可能被误当成 IP 包处理，或者真实 IP 包被误当成控制报文吞掉。
+    #[test]
+    fn control_tags_never_look_like_ipv4() {
+        assert!(!looks_like_ipv4(CTRL_NACK));
+        assert!(!looks_like_ipv4(CTRL_HEARTBEAT));
+        // 标准 20 字节头（IHL=5）到最大 60 字节头（IHL=15）覆盖的全部合法首字节
+        for ihl in 5..=15u8 {
+            let first_byte = (4 << 4) | ihl;
+            assert!(looks_like_ipv4(first_byte), "0x{:02x} 应该被认成合法 IPv4", first_byte);
+        }
+    }
+
+    #[test]
+    fn nack_roundtrips_through_encode_decode() {
+        let ranges = vec![(100u64, 3u16), (500u64, 1u16), (9999u64, 64u16)];
+        let encoded = encode_nack(&ranges);
+        let decoded = decode_nack(&encoded).expect("应该能解出来");
+        assert_eq!(decoded, ranges);
+    }
+
+    #[test]
+    fn nack_decode_rejects_truncated_payload() {
+        let ranges = vec![(1u64, 5u16), (2u64, 5u16)];
+        let mut encoded = encode_nack(&ranges);
+        encoded.truncate(encoded.len() - 1);
+        assert!(decode_nack(&encoded).is_none(), "长度对不上必须拒绝，不能越界读");
+    }
+
+    #[test]
+    fn nack_decode_rejects_wrong_tag() {
+        let mut encoded = encode_nack(&[(1, 1)]);
+        encoded[0] = CTRL_HEARTBEAT;
+        assert!(decode_nack(&encoded).is_none());
+    }
+
+    #[test]
+    fn heartbeat_roundtrips_through_encode_decode() {
+        let encoded = encode_heartbeat(123_456_789);
+        assert_eq!(decode_heartbeat(&encoded), Some(123_456_789));
+    }
+
+    #[test]
+    fn heartbeat_decode_rejects_wrong_tag_or_length() {
+        assert!(decode_heartbeat(&[CTRL_NACK, 0, 0, 0, 0, 0, 0, 0, 1]).is_none());
+        assert!(decode_heartbeat(&[CTRL_HEARTBEAT, 0, 0]).is_none());
+    }
+
+    /// 分档必须跟《抗丢包方案设计》第 4.5 节的表格对齐：
+    /// 基线 2 份（额外 1），10~20% 升到 3 份（额外 2），20%+ 升到 4 份（额外 3）。
+    #[test]
+    fn redundancy_tier_matches_the_design_thresholds() {
+        assert_eq!(tier_for_bp(0), 1);
+        assert_eq!(tier_for_bp(999), 1);
+        assert_eq!(tier_for_bp(1000), 2);
+        assert_eq!(tier_for_bp(1999), 2);
+        assert_eq!(tier_for_bp(2000), 3);
+        assert_eq!(tier_for_bp(10_000), 3);
+    }
+
+    #[test]
+    fn gap_tracker_ignores_reordering_within_grace_period() {
+        let t = Instant::now();
+        let mut g = GapTracker::new();
+        g.observe(1, t);
+        g.observe(3, t); // 2 还没到，但可能只是乱序
+        assert!(
+            g.ranges_to_nack(t).is_empty(),
+            "重排容忍期内不该立刻 NACK"
+        );
+        // 2 姗姗来迟
+        g.observe(2, t + Duration::from_millis(5));
+        assert!(
+            g.ranges_to_nack(t + REORDER_GRACE + Duration::from_millis(1))
+                .is_empty(),
+            "已经补上的空洞不该再出现在 NACK 里"
+        );
+    }
+
+    #[test]
+    fn gap_tracker_nacks_genuine_gaps_after_grace_period() {
+        let t = Instant::now();
+        let mut g = GapTracker::new();
+        g.observe(1, t);
+        g.observe(5, t); // 2、3、4 缺失
+        let ranges = g.ranges_to_nack(t + REORDER_GRACE + Duration::from_millis(1));
+        assert_eq!(ranges, vec![(2, 3)], "连续缺失应该压缩成一个区间");
+    }
+
+    #[test]
+    fn gap_tracker_gives_up_after_arq_deadline() {
+        let t = Instant::now();
+        let mut g = GapTracker::new();
+        g.observe(1, t);
+        g.observe(5, t);
+        let too_late = t + ARQ_DEADLINE + Duration::from_millis(1);
+        assert!(
+            g.ranges_to_nack(too_late).is_empty(),
+            "超过 ARQ 截止时间的空洞必须放弃，不能一直 NACK 下去"
+        );
+    }
+
+    #[test]
+    fn gap_tracker_rate_limits_nack_sends() {
+        let t = Instant::now();
+        let mut g = GapTracker::new();
+        g.observe(1, t);
+        g.observe(5, t);
+        let due = t + REORDER_GRACE + Duration::from_millis(1);
+        let first = g.ranges_to_nack(due);
+        assert!(!first.is_empty(), "第一次该发");
+        let second = g.ranges_to_nack(due + Duration::from_millis(1));
+        assert!(second.is_empty(), "限速窗口内不该再发一次");
+    }
+
+    #[test]
+    fn send_buffer_hits_are_only_valid_within_arq_deadline() {
+        let t = Instant::now();
+        let mut buf = SendBuffer::new();
+        buf.push(42, vec![1, 2, 3], None, t);
+        assert!(buf.get(42).is_some(), "刚发的应该能命中");
+        // 模拟时间流逝：直接构造一个"很久以前"发送的条目来验证截止时间生效
+        buf.entries.get_mut(&42).unwrap().sent_at = t - ARQ_DEADLINE - Duration::from_millis(1);
+        assert!(buf.get(42).is_none(), "超过 ARQ 截止时间的条目不该再被命中");
+    }
+
+    #[test]
+    fn send_buffer_evicts_oldest_entry_when_full() {
+        let t = Instant::now();
+        let mut buf = SendBuffer::new();
+        for i in 0..SEND_BUFFER_CAP as u64 {
+            buf.push(i, vec![0], None, t);
+        }
+        assert!(buf.get(0).is_some());
+        buf.push(SEND_BUFFER_CAP as u64, vec![0], None, t);
+        assert!(buf.get(0).is_none(), "满了之后应该淘汰最老的条目");
+        assert!(buf.get(SEND_BUFFER_CAP as u64).is_some());
     }
 }
