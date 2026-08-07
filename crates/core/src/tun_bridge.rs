@@ -631,7 +631,14 @@ impl PeerForwarder {
                     let (stats, user) = (stats.clone(), user.clone());
                     tokio::spawn(async move { stats.record_send(&user, len).await });
                 }
-                tracing::info!("[TUN] tx-orig counter={} bytes={}", counter, len);
+                // 这条本来每个包都无条件打一次，联机跑图时一秒上千个包
+                // 就是一秒上千次同步日志 I/O，直接卡在转发热路径里——
+                // 这是"大量发包时 ping 从 40ms 飙到 1300ms"的真正原因，
+                // 日志系统本身也已经改成非阻塞（见 `logging.rs`），但源头
+                // 该抽样还是要抽样，跟 `rx`/`tx` 两条日志保持同一个策略。
+                if counter <= 100 || counter % 1000 == 0 {
+                    tracing::info!("[TUN] tx-orig counter={} bytes={}", counter, len);
+                }
                 true
             }
             Err(e) => {
