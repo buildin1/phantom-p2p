@@ -29,6 +29,7 @@ mod admin;
 mod config;
 mod database;
 mod log_upload;
+mod logging;
 mod relay;
 mod stun_server;
 
@@ -2196,12 +2197,15 @@ fn start_session_timeout_task(state: SharedState) {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "phantom_server=info".into()),
-        )
-        .init();
+    // 日志目录跟 config.toml 同级，与 admin.credential 等运行期文件保持一致。
+    // `_log_guards` 必须活到 main 结束——非阻塞写入器的后台线程靠它存活，
+    // 提前 drop 会把还在队列里的日志丢掉。
+    let log_dir = config::find_config_dir().join("log");
+    let _log_guards = logging::init(&log_dir, "phantom_server=info");
+    match &_log_guards.file_error {
+        Some(e) => warn!("[日志] 文件日志不可用，本次仅输出到控制台: {}", e),
+        None => info!("[日志] 文件日志已启用: {}", log_dir.display()),
+    }
 
     let db = database::init_database()
         .unwrap_or_else(|e| panic!("[数据库] 初始化失败，拒绝以非持久化模式启动: {}", e));
