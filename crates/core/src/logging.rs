@@ -35,6 +35,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 
 /// 单个日志文件的大小上限；超过即轮转
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
@@ -128,24 +129,41 @@ pub struct LogRouter {
 }
 
 struct RouterInner {
-    ice: RollingFile,
-    signal: RollingFile,
-    tunnel: RollingFile,
-    app: RollingFile,
+    ice: NonBlocking,
+    signal: NonBlocking,
+    tunnel: NonBlocking,
+    app: NonBlocking,
     /// 模板 → (首次出现时刻, 已折叠条数)
     dedup: HashMap<String, (Instant, u32)>,
+    /// 只用来延续后台落盘线程的生命周期，本身不读不写。
+    ///
+    /// 实测联机跑图时一秒转发上千个包，`tx-orig` 之前是每个包同步写一次
+    /// 文件（还带一次 `flush()`），四个日志文件共用一把锁——这条同步 I/O
+    /// 直接卡在转发热路径里，是"大量发包时 ping 从 40ms 飙到 1300ms"的
+    /// 真正原因，不是网络拥塞也不是补包误判（QUIC 自己测的 `sent`/`lost`
+    /// 全程正常，冗余机制那次也压根没触发）。改成 `tracing_appender::
+    /// non_blocking`：调用方只把格式化好的行丢进一个有界 channel 就立刻
+    /// 返回，真正的文件写入挪到专门的后台线程做，热路径不再等磁盘。
+    _guards: Vec<WorkerGuard>,
 }
 
 impl LogRouter {
     pub fn new(dir: &Path) -> io::Result<Self> {
         std::fs::create_dir_all(dir)?;
+        let (ice, ice_guard) = tracing_appender::non_blocking(RollingFile::new(dir, "ice"));
+        let (signal, signal_guard) =
+            tracing_appender::non_blocking(RollingFile::new(dir, "signal"));
+        let (tunnel, tunnel_guard) =
+            tracing_appender::non_blocking(RollingFile::new(dir, "tunnel"));
+        let (app, app_guard) = tracing_appender::non_blocking(RollingFile::new(dir, "app"));
         Ok(Self {
             inner: Arc::new(Mutex::new(RouterInner {
-                ice: RollingFile::new(dir, "ice"),
-                signal: RollingFile::new(dir, "signal"),
-                tunnel: RollingFile::new(dir, "tunnel"),
-                app: RollingFile::new(dir, "app"),
+                ice,
+                signal,
+                tunnel,
+                app,
                 dedup: HashMap::new(),
+                _guards: vec![ice_guard, signal_guard, tunnel_guard, app_guard],
             })),
         })
     }
@@ -261,14 +279,15 @@ impl LogRouter {
 }
 
 fn write_to(inner: &mut RouterInner, target: &str, s: &str) -> io::Result<()> {
-    let f: &mut RollingFile = match route_of(target) {
+    let f: &mut NonBlocking = match route_of(target) {
         Target::Ice => &mut inner.ice,
         Target::Signal => &mut inner.signal,
         Target::Tunnel => &mut inner.tunnel,
         Target::App => &mut inner.app,
     };
-    f.write_all(s.as_bytes())?;
-    f.flush()
+    // 不用再显式 flush：`NonBlocking::flush()` 本来就是空实现，真正落盘
+    // 由后台线程按自己的节奏做，这里调不调都一样，干脆不调更清楚。
+    f.write_all(s.as_bytes())
 }
 
 /// 安装分层日志。
@@ -286,7 +305,19 @@ pub fn init(log_dir: &Path, dev_mode: bool) -> Result<LogRouter, String> {
         "info,phantom_core::punch=debug,phantom_core::ice=debug,phantom_core::stun=debug".into()
     });
 
-    let console = tracing_subscriber::fmt::layer().with_ansi(dev_mode);
+    // 控制台输出也必须走非阻塞包装：实测用户是从命令行窗口启动的，
+    // Windows 控制台在高频输出下本身就慢，跟文件那边同一个道理——
+    // 不包一层的话，联机跑图时上千条/秒的事件会在控制台这边继续
+    // 卡住转发热路径，文件那边包了也白包。
+    //
+    // guard 必须活到进程退出，但这里没有一个自然的长生命周期宿主可以
+    // 挂它——故意 leak：这就是一次性、伴随进程生命周期的资源，
+    // leak 比额外发明一个全局变量或者改调用方签名更直接。
+    let (console_writer, console_guard) = tracing_appender::non_blocking(std::io::stdout());
+    Box::leak(Box::new(console_guard));
+    let console = tracing_subscriber::fmt::layer()
+        .with_ansi(dev_mode)
+        .with_writer(console_writer);
     let files = RouterLayer {
         router: router.clone(),
     };
