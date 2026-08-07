@@ -9,7 +9,7 @@
 //! 过期的实时包仍被重传、内层 TCP 与外层重传叠加会导致吞吐崩塌。
 //! 内层协议自己负责可靠性——TCP 本就会重传，UDP 本就允许丢。
 
-use crate::crypto::{ReplayWindow, SessionCrypto};
+use crate::crypto::{ReplayVerdict, ReplayWindow, SessionCrypto};
 use crate::stats::StatsManager;
 use crate::tun::{Ipv4Header, TunDevice, TunError};
 use quinn::Connection;
@@ -1113,7 +1113,11 @@ impl FlowReplayTable {
     }
 
     /// 该流的这个计数器是否可接受；可接受时顺带记账。
-    fn accept(&mut self, key: FlowKey, counter: u64) -> bool {
+    ///
+    /// 判定和记账是 [`ReplayWindow::check_and_set`] 里的一次调用，不是
+    /// "先问一次再记一次"——那个拆分正是环形位图绕回缺陷的根源，见该函数
+    /// 的文档。这里也不要再把它拆回两步。
+    fn accept(&mut self, key: FlowKey, counter: u64) -> ReplayVerdict {
         if !self.windows.contains_key(&key) {
             if self.windows.len() >= MAX_TRACKED_FLOWS {
                 if let Some(oldest) = self.insertion_order.pop_front() {
@@ -1123,14 +1127,19 @@ impl FlowReplayTable {
             self.windows.insert(key, ReplayWindow::new());
             self.insertion_order.push_back(key);
         }
-        let window = self.windows.get(&key).expect("刚插入过，一定存在");
-        if !window.check(counter) {
-            return false;
-        }
-        window.accept(counter);
-        true
+        let window = self.windows.get_mut(&key).expect("刚插入过，一定存在");
+        window.check_and_set(counter)
     }
 }
+
+/// 同一条连接上连续这么多个数据报被重放判定拒收，就升级成 WARN。
+///
+/// 健康链路上这是结构性不可能的：真实的网络重复/乱序不会连成一片，而
+/// 冗余补发份最多也就 [`MAX_EXTRA_COPIES`] 份。连续拒收几十个只可能是
+/// 本端判定逻辑自己出了问题——上一次环形位图绕回时，这条日志停在 DEBUG
+/// 级、又跟正常的偶发重复混在一起，于是"本端把自己锁死"看起来像"网络在
+/// 丢包"，白白多绕了两轮排查。
+const REPLAY_REJECT_ALARM: u32 = 64;
 
 /// 跟踪本端观测到、但还没到达的计数器，驱动 NACK 请求重传。
 ///
@@ -1240,6 +1249,10 @@ async fn receive_datagrams(
     let mut flows = FlowReplayTable::new();
     let mut loss = LossMeter::new(Instant::now());
     let mut gaps = GapTracker::new();
+    // 见 `REPLAY_REJECT_ALARM`。放在收包循环里而不是按流记：控制报文走的是
+    // 另一条分支，不会打断计数，所以这个数就是"连续多少个数据报没能通过
+    // 重放判定"，正是要报警的那个信号。
+    let mut consecutive_rejects: u32 = 0;
     loop {
         let datagram = conn.read_datagram().await.map_err(|e| e.to_string())?;
         if let Some((stats, user)) = &sender.stats {
@@ -1337,10 +1350,31 @@ async fn receive_datagrams(
         };
         // 重放判定按内层流拆分，必须在拿到明文之后做——五元组在解密前不可见。
         let key = flow_key(header, &packet);
-        if !flows.accept(key, counter) {
-            debug!("[TUN] 丢弃重复/过旧的 overlay 报文 (counter={counter})");
-            maybe_send_nack(&sender, &mut gaps, now);
-            continue;
+        match flows.accept(key, counter) {
+            ReplayVerdict::Fresh => consecutive_rejects = 0,
+            verdict => {
+                consecutive_rejects += 1;
+                // 两种拒绝原因分开报，并带上窗口状态：`counter` 明显比
+                // `highest` 新却报重复，就只可能是环形位图绕回。
+                match verdict {
+                    ReplayVerdict::Duplicate { highest, slot } => debug!(
+                        "[TUN] 丢弃重复的 overlay 报文 (counter={counter}, 流内最大={highest}, 槽位={slot})"
+                    ),
+                    ReplayVerdict::TooOld { highest, floor } => debug!(
+                        "[TUN] 丢弃过旧的 overlay 报文 (counter={counter}, 流内最大={highest}, 窗口下沿={floor})"
+                    ),
+                    ReplayVerdict::Fresh => unreachable!("放行的分支在上面"),
+                }
+                if consecutive_rejects == REPLAY_REJECT_ALARM {
+                    warn!(
+                        "[TUN] 已连续 {} 个数据报被重放判定拒收 — 健康链路上这不可能，\
+                         八成是本端判定逻辑出了问题 (最近一次: counter={counter}, {:?})",
+                        consecutive_rejects, verdict
+                    );
+                }
+                maybe_send_nack(&sender, &mut gaps, now);
+                continue;
+            }
         }
         let source = header.source_addr();
         let valid_source = if is_host {
@@ -1458,6 +1492,11 @@ mod tests {
         }
     }
 
+    /// 只关心"这个包放行没有"的测试用它，丢掉拒绝原因。
+    fn passes(table: &mut FlowReplayTable, key: FlowKey, counter: u64) -> bool {
+        table.accept(key, counter) == ReplayVerdict::Fresh
+    }
+
     /// 本次修复的核心承诺：一条流的突发不得把另一条安静流的包判成"过旧"。
     ///
     /// 窗口若按会话全局维护，突发流量会把窗口整体推过去，安静流延迟到达的
@@ -1470,7 +1509,7 @@ mod tests {
         let bursty = key(5000);
 
         // 安静流先发一个包（计数器较小）
-        assert!(table.accept(quiet, 10));
+        assert!(passes(&mut table, quiet, 10));
 
         // 突发流把会话计数器推得很远——远超单个窗口宽度
         for c in 100..100_000u64 {
@@ -1479,11 +1518,29 @@ mod tests {
 
         // 安静流随后到达的包仍然必须被接受
         assert!(
-            table.accept(quiet, 11),
+            passes(&mut table, quiet, 11),
             "突发流量不得让安静流的后续包被判成过旧"
         );
         // 它自己的重复包照样要拒
-        assert!(!table.accept(quiet, 11), "同一条流内的重复仍要拒绝");
+        assert!(!passes(&mut table, quiet, 11), "同一条流内的重复仍要拒绝");
+    }
+
+    /// 一条长命流连续跑过环形位图的整圈边界后，必须还能继续收包。
+    ///
+    /// 这是 `crypto.rs` 里那个绕回缺陷在**调用侧**的回归测试：那次实机故障
+    /// 就是这条路径——Minecraft 那条 TCP 流一直用同一个五元组，累计计数器
+    /// 跨过 65536 之后，本端把它之后的每一个包都判成重复，游戏 reset。
+    #[test]
+    fn a_long_lived_flow_survives_crossing_the_replay_ring() {
+        let mut table = FlowReplayTable::new();
+        let game = key(25565);
+        // 走满两圈多，覆盖第一次绕回和之后的稳态。
+        for c in 0..(2 * 65536u64 + 1000) {
+            assert!(
+                passes(&mut table, game, c),
+                "长命流跨圈之后被误判 (counter={c})"
+            );
+        }
     }
 
     /// 跟踪的流数必须有上限，否则对端伪造海量五元组就能把内存吃光
@@ -1508,8 +1565,11 @@ mod tests {
         let udp = key(0);
         assert_ne!(icmp.protocol, udp.protocol);
         let mut table = FlowReplayTable::new();
-        assert!(table.accept(icmp, 5));
-        assert!(table.accept(udp, 5), "不同协议是不同的流，不该互相判重放");
+        assert!(passes(&mut table, icmp, 5));
+        assert!(
+            passes(&mut table, udp, 5),
+            "不同协议是不同的流，不该互相判重放"
+        );
     }
 
     /// 入方向丢包：计数器空洞就是丢的包
