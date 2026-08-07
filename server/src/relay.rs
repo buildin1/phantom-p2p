@@ -13,7 +13,7 @@
 //! （唯一调用点在自己的单元测试里），而数据面统一走 QUIC 之后，
 //! 单独维护一条明文通道只会让两套逻辑的 bug 互相掩盖。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
@@ -101,6 +101,19 @@ pub struct RelayRegistry {
     /// 等待 Host 连接的 Guest waiter（token → [tx]）
     /// Guest 连接到达但 Host 未到时，通过 oneshot 等待通知
     guest_host_waiters: HashMap<String, Vec<oneshot::Sender<()>>>,
+    /// token → 当前已桥接的 Guest 连接列表，供数据报下行扇出转发用。
+    ///
+    /// 上行（Guest→Host）方向没有歧义：每个 Guest 连接是独立的 QUIC 连接，
+    /// 各自的收包任务只转发自己收到的数据报。下行（Host→Guest）方向不同——
+    /// Host 只有一条共享连接（1:N 模型），中继看到的是密文，没法从数据报本身
+    /// 判断该发给哪个 Guest，只能广播给这个 token 下全部已桥接的 Guest，
+    /// 靠各自的 overlay 会话密钥解密失败自然丢弃不属于自己的包。
+    guest_bridges: HashMap<String, Vec<quinn::Connection>>,
+    /// 已经为这个 token 起了 Host→Guest 数据报扇出任务。
+    ///
+    /// 每个 token 只能有一个扇出任务在读 host_conn 的数据报——多个任务
+    /// 同时 `read_datagram()` 会互相抢包，导致包被随机分给某一个 Guest。
+    host_datagram_fanout_started: HashSet<String>,
 }
 
 impl RelayRegistry {
@@ -111,6 +124,8 @@ impl RelayRegistry {
             guest_credentials: HashMap::new(),
             host_connections: HashMap::new(),
             guest_host_waiters: HashMap::new(),
+            guest_bridges: HashMap::new(),
+            host_datagram_fanout_started: HashSet::new(),
         }
     }
 
@@ -140,6 +155,32 @@ impl RelayRegistry {
             }
         }
         self.guest_credentials.retain(|_, room| room != token);
+        self.guest_bridges.remove(token);
+        self.host_datagram_fanout_started.remove(token);
+    }
+
+    /// 登记一个已桥接的 Guest 连接，供数据报下行扇出用。
+    fn add_guest_bridge(&mut self, token: &str, guest_conn: quinn::Connection) {
+        self.guest_bridges
+            .entry(token.to_string())
+            .or_default()
+            .push(guest_conn);
+    }
+
+    /// 当前 token 下已桥接、且连接仍存活的 Guest 连接。顺便清掉已关闭的。
+    fn live_guest_bridges(&mut self, token: &str) -> Vec<quinn::Connection> {
+        if let Some(conns) = self.guest_bridges.get_mut(token) {
+            conns.retain(|c| c.close_reason().is_none());
+            conns.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// 若这是该 token 第一次有 Guest 桥接，标记并返回 true——
+    /// 调用方应据此只起一个 Host→Guest 数据报扇出任务。
+    fn claim_datagram_fanout(&mut self, token: &str) -> bool {
+        self.host_datagram_fanout_started.insert(token.to_string())
     }
 
     pub fn register_guest_credential(&mut self, room_token: &str, credential: String) {
@@ -391,6 +432,12 @@ async fn handle_guest_conn(
             info!("[中继-QUIC] Guest 直接桥接到 Host (token: {})", token);
             let _ = send.write_all(b"OK").await;
             let _ = send.finish();
+            tokio::spawn(bridge_datagrams(
+                token.clone(),
+                conn.clone(),
+                host_conn.clone(),
+                registry.clone(),
+            ));
             tokio::spawn(bridge_guest_to_host(conn, host_conn));
         }
         None if need_wait => {
@@ -424,6 +471,12 @@ async fn handle_guest_conn(
                         .cloned()
                 };
                 if let Some(host_conn) = host_conn_after_wait {
+                    tokio::spawn(bridge_datagrams(
+                        token.clone(),
+                        conn.clone(),
+                        host_conn.clone(),
+                        registry.clone(),
+                    ));
                     tokio::spawn(bridge_guest_to_host(conn, host_conn));
                 }
                 // 如果获取不到 host_conn，说明期间 token 被消耗了，静默退出
@@ -443,6 +496,63 @@ async fn handle_guest_conn(
             let _ = send.write_all(b"ERR:invalid_token").await;
             let _ = send.finish();
         }
+    }
+}
+
+/// 登记一个 Guest 的数据报桥接，并按需起 Host→Guest 扇出任务。
+///
+/// TUN 隧道的实际载荷走的是 QUIC 数据报（不可靠、无序、低延迟），
+/// 不是上面的 PIP1 流——这条转发路径和 `bridge_guest_to_host` 完全独立，
+/// 后者目前没有客户端在用。
+///
+/// - Guest→Host：每个 Guest 连接独立，各自的收包任务只转发自己收到的，
+///   没有歧义，per-guest 起一个任务即可。
+/// - Host→Guest：Host 只有一条共享连接，中继看不见密文里的目的地址，
+///   只能广播给这个 token 下全部已桥接的 Guest，靠各自的 overlay 会话
+///   密钥解密失败自然丢弃不属于自己的包。整个 token 只能有一个任务读
+///   host_conn 的数据报，否则多个任务会互相抢包。
+async fn bridge_datagrams(
+    token: String,
+    guest_conn: quinn::Connection,
+    host_conn: quinn::Connection,
+    registry: SharedRegistry,
+) {
+    {
+        let mut reg = registry.lock().await;
+        reg.add_guest_bridge(&token, guest_conn.clone());
+    }
+
+    // Guest → Host：单向转发，没有歧义。
+    let gc = guest_conn.clone();
+    let hc = host_conn.clone();
+    tokio::spawn(async move {
+        loop {
+            match gc.read_datagram().await {
+                Ok(data) => {
+                    if hc.send_datagram(data).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Host → Guest：整个 token 只起一次。
+    if registry.lock().await.claim_datagram_fanout(&token) {
+        tokio::spawn(async move {
+            loop {
+                match host_conn.read_datagram().await {
+                    Ok(data) => {
+                        let guests = registry.lock().await.live_guest_bridges(&token);
+                        for guest in &guests {
+                            let _ = guest.send_datagram(data.clone());
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
     }
 }
 

@@ -635,6 +635,27 @@ impl HeadlessRuntime {
             }
         };
 
+        // 开发者模式的强制中继：会话密钥在阶段二 `on_plan` 就已经通过双方
+        // 交换的临时公钥派生完毕，跟真的去打洞完全无关——这里直接跳过
+        // `session.run()`（真实 UDP 打洞尝试），当成一次打洞失败处理，
+        // 复用下面已有的"失败就回退中继"逻辑，不用另起一套中继连接代码。
+        if self.config.read().await.force_relay_mode {
+            self.state.lock().await.peer_crypto = session.crypto();
+            tracing::warn!("[开发者模式] 强制中继已开启，跳过 P2P 打洞");
+            self.emit(
+                "punch:phase",
+                puncher::PunchPhase::Failed {
+                    reason: "开发者模式已开启强制中继".into(),
+                },
+            );
+            if let Some(relay) = self.state.lock().await.relay.clone() {
+                if let Err(error) = self.start_relay(relay).await {
+                    self.emit("tunnel:failed", json!({"mode": "Relay", "reason": error}));
+                }
+            }
+            return;
+        }
+
         self.emit("punch:phase", puncher::PunchPhase::Punching);
         let outcome = session.run(peer_candidates, start_delay_ms, ctx).await;
 
@@ -650,6 +671,9 @@ impl HeadlessRuntime {
         }
 
         let Some(success) = outcome.success else {
+            // 数据面必须用这把密钥；没有它就只能明文，宁可不建隧道。
+            // 打洞失败时同样要写回——接下来就是走中继回退，中继同样需要它。
+            self.state.lock().await.peer_crypto = outcome.crypto.clone();
             if is_host {
                 if let Some(peer) = self.state.lock().await.host_peers.remove(&peer_session_id) {
                     if let Some(endpoint) = peer.endpoint {
@@ -864,10 +888,23 @@ impl HeadlessRuntime {
         let connection = connection.ok_or("QUIC connection is not ready")?;
         // 没有会话密钥就不建隧道——绝不退回明文传输
         let crypto = crypto.ok_or("overlay 会话密钥尚未协商完成")?;
-        let bridge =
-            tun_bridge::TunBridge::start(&subnet, &virtual_ip, &host_ip, connection, crypto)
-                .await
-                .map_err(|e| e.to_string())?;
+        // Guest 只有一条对端连接，取它作为流量与丢包统计的归属。
+        // 没有它的话 tun_bridge 无处上报，带宽会一直显示 0。
+        let peer_stats = self
+            .stats
+            .first_connection_id()
+            .await
+            .map(|user| (self.stats.clone(), user));
+        let bridge = tun_bridge::TunBridge::start(
+            &subnet,
+            &virtual_ip,
+            &host_ip,
+            connection,
+            crypto,
+            peer_stats,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         self.state.lock().await.tun_bridge = Some(bridge);
         self.emit(
             "tun:ready",
