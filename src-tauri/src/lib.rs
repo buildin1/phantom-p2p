@@ -677,6 +677,26 @@ async fn connect_signal(
                                 }
                             };
 
+                            // 开发者模式的强制中继：会话密钥在阶段二 `on_plan` 就已经
+                            // 通过双方交换的临时公钥派生完毕，跟真的去打洞完全无关——
+                            // 这里直接跳过 `session.run()`（真实 UDP 打洞尝试），把它当成
+                            // 一次打洞失败处理，复用前端已有的"失败就回退中继"路径。
+                            // 这样强制中继复用的是跟正常中继回退完全相同的代码，
+                            // 不需要另起一套中继连接逻辑。
+                            if crate::DEV_MODE.load(Ordering::Relaxed)
+                                && phantom_core::config::ClientConfig::load().force_relay_mode
+                            {
+                                *ps.peer_crypto.lock().await = session.crypto();
+                                tracing::warn!("[开发者模式] 强制中继已开启，跳过 P2P 打洞");
+                                let _ = app_for_ice.emit(
+                                    "punch:phase",
+                                    puncher::PunchPhase::Failed {
+                                        reason: "开发者模式已开启强制中继".into(),
+                                    },
+                                );
+                                return;
+                            }
+
                             let _ = app_for_ice.emit("punch:phase", puncher::PunchPhase::Punching);
 
                             let room_code = signal_client_for_ice
@@ -1372,6 +1392,7 @@ async fn request_relay(
 async fn start_tun_bridge(
     app: AppHandle,
     punch_state: tauri::State<'_, PunchState>,
+    stats_state: tauri::State<'_, StatsState>,
 ) -> Result<(), String> {
     // 防止重复启动
     if punch_state
@@ -1419,10 +1440,23 @@ async fn start_tun_bridge(
         .await
         .clone()
         .ok_or("overlay 会话密钥尚未协商完成")?;
-    let bridge =
-        tun_bridge::TunBridge::start(&subnet, &virtual_ip, &host_virtual_ip, quic_conn, crypto)
-            .await
-            .map_err(|e| format!("启动 TUN 桥接失败: {}", e))?;
+    // Guest 只有一条对端连接，取它作为流量与丢包统计的归属。
+    // 没有它的话 tun_bridge 无处上报，带宽会一直显示 0。
+    let peer_stats = stats_state
+        .manager
+        .first_connection_id()
+        .await
+        .map(|user| (stats_state.manager.clone(), user));
+    let bridge = tun_bridge::TunBridge::start(
+        &subnet,
+        &virtual_ip,
+        &host_virtual_ip,
+        quic_conn,
+        crypto,
+        peer_stats,
+    )
+    .await
+    .map_err(|e| format!("启动 TUN 桥接失败: {}", e))?;
 
     *punch_state.tun_bridge.lock().await = Some(bridge);
     punch_state

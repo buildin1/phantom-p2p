@@ -1086,6 +1086,47 @@ function applyDevVisibility() {
   // 设置页信令地址
   const setSignalField = $("setSignalField");
   if (setSignalField) setSignalField.style.display = hidden ? "none" : "";
+  // 开发者专属卡片（强制中继等）
+  const devOnlyCard = $("devOnlyCard");
+  if (devOnlyCard) devOnlyCard.style.display = hidden ? "none" : "";
+}
+
+function syncForceRelayToggle() {
+  const toggle = $("forceRelayToggle");
+  if (!toggle) return;
+  const switchNode = toggle.querySelector(".switch");
+  if (!switchNode) return;
+  switchNode.classList.toggle("on", !!(state.config && state.config.force_relay_mode));
+}
+
+/// 强制中继开关：不走通用 data-flag 机制，因为它要立即写入后端配置生效
+/// （下一次连接开始时就会读到），而不是等点"保存设置"。
+function bindForceRelayToggle() {
+  const toggle = $("forceRelayToggle");
+  if (!toggle) return;
+  const switchNode = toggle.querySelector(".switch");
+  if (!switchNode) return;
+
+  syncForceRelayToggle();
+
+  toggle.addEventListener("click", async () => {
+    if (!state.isDevMode) return;
+    const enabled = !switchNode.classList.contains("on");
+    const cfg = state.config || {};
+    cfg.force_relay_mode = enabled;
+    state.config = cfg;
+    switchNode.classList.toggle("on", enabled);
+
+    try {
+      await invoke("save_config", { config: cfg });
+      addLog(`[开发者模式] 强制中继已${enabled ? "开启" : "关闭"}`, "WARN", "system");
+    } catch (err) {
+      addLog(`强制中继开关保存失败: ${err}`, "ERROR", "system");
+      cfg.force_relay_mode = !enabled;
+      state.config = cfg;
+      switchNode.classList.toggle("on", !enabled);
+    }
+  });
 }
 
 async function loadConfig() {
@@ -1101,6 +1142,7 @@ async function loadConfig() {
   }
   syncSettingsToggles();
   applySettingsToForm();
+  syncForceRelayToggle();
 }
 
 async function saveSettings() {
@@ -1927,6 +1969,7 @@ async function bootstrap() {
   applyDevVisibility();
   bindActions();
   bindSettingsToggles();
+  bindForceRelayToggle();
   resetProgress();
   setText("simBtn", "暂停采样");
   await loadConfig();

@@ -15,6 +15,27 @@ use tracing::{debug, info, warn};
 // P2P QUIC 配置（自签名证书）
 // ============================================================
 
+/// QUIC DATAGRAM 发送缓冲上限（字节）。
+///
+/// quinn 默认给到 1MB——按满载 1184 字节的包算，够缓冲 800 多个包。这本来是
+/// 为了防止应用层发送速度超过链路时把内存吃爆，但对我们这种实时流量来说，
+/// 缓冲区越大反而越危险：游戏一次性生成一大批数据（比如玩家快速移动触发大量
+/// 区块同步）时，1MB 的余量足够把这些包全部先攒进队列，而不是立刻反映到
+/// 拥塞控制上——于是 QUIC 会在这批包**攒满整个缓冲区之后才一次性大批丢弃**，
+/// 不是提前、少量、持续地丢。实机联机验证过这个后果：这一整批包（原包 +
+/// 我们自己补发的所有冗余份）几乎前后脚发出去，全部落在同一次拥塞窗口里，
+/// 稀释/错峰补包完全失效——因为补发用的错峰窗口（`tun_bridge.rs` 的
+/// `REDUNDANCY_WINDOW_CAP`，60ms）远小于这种"攒满再炸"的拥塞持续时间
+/// （实测能到 1 秒量级），冗余份跟原包一起被团灭，反倒是 Minecraft 这类
+/// 游戏里报的"reset"的直接原因。
+///
+/// 调小到 128KB（约 100+ 个满载包的余量）：让超出实际链路承载能力的部分
+/// 更早、更小批量地被 quinn 自己按"新包挤掉旧包"的规则丢弃（见
+/// `TransportConfig::datagram_send_buffer_size` 文档），而不是攒成一个大包
+/// 之后被拥塞控制一次性团灭——这样每次真正需要补的量小得多，也终于落在
+/// 我们补包机制的设计前提（应对短暂、小规模丢包）之内。
+const DATAGRAM_SEND_BUFFER_BYTES: usize = 128 * 1024;
+
 /// 生成自签名 TLS 证书，返回 (cert_der, key_der)
 fn generate_self_signed_cert() -> Result<(Vec<u8>, Vec<u8>), String> {
     let cert = rcgen::generate_simple_self_signed(vec!["phantom-p2p".to_string()])
@@ -46,6 +67,9 @@ pub fn build_server_config() -> Result<quinn::ServerConfig, String> {
     // 空闲超时: 60 秒无活动则断开
     transport_config.max_idle_timeout(Some(std::time::Duration::from_secs(60).try_into().unwrap()));
     transport_config.max_concurrent_bidi_streams(4096u32.into());
+    // 见 `DATAGRAM_SEND_BUFFER_BYTES` 的说明：调小是为了让突发流量提前、
+    // 小批量地被丢弃，而不是攒够 1MB 再被拥塞控制一次性团灭。
+    transport_config.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER_BYTES);
 
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
@@ -72,6 +96,7 @@ pub fn build_client_config() -> Result<quinn::ClientConfig, String> {
     // 空闲超时: 60 秒无活动则断开
     transport_config.max_idle_timeout(Some(std::time::Duration::from_secs(60).try_into().unwrap()));
     transport_config.max_concurrent_bidi_streams(4096u32.into());
+    transport_config.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER_BYTES);
 
     let mut client_config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
@@ -98,6 +123,7 @@ pub fn build_relay_client_config() -> Result<quinn::ClientConfig, String> {
     // 空闲超时: 60 秒无活动则断开
     transport_config.max_idle_timeout(Some(std::time::Duration::from_secs(60).try_into().unwrap()));
     transport_config.max_concurrent_bidi_streams(4096u32.into());
+    transport_config.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER_BYTES);
 
     let mut client_config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
@@ -213,7 +239,13 @@ pub async fn start_host_tunnel(
             // 连接一建立就把它接入 TUN 桥，之后只等连接结束。
             match (tun_bridge.clone(), peer_crypto.clone()) {
                 (Some(bridge), Some(crypto)) => {
-                    if let Err(e) = bridge.attach_peer(conn.clone(), crypto, None).await {
+                    let peer_stats = mapped_user_id
+                        .as_ref()
+                        .map(|u| (stats_manager.clone(), u.clone()));
+                    if let Err(e) = bridge
+                        .attach_peer(conn.clone(), crypto, None, peer_stats)
+                        .await
+                    {
                         warn!("[TUN] Host 接入对端数据报通道失败: {}", e);
                     }
                 }
@@ -693,7 +725,11 @@ async fn relay_host_datagram_loop(
     spawn_quic_monitor(conn.clone(), stats_manager.clone(), user_id.clone());
     match (tun_bridge, peer_crypto) {
         (Some(bridge), Some(crypto)) => {
-            if let Err(e) = bridge.attach_peer(conn.clone(), crypto, None).await {
+            let peer_stats = Some((stats_manager.clone(), user_id.clone()));
+            if let Err(e) = bridge
+                .attach_peer(conn.clone(), crypto, None, peer_stats)
+                .await
+            {
                 warn!("[TUN] 中继 Host 接入数据报通道失败: {}", e);
                 return;
             }
@@ -783,9 +819,16 @@ impl TunnelConnManager {
     }
 
     /// 关闭管理器（清除连接）
+    /// 关闭管理器。
+    ///
+    /// 必须**真的关掉** QUIC 连接，而不只是清掉这里的引用：数据面的收包任务
+    /// 各自克隆了连接句柄，清引用对它们毫无影响。以前只置 None，结果关了房间
+    /// 之后旧会话仍然能收发，对端也收不到任何断开通知。
     pub async fn close(&self) {
         let mut guard = self.conn.write().await;
-        *guard = None;
+        if let Some(conn) = guard.take() {
+            conn.close(0u32.into(), b"tunnel closed");
+        }
     }
 
     /// 当前活跃流数量

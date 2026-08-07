@@ -626,6 +626,18 @@
       padding: 5px 9px;
     }
 
+    /* 开发者专属项用警示色，避免被当成普通设置随手打开 */
+    .tag.warn {
+      border-color: rgba(255, 176, 32, 0.4);
+      color: #ffb020;
+      background: rgba(255, 176, 32, 0.14);
+    }
+
+    .muted {
+      color: var(--text-soft);
+      font-weight: 500;
+    }
+
     .form {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -2024,6 +2036,19 @@
                 <div class="toggle" data-flag="verbose"><span>详细日志输出</span><i class="switch on"></i></div>
                 <div class="toggle" data-flag="autoConnect"><span>启动时自动连接信令</span><i class="switch on"></i></div>
                 <div class="toggle" data-flag="smoothCharts"><span>图表平滑插值</span><i class="switch"></i></div>
+              </div>
+            </article>
+
+            <article class="panel" id="devOnlyCard" style="display: none">
+              <div class="panel-top">
+                <h3>开发者选项</h3>
+                <span class="tag warn">仅测试</span>
+              </div>
+              <div class="stack">
+                <div class="toggle" id="forceRelayToggle">
+                  <span>强制中继（跳过 P2P 打洞）<br /><small class="muted">用于单独测试中继服务器，正常联机请保持关闭</small></span>
+                  <i class="switch"></i>
+                </div>
               </div>
             </article>
           </section>
