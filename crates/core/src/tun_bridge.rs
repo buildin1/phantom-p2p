@@ -15,7 +15,7 @@ use crate::tun::{Ipv4Header, TunDevice, TunError};
 use quinn::Connection;
 use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as SyncMutex;
 use std::time::{Duration, Instant};
@@ -46,6 +46,29 @@ const REDUNDANCY_DELAY: Duration = Duration::from_millis(15);
 /// 不能紧挨着发——一次突发丢包会把挨在一起的两份一起带走，冗余等于白加。
 /// 错开发送才是为突发丢包地区留的余量。
 const REDUNDANCY_STAGGER: Duration = Duration::from_millis(10);
+
+/// 不管这次要补几份，从原包发出到最后一份补发完，总耗时不能超过这个上限。
+///
+/// 份数按丢包率升到 [`MAX_EXTRA_COPIES`] 档之后，如果还按固定
+/// [`REDUNDANCY_STAGGER`] 错峰，最后一份会拖到 85ms 才发出去——比内层 TCP
+/// 约 55ms 的自愈窗口还慢，纯属陪跑，起不到"抢在卡顿被感知到之前补上"
+/// 的作用。份数一多就按这个上限压缩间隔，见 [`redundancy_delay_for`]。
+const REDUNDANCY_WINDOW_CAP: Duration = Duration::from_millis(60);
+
+/// 补 `extra_copies` 份时，第 `i`（0 起）份相对原包该等多久再发。
+///
+/// 份数不多时维持固定的 [`REDUNDANCY_STAGGER`] 间隔，跟以前行为一致；
+/// 份数多到会把最后一份推到 [`REDUNDANCY_WINDOW_CAP`] 之后时，压缩间隔让
+/// 全部补发挤进这个窗口——宁可挤得密一点多担一点"一次突发全带走"的风险，
+/// 也不要让补发本身晚到失去意义。
+fn redundancy_delay_for(i: u8, extra_copies: u8) -> Duration {
+    if extra_copies <= 1 {
+        return REDUNDANCY_DELAY;
+    }
+    let budget = REDUNDANCY_WINDOW_CAP.saturating_sub(REDUNDANCY_DELAY);
+    let interval = std::cmp::min(REDUNDANCY_STAGGER, budget / (extra_copies as u32 - 1));
+    REDUNDANCY_DELAY + interval * i as u32
+}
 
 /// 一条流检测到丢包后，主动冗余保持开启的时长。
 ///
@@ -122,24 +145,46 @@ fn counter_of(sealed: &[u8]) -> u64 {
         .unwrap_or(0)
 }
 
-/// 按最近一次测得的入方向丢包率，决定冗余档位（额外补发份数，不含原包）。
+/// 补发份数的硬上限（不含原包）——算法认为该补更多也不会超过这个数。
 ///
-/// 对应《抗丢包方案设计》第 4.5 节的分档：0（真的没丢）、基线 2 份（额外 1 份）、
-/// 10~20% 升到 3 份、20%+ 升到 4 份。
+/// 这版实验性构建**不考虑带宽放大**（这是正式版才需要精打细算的事，见
+/// 《抗丢包方案设计》第一节的范围声明），所以宁可份数给足也不留一手；
+/// 但报文速率终归不能没有上限地涨，同一个包连续发 N 次这种模式本身也
+/// 可能被运营商当成异常流量处理，留一个明确的顶避免真的失控。
+const MAX_EXTRA_COPIES: u8 = 8;
+
+/// 按最近一次测得的丢包率，决定冗余档位（额外补发份数，不含原包）。
 ///
-/// `bp == 0` 必须映射到 0，不能给个"最低也算 1 档"的下限——这个值同时也是
+/// 对应《抗丢包方案设计》第 4.5 节的分档表——这版刻意压低了每一档的起点、
+/// 拉陡了升档曲线：不考虑带宽的实验构建里，"少补一份导致原包+补发一起丢"
+/// 比"多发几份包"贵得多，宁可 2% 出头就直接跳到 2 份额外拷贝：
+///
+/// | 丢包率 | 额外份数 | 总份数 |
+/// |---|---|---|
+/// | 0 | 0 | 1 |
+/// | 0~2% | 2 | 3 |
+/// | 2~5% | 3 | 4 |
+/// | 5~10% | 4 | 5 |
+/// | 10~20% | 6 | 7 |
+/// | 20%+ | 8（[`MAX_EXTRA_COPIES`]） | 9 |
+///
+/// `bp == 0` 必须映射到 0，不能给个"最低也算一档"的下限——这个值同时也是
 /// 连接级的**预测基线**（见 [`effective_extra_copies`]），链路真的干净时
 /// 基线要能跟着降到 0，不然新流量会一直白白多发，冗余没法在链路恢复之后
 /// 自己关掉。
 fn tier_for_bp(bp: u16) -> u8 {
-    if bp >= 2000 {
-        3
-    } else if bp >= 1000 {
-        2
-    } else if bp > 0 {
-        1
-    } else {
+    if bp == 0 {
         0
+    } else if bp <= 200 {
+        2
+    } else if bp <= 500 {
+        3
+    } else if bp <= 1000 {
+        4
+    } else if bp <= 2000 {
+        6
+    } else {
+        MAX_EXTRA_COPIES
     }
 }
 
@@ -188,19 +233,27 @@ fn decode_nack(payload: &[u8]) -> Option<Vec<(u64, u16)>> {
     Some(ranges)
 }
 
-/// 编码一条心跳：`[0xF2][u64 目前发到的最大计数器]`
-fn encode_heartbeat(highest: u64) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(9);
+/// 编码一条心跳：`[0xF2][u64 目前发到的最大计数器][u16 本端最近测得的入方向丢包率]`
+///
+/// 丢包率字段是给对端用的，不是自己看的：本端的"入方向丢包率"，从对端的
+/// 视角看正是"它自己的出方向丢包率"——这正是对端决定自己该给发给我方的
+/// 包补几份冗余时，唯一测得准的信号。见 [`PeerForwarder::current_tier`]
+/// 的说明。
+fn encode_heartbeat(highest: u64, loss_bp: u16) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(11);
     buf.push(CTRL_HEARTBEAT);
     buf.extend_from_slice(&highest.to_be_bytes());
+    buf.extend_from_slice(&loss_bp.to_be_bytes());
     buf
 }
 
-fn decode_heartbeat(payload: &[u8]) -> Option<u64> {
-    if payload.len() != 9 || payload[0] != CTRL_HEARTBEAT {
+fn decode_heartbeat(payload: &[u8]) -> Option<(u64, u16)> {
+    if payload.len() != 11 || payload[0] != CTRL_HEARTBEAT {
         return None;
     }
-    Some(u64::from_be_bytes(payload[1..9].try_into().unwrap()))
+    let highest = u64::from_be_bytes(payload[1..9].try_into().unwrap());
+    let loss_bp = u16::from_be_bytes(payload[9..11].try_into().unwrap());
+    Some((highest, loss_bp))
 }
 
 /// TUN 设备 MTU。
@@ -281,7 +334,7 @@ impl SendBuffer {
 #[derive(Clone, Copy)]
 struct RedundancyState {
     until: Instant,
-    /// 额外补发的份数（不含原包）。1~3，对应总共 2~4 份，见 [`tier_for_bp`]。
+    /// 额外补发的份数（不含原包）。1~8，对应总共 2~9 份，见 [`tier_for_bp`]。
     extra_copies: u8,
 }
 
@@ -304,7 +357,21 @@ struct PeerForwarder {
     flow_redundancy: Arc<SyncMutex<HashMap<FlowKey, RedundancyState>>>,
     /// 目前为止发送过的最大计数器，心跳用来告诉对端"我发到哪了"。
     highest_sent: Arc<AtomicU64>,
-    /// 最近一次测得的入方向丢包档位（1~3），新开启一条流的冗余时按这个定份数。
+    /// 本端最近一次测得的入方向丢包率（basis points，10000=100%）。
+    ///
+    /// 只用来往对端上报（塞进心跳里，见 [`encode_heartbeat`]），**不能**直接
+    /// 拿来当自己的冗余基线用——这个数测的是"对端发给我"这个方向的丢包，
+    /// 而 [`current_tier`](Self::current_tier) 要回答的是"我发给对端"这个
+    /// 方向该补几份，两者是链路的两个独立方向，尤其在移动网络上可能差很多。
+    measured_loss_bp: Arc<AtomicU16>,
+    /// 连接级的**出方向**预测基线（0、2~8，见 [`tier_for_bp`]），决定新流量
+    /// 该垫几份底。
+    ///
+    /// 这个值来自**对端心跳里上报的、对端测到的入方向丢包率**——也就是"我
+    /// 发出去的包，对端那边实际收到的样子"，这才是预测"我该给自己发的包
+    /// 补几份"时唯一测得准的方向。不能直接用本端自己的入方向丢包率
+    /// （[`measured_loss_bp`] 字段那个）替代：两个方向的丢包率不保证对称，
+    /// 用错方向会导致这条链路真正需要冗余的方向反而没测准。
     current_tier: Arc<AtomicU8>,
 }
 
@@ -580,7 +647,7 @@ impl PeerForwarder {
                 let stats = self.stats.clone();
                 tokio::spawn(async move {
                     for i in 0..extra_copies {
-                        tokio::time::sleep(REDUNDANCY_DELAY + REDUNDANCY_STAGGER * i as u32).await;
+                        tokio::time::sleep(redundancy_delay_for(i, extra_copies)).await;
                         match conn.send_datagram(bytes.clone().into()) {
                             Ok(()) => {
                                 if let Some((stats, user)) = &stats {
@@ -734,8 +801,9 @@ impl TunBridge {
             send_buffer: Arc::new(SyncMutex::new(SendBuffer::new())),
             flow_redundancy: Arc::new(SyncMutex::new(HashMap::new())),
             highest_sent: Arc::new(AtomicU64::new(0)),
-            // 从 0 起步（不预设有损）：真实档位由收到的第一批入方向丢包率
-            // 测量结果（`loss.poll()` → `set_tier`）来定，见那里的说明。
+            measured_loss_bp: Arc::new(AtomicU16::new(0)),
+            // 从 0 起步（不预设有损）：真实档位由对端心跳汇报的丢包率
+            // （`set_tier`，见那里的说明）来定，收到第一条心跳之前不补冗余。
             current_tier: Arc::new(AtomicU8::new(0)),
         };
         tracing::info!(
@@ -768,7 +836,8 @@ impl TunBridge {
                         break;
                     }
                     let highest = heartbeat.highest_sent.load(Ordering::Relaxed);
-                    heartbeat.send_control(encode_heartbeat(highest));
+                    let loss_bp = heartbeat.measured_loss_bp.load(Ordering::Relaxed);
+                    heartbeat.send_control(encode_heartbeat(highest, loss_bp));
                 }
             });
         }
@@ -1095,11 +1164,11 @@ async fn receive_datagrams(
             if bp > 0 {
                 tracing::info!("[TUN] 入方向丢包 {:.2}%", bp as f64 / 100.0);
             }
-            // 不管这次测出来是不是 0，都要更新预测基线档位——链路刚变干净
-            // 时也得让基线跟着降回 0，不然新流量会一直被按旧的丢包率白白
-            // 多发。真正按流精确开启冗余是 `handle_nack` 命中之后才做的事，
-            // 见那里的说明；这里只更新"预测该垫几份底"的档位。
-            sender.set_tier(tier_for_bp(bp));
+            // 存下来给对端用（塞进下一条心跳），**不**在这里直接拿去设
+            // `current_tier`——这个 bp 测的是"对端发给我"这个方向，
+            // 而 `current_tier` 要回答的是"我发给对端"该补几份，
+            // 那个数只能靠对端心跳汇报，见 `current_tier` 字段的说明。
+            sender.measured_loss_bp.store(bp, Ordering::Relaxed);
         }
 
         // 控制报文（NACK/心跳）不是 IP 包，标签取值故意避开合法 IPv4 首字节
@@ -1116,8 +1185,13 @@ async fn receive_datagrams(
                         }
                     }
                     CTRL_HEARTBEAT => {
-                        if let Some(highest) = decode_heartbeat(&packet) {
+                        if let Some((highest, remote_loss_bp)) = decode_heartbeat(&packet) {
                             gaps.observe(highest, now);
+                            // 对端汇报的是它自己的入方向丢包率，正好等于
+                            // "我发给它"这个方向的丢包率——这是设出方向
+                            // 预测基线唯一测得准的信号，见 `current_tier`
+                            // 字段的说明。
+                            sender.set_tier(tier_for_bp(remote_loss_bp));
                         } else {
                             debug!("[TUN] 收到格式错误的心跳");
                         }
@@ -1539,29 +1613,56 @@ mod tests {
 
     #[test]
     fn heartbeat_roundtrips_through_encode_decode() {
-        let encoded = encode_heartbeat(123_456_789);
-        assert_eq!(decode_heartbeat(&encoded), Some(123_456_789));
+        let encoded = encode_heartbeat(123_456_789, 4321);
+        assert_eq!(decode_heartbeat(&encoded), Some((123_456_789, 4321)));
     }
 
     #[test]
     fn heartbeat_decode_rejects_wrong_tag_or_length() {
-        assert!(decode_heartbeat(&[CTRL_NACK, 0, 0, 0, 0, 0, 0, 0, 1]).is_none());
+        assert!(decode_heartbeat(&[CTRL_NACK, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0]).is_none());
         assert!(decode_heartbeat(&[CTRL_HEARTBEAT, 0, 0]).is_none());
     }
 
-    /// 分档必须跟《抗丢包方案设计》第 4.5 节的表格对齐：
-    /// 真没丢是 0 份额外，>0~10% 基线 2 份（额外 1），10~20% 升到 3 份（额外 2），
-    /// 20%+ 升到 4 份（额外 3）。`bp == 0` 必须是 0——它同时也是预测基线，
-    /// 链路干净时基线要能降到底，见 `tier_for_bp` 的说明。
+    /// 分档必须跟《抗丢包方案设计》第 4.5 节的表格对齐，这版故意把每一档的
+    /// 起点压低、曲线拉陡——不考虑带宽的实验构建里，"少补一份导致原包+
+    /// 补发一起丢"比"多发几份包"贵得多：真没丢是 0 份额外，0~2% 就给 2 份
+    /// 额外（共 3 份），2~5% 给 3 份，5~10% 给 4 份，10~20% 给 6 份，
+    /// 20%+ 封顶在 `MAX_EXTRA_COPIES`（8 份）。`bp == 0` 必须是 0——它同时
+    /// 也是预测基线，链路干净时基线要能降到底，见 `tier_for_bp` 的说明。
     #[test]
     fn redundancy_tier_matches_the_design_thresholds() {
         assert_eq!(tier_for_bp(0), 0);
-        assert_eq!(tier_for_bp(1), 1);
-        assert_eq!(tier_for_bp(999), 1);
-        assert_eq!(tier_for_bp(1000), 2);
-        assert_eq!(tier_for_bp(1999), 2);
-        assert_eq!(tier_for_bp(2000), 3);
-        assert_eq!(tier_for_bp(10_000), 3);
+        assert_eq!(tier_for_bp(1), 2);
+        assert_eq!(tier_for_bp(200), 2);
+        assert_eq!(tier_for_bp(201), 3);
+        assert_eq!(tier_for_bp(500), 3);
+        assert_eq!(tier_for_bp(501), 4);
+        assert_eq!(tier_for_bp(1000), 4);
+        assert_eq!(tier_for_bp(1001), 6);
+        assert_eq!(tier_for_bp(2000), 6);
+        assert_eq!(tier_for_bp(2001), MAX_EXTRA_COPIES);
+        assert_eq!(tier_for_bp(10_000), MAX_EXTRA_COPIES);
+    }
+
+    /// 份数少时维持原来的固定错峰间隔；份数多到会把最后一份推过
+    /// `REDUNDANCY_WINDOW_CAP` 时，间隔要压缩，保证全部补发都挤在窗口内。
+    #[test]
+    fn redundancy_delay_stays_within_the_window_cap_as_copies_grow() {
+        // 份数少：维持原来的固定 10ms 间隔，行为不变。
+        assert_eq!(redundancy_delay_for(0, 2), REDUNDANCY_DELAY);
+        assert_eq!(
+            redundancy_delay_for(1, 2),
+            REDUNDANCY_DELAY + REDUNDANCY_STAGGER
+        );
+
+        // 封顶的 8 份：最后一份（i=7）不能晚于窗口上限。
+        let last = redundancy_delay_for(MAX_EXTRA_COPIES - 1, MAX_EXTRA_COPIES);
+        assert!(last <= REDUNDANCY_WINDOW_CAP);
+        // 但补发依旧要保持错峰（不能全挤到同一时刻，不然一次突发丢包
+        // 会把所有份数一起带走，冗余等于白加）。
+        assert!(
+            redundancy_delay_for(1, MAX_EXTRA_COPIES) > redundancy_delay_for(0, MAX_EXTRA_COPIES)
+        );
     }
 
     /// 预测基线兜底、探测针实测只会往上修正，不会盖过更新鲜的基线。
