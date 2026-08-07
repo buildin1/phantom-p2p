@@ -1032,13 +1032,31 @@ async fn receive_datagrams(
         };
 
         let now = Instant::now();
-        // 空洞跟踪不分数据/控制报文——两者共用同一个计数器序列，只要序号
-        // 存在过就要记，驱动 NACK 的是"序号没到"，不是"内容是什么"。
+        // 空洞跟踪和丢包率统计都不分数据/控制报文——两者共用同一个计数器序列
+        // （`crypto.rs` 的 `tx_counter` 是连接全局的，不区分内容），控制报文
+        // 一样要算进"这个序号收到了"。**必须在下面的控制报文分支之前做**：
+        // 心跳每秒占用一个计数器，如果只对数据报文调用 `loss.on_received`，
+        // 心跳占的那个号会被 `LossMeter` 永远当成"没收到"算进丢包率——
+        // 等于自己制造假丢包，还会被当成真信号触发冗余升级/误导排查。
         gaps.observe(counter, now);
+        loss.on_received(counter, now);
+        if let Some(bp) = loss.poll(now) {
+            if let Some((stats, user)) = &sender.stats {
+                let (stats, user) = (stats.clone(), user.clone());
+                tokio::spawn(async move { stats.update_inbound_loss(&user, bp).await });
+            }
+            if bp > 0 {
+                tracing::info!("[TUN] 入方向丢包 {:.2}%", bp as f64 / 100.0);
+                // 这里只更新档位（额外补发几份），不直接开冗余——
+                // 真正按流精确开启冗余是 `handle_nack` 命中之后才做的事，
+                // 见那里的说明。
+                sender.set_tier(tier_for_bp(bp));
+            }
+        }
 
         // 控制报文（NACK/心跳）不是 IP 包，标签取值故意避开合法 IPv4 首字节
         // （版本号固定是 4），解密后不用再包一层信封就能跟数据报文分开，
-        // 走独立分支处理，不进入下面的丢包统计/重放判定/TUN 写入流程。
+        // 走独立分支处理，不进入下面的重放判定/TUN 写入流程。
         if let Some(&tag) = packet.first() {
             if !looks_like_ipv4(tag) {
                 match tag {
@@ -1062,23 +1080,6 @@ async fn receive_datagrams(
                 }
                 maybe_send_nack(&sender, &mut gaps, now);
                 continue;
-            }
-        }
-
-        // 计数器空洞就是入方向丢包，必须在重放判定**之前**记——
-        // 重放判定会把重复包挡掉，放在后面就统计不到真实到达情况了。
-        loss.on_received(counter, now);
-        if let Some(bp) = loss.poll(now) {
-            if let Some((stats, user)) = &sender.stats {
-                let (stats, user) = (stats.clone(), user.clone());
-                tokio::spawn(async move { stats.update_inbound_loss(&user, bp).await });
-            }
-            if bp > 0 {
-                tracing::info!("[TUN] 入方向丢包 {:.2}%", bp as f64 / 100.0);
-                // 这里只更新档位（额外补发几份），不直接开冗余——
-                // 真正按流精确开启冗余是 `handle_nack` 命中之后才做的事，
-                // 见那里的说明。
-                sender.set_tier(tier_for_bp(bp));
             }
         }
 
