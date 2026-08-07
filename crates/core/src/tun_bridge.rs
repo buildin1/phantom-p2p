@@ -124,16 +124,36 @@ fn counter_of(sealed: &[u8]) -> u64 {
 
 /// 按最近一次测得的入方向丢包率，决定冗余档位（额外补发份数，不含原包）。
 ///
-/// 对应《抗丢包方案设计》第 4.5 节的分档：基线 2 份（额外 1 份），
-/// 10~20% 升到 3 份，20%+ 升到 4 份。
+/// 对应《抗丢包方案设计》第 4.5 节的分档：0（真的没丢）、基线 2 份（额外 1 份）、
+/// 10~20% 升到 3 份、20%+ 升到 4 份。
+///
+/// `bp == 0` 必须映射到 0，不能给个"最低也算 1 档"的下限——这个值同时也是
+/// 连接级的**预测基线**（见 [`effective_extra_copies`]），链路真的干净时
+/// 基线要能跟着降到 0，不然新流量会一直白白多发，冗余没法在链路恢复之后
+/// 自己关掉。
 fn tier_for_bp(bp: u16) -> u8 {
     if bp >= 2000 {
         3
     } else if bp >= 1000 {
         2
-    } else {
+    } else if bp > 0 {
         1
+    } else {
+        0
     }
+}
+
+/// 一个包实际该补几份：连接级预测基线 与 这条流自己被 NACK 命中过的
+/// 实测档位，取较大值。
+///
+/// 基线覆盖的是"这条流还没机会自证丢没丢"的情况——连接最近测出来在丢包，
+/// 新流量/低频流量（比如 ICMP ping，一次只发一个、隔很久才发下一个）
+/// 很可能要等很久才能靠自己触发一次 NACK，等不起就先按连接的整体水平垫底。
+/// 一旦这条流真的被 NACK 命中过（探测针给出了实测结果），说明预测该往上修
+/// 正了，取较大值；探测针只会把保护"往上修"，不会把连接当前还在丢包时的
+/// 基线"往下压"——旧的探测结果不该盖过更新鲜的连接级信号。
+fn effective_extra_copies(baseline_tier: u8, flow_specific: Option<u8>) -> u8 {
+    baseline_tier.max(flow_specific.unwrap_or(0))
 }
 
 /// 编码一条 NACK：`[0xF1][u16 区间数][ (u64 起始计数器, u16 区间长度) ... ]`
@@ -508,17 +528,19 @@ impl PeerForwarder {
         let counter = counter_of(&sealed);
         let len = sealed.len();
 
-        // 按这个包**自己所属的流**查冗余状态，不是按整条连接——同一条连接里
-        // 没在丢包的流不会被这条包连累多发。
+        // 补几份 = 连接级预测基线 与 这条流自己被 NACK 命中过的实测档位，
+        // 取较大值（见 `effective_extra_copies`）。基线兜住"这条流还没机会
+        // 自证丢没丢"的情况——ICMP ping 这种一次只发一个、隔很久才发下一个
+        // 的稀疏流，靠自己触发一次 NACK 可能要等将近一个心跳周期，等不起。
         let flow = Ipv4Header::from_bytes(packet).map(|h| flow_key(h, packet));
-        let extra_copies = flow
-            .and_then(|f| {
-                let fr = self.flow_redundancy.lock().unwrap();
-                fr.get(&f)
-                    .filter(|s| s.until > Instant::now())
-                    .map(|s| s.extra_copies)
-            })
-            .unwrap_or(0);
+        let flow_specific = flow.and_then(|f| {
+            let fr = self.flow_redundancy.lock().unwrap();
+            fr.get(&f)
+                .filter(|s| s.until > Instant::now())
+                .map(|s| s.extra_copies)
+        });
+        let extra_copies =
+            effective_extra_copies(self.current_tier.load(Ordering::Relaxed), flow_specific);
         // 冗余份必须复用这份密文字节原样重发，不能对同一个包再调一次
         // `crypto.seal()`——那样会拿到不同计数器的两个包，现有重放窗口就
         // 没法把它们当成同一个包去重了。只有确定要发冗余份时才克隆，
@@ -712,7 +734,9 @@ impl TunBridge {
             send_buffer: Arc::new(SyncMutex::new(SendBuffer::new())),
             flow_redundancy: Arc::new(SyncMutex::new(HashMap::new())),
             highest_sent: Arc::new(AtomicU64::new(0)),
-            current_tier: Arc::new(AtomicU8::new(1)),
+            // 从 0 起步（不预设有损）：真实档位由收到的第一批入方向丢包率
+            // 测量结果（`loss.poll()` → `set_tier`）来定，见那里的说明。
+            current_tier: Arc::new(AtomicU8::new(0)),
         };
         tracing::info!(
             "[TUN] 数据报通道就绪 (local={}, peer_hint={:?}, host={}, max_datagram={:?})",
@@ -1070,11 +1094,12 @@ async fn receive_datagrams(
             }
             if bp > 0 {
                 tracing::info!("[TUN] 入方向丢包 {:.2}%", bp as f64 / 100.0);
-                // 这里只更新档位（额外补发几份），不直接开冗余——
-                // 真正按流精确开启冗余是 `handle_nack` 命中之后才做的事，
-                // 见那里的说明。
-                sender.set_tier(tier_for_bp(bp));
             }
+            // 不管这次测出来是不是 0，都要更新预测基线档位——链路刚变干净
+            // 时也得让基线跟着降回 0，不然新流量会一直被按旧的丢包率白白
+            // 多发。真正按流精确开启冗余是 `handle_nack` 命中之后才做的事，
+            // 见那里的说明；这里只更新"预测该垫几份底"的档位。
+            sender.set_tier(tier_for_bp(bp));
         }
 
         // 控制报文（NACK/心跳）不是 IP 包，标签取值故意避开合法 IPv4 首字节
@@ -1525,15 +1550,34 @@ mod tests {
     }
 
     /// 分档必须跟《抗丢包方案设计》第 4.5 节的表格对齐：
-    /// 基线 2 份（额外 1），10~20% 升到 3 份（额外 2），20%+ 升到 4 份（额外 3）。
+    /// 真没丢是 0 份额外，>0~10% 基线 2 份（额外 1），10~20% 升到 3 份（额外 2），
+    /// 20%+ 升到 4 份（额外 3）。`bp == 0` 必须是 0——它同时也是预测基线，
+    /// 链路干净时基线要能降到底，见 `tier_for_bp` 的说明。
     #[test]
     fn redundancy_tier_matches_the_design_thresholds() {
-        assert_eq!(tier_for_bp(0), 1);
+        assert_eq!(tier_for_bp(0), 0);
+        assert_eq!(tier_for_bp(1), 1);
         assert_eq!(tier_for_bp(999), 1);
         assert_eq!(tier_for_bp(1000), 2);
         assert_eq!(tier_for_bp(1999), 2);
         assert_eq!(tier_for_bp(2000), 3);
         assert_eq!(tier_for_bp(10_000), 3);
+    }
+
+    /// 预测基线兜底、探测针实测只会往上修正，不会盖过更新鲜的基线。
+    #[test]
+    fn effective_extra_copies_takes_the_larger_of_baseline_and_flow_specific() {
+        // 没测出来过丢包、这条流也没被 NACK 命中过：不多发。
+        assert_eq!(effective_extra_copies(0, None), 0);
+        // 连接级已经测出在丢包，这条流还没机会自证——按基线垫底。
+        assert_eq!(effective_extra_copies(2, None), 2);
+        // 这条流被探测针命中过，但基线更高（链路刚变得更差）：以更新鲜的基线为准。
+        assert_eq!(effective_extra_copies(3, Some(1)), 3);
+        // 这条流被命中的实测档位比基线还高：以实测为准（探测针只会往上修）。
+        assert_eq!(effective_extra_copies(1, Some(3)), 3);
+        // 链路已经干净（基线回到 0），但这条流之前被命中过、redundancy 状态
+        // 还没过期：仍然保留这条流自己的实测保护，直到状态自然过期。
+        assert_eq!(effective_extra_copies(0, Some(2)), 2);
     }
 
     #[test]
