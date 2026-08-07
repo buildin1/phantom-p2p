@@ -540,8 +540,7 @@ impl PeerForwarder {
                 let stats = self.stats.clone();
                 tokio::spawn(async move {
                     for i in 0..extra_copies {
-                        tokio::time::sleep(REDUNDANCY_DELAY + REDUNDANCY_STAGGER * i as u32)
-                            .await;
+                        tokio::time::sleep(REDUNDANCY_DELAY + REDUNDANCY_STAGGER * i as u32).await;
                         match conn.send_datagram(bytes.clone().into()) {
                             Ok(()) => {
                                 if let Some((stats, user)) = &stats {
@@ -1455,7 +1454,11 @@ mod tests {
         // 标准 20 字节头（IHL=5）到最大 60 字节头（IHL=15）覆盖的全部合法首字节
         for ihl in 5..=15u8 {
             let first_byte = (4 << 4) | ihl;
-            assert!(looks_like_ipv4(first_byte), "0x{:02x} 应该被认成合法 IPv4", first_byte);
+            assert!(
+                looks_like_ipv4(first_byte),
+                "0x{:02x} 应该被认成合法 IPv4",
+                first_byte
+            );
         }
     }
 
@@ -1472,7 +1475,10 @@ mod tests {
         let ranges = vec![(1u64, 5u16), (2u64, 5u16)];
         let mut encoded = encode_nack(&ranges);
         encoded.truncate(encoded.len() - 1);
-        assert!(decode_nack(&encoded).is_none(), "长度对不上必须拒绝，不能越界读");
+        assert!(
+            decode_nack(&encoded).is_none(),
+            "长度对不上必须拒绝，不能越界读"
+        );
     }
 
     #[test]
@@ -1512,10 +1518,7 @@ mod tests {
         let mut g = GapTracker::new();
         g.observe(1, t);
         g.observe(3, t); // 2 还没到，但可能只是乱序
-        assert!(
-            g.ranges_to_nack(t).is_empty(),
-            "重排容忍期内不该立刻 NACK"
-        );
+        assert!(g.ranges_to_nack(t).is_empty(), "重排容忍期内不该立刻 NACK");
         // 2 姗姗来迟
         g.observe(2, t + Duration::from_millis(5));
         assert!(
