@@ -77,6 +77,55 @@ fn redundancy_delay_for(i: u8, extra_copies: u8) -> Duration {
 /// 冗余必须跟着实测丢包走、按流精确定向，不能全局常开去撞运营商风控。
 const REDUNDANCY_HOLD: Duration = Duration::from_secs(4);
 
+/// RTT 超过"这条连接见过的最小 RTT"多少倍，判定为链路正在拥塞。
+///
+/// 基线用这条连接自己的历史最小 RTT，而不是写死的常量——不同链路的物理
+/// 延迟差异很大，只有拿它自己的最优值当基准才公平（BBR 判断拥塞用的也是
+/// 同一个思路）。RTT 持续、明显地偏离这个基线，是排队/拥塞最直接的信号。
+///
+/// 实机联机测出过这个坑：一旦测到的丢包率把冗余档位推到顶（`MAX_EXTRA_COPIES`
+/// 8 份），如果这次丢包本身就是链路拥塞造成的，补 9 倍流量上去只会让拥塞
+/// 更重——拥塞导致丢包更多，更多丢包又把档位摁在顶不下来，形成恶性循环，
+/// 实测 12 秒内同一条流的重复/过旧拒收事件飙到 4000+ 次，最后直接把游戏
+/// 连接拖到重置。WebRTC/RFC 8854 对这个问题的标准做法是：补发流量必须
+/// 服从拥塞控制给出的带宽上限，链路已经拥塞时应该降补发量而不是加——
+/// 这里就是那个"降"的开关。
+const CONGESTION_RTT_MULTIPLIER: u64 = 3;
+
+/// 判定为拥塞时，无论测出的丢包率多高，冗余档位最多压到这个值。
+///
+/// 不是压到 0——已经被 NACK 证实丢包的流仍然值得担一份最基本的冗余，
+/// 只是不能再跟着丢包率往上加码，见 [`CONGESTION_RTT_MULTIPLIER`] 的说明。
+const CONGESTED_TIER_CAP: u8 = 1;
+
+/// 纯逻辑判断，不摸真实时钟——方便单测，不用真建一条 QUIC 连接。
+fn is_congested(min_rtt_ms: u64, current_rtt_ms: u64) -> bool {
+    min_rtt_ms != u64::MAX && current_rtt_ms > min_rtt_ms.saturating_mul(CONGESTION_RTT_MULTIPLIER)
+}
+
+/// 补发流量（冗余份 + NACK 重传）的硬性速率上限——每条连接每秒最多发这么
+/// 多份补发包，不管上面 tier 算出来该补多少。
+///
+/// 这是最后一道硬闸门，不依赖"拥塞判断得准不准"：就算上面的 RTT 检测这次
+/// 没抓住（比如拥塞发生在对端、本端自己测的 RTT 没体现出来），补发流量
+/// 物理上也不可能超过这个数，从根上堵死"冗余把链路自己压垮"这种失控放大。
+const MAX_REPAIR_PACKETS_PER_SEC: u32 = 300;
+
+/// 纯逻辑：给定补发预算窗口的当前状态和这一刻的时间，算出这次要不要放行、
+/// 放行/拒绝之后窗口状态该更新成什么样。不摸真实时钟或锁，方便单测。
+fn reserve_repair_budget(window_start: Instant, used: u32, now: Instant) -> (bool, Instant, u32) {
+    let (window_start, used) = if now.duration_since(window_start) >= Duration::from_secs(1) {
+        (now, 0)
+    } else {
+        (window_start, used)
+    };
+    if used < MAX_REPAIR_PACKETS_PER_SEC {
+        (true, window_start, used + 1)
+    } else {
+        (false, window_start, used)
+    }
+}
+
 /// NACK 请求重传的最长等待时间，**按这条连接实测的 RTT 动态算**，不能写死。
 ///
 /// 曾经写死成 150ms，在低延迟链路上没问题，但拿到一条真实高丢包链路
@@ -373,6 +422,12 @@ struct PeerForwarder {
     /// （[`measured_loss_bp`] 字段那个）替代：两个方向的丢包率不保证对称，
     /// 用错方向会导致这条链路真正需要冗余的方向反而没测准。
     current_tier: Arc<AtomicU8>,
+    /// 这条连接见过的最小 RTT（毫秒），拥塞判定的基线。`u64::MAX` 表示还
+    /// 没有过任何样本。见 [`is_congested`]。
+    min_rtt_ms: Arc<AtomicU64>,
+    /// 补发流量速率限制的窗口状态：(当前窗口起始时间, 这个窗口已经用掉的
+    /// 份数)。见 [`reserve_repair_budget`]。
+    repair_budget: Arc<SyncMutex<(Instant, u32)>>,
 }
 
 impl PeerForwarder {
@@ -397,6 +452,28 @@ impl PeerForwarder {
         self.current_tier.store(tier, Ordering::Relaxed);
     }
 
+    /// 拿当前连接的 RTT 刷新历史最小值基线，并返回这一刻是否判定为拥塞。
+    fn observe_congestion(&self) -> bool {
+        let now_ms = self.conn.rtt().as_millis() as u64;
+        let mut congested = false;
+        let _ = self
+            .min_rtt_ms
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |min| {
+                congested = is_congested(min, now_ms);
+                Some(min.min(now_ms))
+            });
+        congested
+    }
+
+    /// 申请一份补发预算；申请不到就不该再发这一份补发包了。见
+    /// [`reserve_repair_budget`]。
+    fn try_reserve_repair_budget(&self) -> bool {
+        let mut guard = self.repair_budget.lock().unwrap();
+        let (allowed, window_start, used) = reserve_repair_budget(guard.0, guard.1, Instant::now());
+        *guard = (window_start, used);
+        allowed
+    }
+
     /// 收到对端的 NACK：命中的计数器原样从发送缓冲重发，并把命中的流标记为
     /// "需要冗余"，让后续该流的包自动补发，不用等下一次 NACK 才反应过来。
     fn handle_nack(&self, ranges: &[(u64, u16)]) {
@@ -411,6 +488,13 @@ impl PeerForwarder {
                         // 放弃这个计数器，跟没收到 NACK 一样处理。
                         continue;
                     };
+                    if !self.try_reserve_repair_budget() {
+                        // 补发预算已经用完——见 `MAX_REPAIR_PACKETS_PER_SEC`
+                        // 的说明，这不是丢包，是主动放弃这次重传，避免补发
+                        // 流量自己把链路打满。
+                        debug!("[TUN] 补发预算已耗尽，放弃重传 counter={}", counter);
+                        continue;
+                    }
                     let conn = self.conn.clone();
                     let bytes = entry.bytes.clone();
                     tokio::spawn(async move {
@@ -652,9 +736,26 @@ impl PeerForwarder {
             if let Some(bytes) = redundant_bytes {
                 let conn = self.conn.clone();
                 let stats = self.stats.clone();
+                // 克隆整个 forwarder（内部都是 Arc，克隆很轻）只是为了在
+                // 这个后台任务里也能申请补发预算——不能省，见
+                // `MAX_REPAIR_PACKETS_PER_SEC` 的说明：这道闸门必须卡在
+                // "实际要发出去"这一刻，不能只在 try_forward 这次调用的
+                // 决策时刻查一次，因为同一秒里还有别的包也在各自的后台
+                // 任务里排队发补发份，只有在真正发送前查预算才挡得住
+                // 大家加起来的总量。
+                let forwarder = self.clone();
                 tokio::spawn(async move {
                     for i in 0..extra_copies {
                         tokio::time::sleep(redundancy_delay_for(i, extra_copies)).await;
+                        if !forwarder.try_reserve_repair_budget() {
+                            debug!(
+                                "[TUN] 补发预算已耗尽，放弃剩余冗余份 counter={} copy={}/{}",
+                                counter,
+                                i + 1,
+                                extra_copies
+                            );
+                            break;
+                        }
                         match conn.send_datagram(bytes.clone().into()) {
                             Ok(()) => {
                                 if let Some((stats, user)) = &stats {
@@ -812,6 +913,8 @@ impl TunBridge {
             // 从 0 起步（不预设有损）：真实档位由对端心跳汇报的丢包率
             // （`set_tier`，见那里的说明）来定，收到第一条心跳之前不补冗余。
             current_tier: Arc::new(AtomicU8::new(0)),
+            min_rtt_ms: Arc::new(AtomicU64::new(u64::MAX)),
+            repair_budget: Arc::new(SyncMutex::new((Instant::now(), 0))),
         };
         tracing::info!(
             "[TUN] 数据报通道就绪 (local={}, peer_hint={:?}, host={}, max_datagram={:?})",
@@ -1198,7 +1301,17 @@ async fn receive_datagrams(
                             // "我发给它"这个方向的丢包率——这是设出方向
                             // 预测基线唯一测得准的信号，见 `current_tier`
                             // 字段的说明。
-                            sender.set_tier(tier_for_bp(remote_loss_bp));
+                            let tier = tier_for_bp(remote_loss_bp);
+                            // 但在往上抬档位之前，先看链路是不是已经在拥塞：
+                            // 如果这次丢包本身就是排队/拥塞造成的，再往上
+                            // 加冗余只会让拥塞更重，见 `CONGESTION_RTT_
+                            // MULTIPLIER` 的说明。
+                            let tier = if sender.observe_congestion() {
+                                tier.min(CONGESTED_TIER_CAP)
+                            } else {
+                                tier
+                            };
+                            sender.set_tier(tier);
                         } else {
                             debug!("[TUN] 收到格式错误的心跳");
                         }
@@ -1670,6 +1783,50 @@ mod tests {
         assert!(
             redundancy_delay_for(1, MAX_EXTRA_COPIES) > redundancy_delay_for(0, MAX_EXTRA_COPIES)
         );
+    }
+
+    /// 还没有过任何 RTT 样本时不能瞎判定拥塞——第一次心跳到达前，基线是
+    /// `u64::MAX`，任何 RTT 都不该被当成"偏离基线"。
+    #[test]
+    fn congestion_detection_needs_a_baseline_first() {
+        assert!(!is_congested(u64::MAX, 500));
+    }
+
+    /// 没超过 `CONGESTION_RTT_MULTIPLIER` 倍基线不算拥塞，超过了才算——
+    /// 边界值精确到刚好等于倍数那一下不算（用的是 `>`，不是 `>=`）。
+    #[test]
+    fn congestion_detection_triggers_only_past_the_multiplier() {
+        assert!(!is_congested(30, 30 * CONGESTION_RTT_MULTIPLIER as u64));
+        assert!(is_congested(30, 30 * CONGESTION_RTT_MULTIPLIER as u64 + 1));
+    }
+
+    /// 补发预算在上限内一直放行，一超过上限就该拒绝。
+    #[test]
+    fn repair_budget_allows_up_to_the_cap_then_blocks() {
+        let start = Instant::now();
+        let mut window_start = start;
+        let mut used = 0u32;
+        for _ in 0..MAX_REPAIR_PACKETS_PER_SEC {
+            let (allowed, ws, u) = reserve_repair_budget(window_start, used, start);
+            assert!(allowed, "没到上限之前都该放行");
+            window_start = ws;
+            used = u;
+        }
+        let (allowed, ..) = reserve_repair_budget(window_start, used, start);
+        assert!(!allowed, "超过每秒上限之后必须拒绝，这是最后一道硬闸门");
+    }
+
+    /// 窗口过期（超过 1 秒）之后必须重新放行，不能被上一个窗口的旧计数
+    /// 卡死——链路缓过来之后补发不该被永久掐断。
+    #[test]
+    fn repair_budget_resets_after_the_window_expires() {
+        let start = Instant::now();
+        let later = start + Duration::from_millis(1001);
+        let (allowed, window_start, used) =
+            reserve_repair_budget(start, MAX_REPAIR_PACKETS_PER_SEC, later);
+        assert!(allowed, "窗口过期后应该重新放行，不能被旧窗口的计数卡住");
+        assert_eq!(used, 1);
+        assert_eq!(window_start, later);
     }
 
     /// 预测基线兜底、探测针实测只会往上修正，不会盖过更新鲜的基线。
