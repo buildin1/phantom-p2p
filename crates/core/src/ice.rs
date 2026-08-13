@@ -63,7 +63,7 @@ pub fn ice_priority_ipv6_host() -> u32 {
 // 策略 1+7: 主机候选收集（本地 IP 地址）
 // ============================================================
 
-/// 获取所有本机 IPv4 地址（排除回环和链路本地）
+/// 获取所有本机 IPv4 地址（排除回环、链路本地、以及本产品自己的 overlay 网段）
 fn get_all_local_ipv4s() -> Vec<String> {
     let mut result = Vec::new();
 
@@ -71,6 +71,14 @@ fn get_all_local_ipv4s() -> Vec<String> {
         for (name, ip) in interfaces {
             if is_overlay_interface(&name) {
                 continue;
+            }
+            if let IpAddr::V4(v4) = ip {
+                // 名字过滤在 macOS 上不生效（utun 设备名由内核分配，
+                // 不是我们请求的 phantomp2p*），靠网段兜底排除 overlay
+                // 自己的虚拟地址，见 network::is_overlay_subnet_ipv4。
+                if network::is_overlay_subnet_ipv4(&v4) {
+                    continue;
+                }
             }
             if ip.is_ipv4() && !ip.is_loopback() && !ip.is_unspecified() {
                 let value = ip.to_string();

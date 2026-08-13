@@ -230,6 +230,36 @@ pub fn provision(
     )?;
     run_command("ifconfig", &[&actual_name, "mtu", &mtu.to_string()])?;
 
+    // Don't rely solely on the ifconfig same-address trick above to install
+    // the on-link subnet route -- on some macOS versions/network configs it
+    // doesn't reliably show up in the routing table, which silently drops
+    // any reply headed back to another host in the subnet (the kernel never
+    // hands the packet to this fd, so nothing shows up in app-level logs
+    // either). Install it explicitly and treat failure as non-fatal: if the
+    // ifconfig trick *did* already install it, this just errors out on a
+    // duplicate route, which is fine.
+    let network = Ipv4Addr::from(u32::from(address) & u32::from(netmask));
+    let prefix_len = netmask.octets().iter().map(|o| o.count_ones()).sum::<u32>();
+    if let Err(e) = run_command(
+        "route",
+        &[
+            "-n",
+            "add",
+            "-net",
+            &format!("{}/{}", network, prefix_len),
+            "-interface",
+            &actual_name,
+        ],
+    ) {
+        tracing::warn!(
+            "[TUN] 显式安装 {} 子网路由 {}/{} 失败（可能已由 ifconfig 隐式安装）: {}",
+            actual_name,
+            network,
+            prefix_len,
+            e
+        );
+    }
+
     Ok(ProvisionedTun {
         fd,
         name: actual_name,
