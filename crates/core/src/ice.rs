@@ -69,16 +69,19 @@ fn get_all_local_ipv4s() -> Vec<String> {
 
     if let Ok(interfaces) = local_ip_address::list_afinet_netifas() {
         for (name, ip) in interfaces {
-            if is_overlay_interface(&name) {
-                continue;
-            }
             if let IpAddr::V4(v4) = ip {
-                // 名字过滤在 macOS 上不生效（utun 设备名由内核分配，
-                // 不是我们请求的 phantomp2p*），靠网段兜底排除 overlay
-                // 自己的虚拟地址，见 network::is_overlay_subnet_ipv4。
-                if network::is_overlay_subnet_ipv4(&v4) {
+                // 名字过滤在 macOS 上不生效（utun 设备名由内核分配，不是
+                // 我们请求的 phantomp2p*）；退化到"网卡名是 utunN 且地址
+                // 落在 overlay 网段"兜底排除，见 network::is_overlay_adapter
+                // 同款逻辑的说明——不能只按网段过滤，会误伤用户自己就用
+                // 172.16/12 的真实局域网。
+                if is_overlay_interface(&name)
+                    || (network::is_macos_utun_name(&name) && network::is_overlay_subnet_ipv4(&v4))
+                {
                     continue;
                 }
+            } else if is_overlay_interface(&name) {
+                continue;
             }
             if ip.is_ipv4() && !ip.is_loopback() && !ip.is_unspecified() {
                 let value = ip.to_string();
