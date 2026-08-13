@@ -91,40 +91,52 @@ fn disable_udp_conn_reset(sock: &UdpSocket) {
 ///   实测一台机器上报了 4 个，把候选表撑到 6 个而其中只有 1 个有用。
 /// * `198.18/15` RFC 2544 基准测试段：正常网络不会出现，
 ///   实测是代理软件 fake-IP 模式的虚拟网卡。
-/// * 本产品自己的 overlay 网段（见 [`is_overlay_subnet_ipv4`]）：正常应该靠
-///   `is_overlay_interface` 按网卡名排除掉这块网卡，但 macOS 的 utun 设备名
-///   由内核分配（`utun0`/`utun4`/……），我们请求的 `phantomp2p*` 名字会被
-///   直接忽略——名字过滤在 macOS 上永远不命中，overlay 网卡自己的虚拟地址
-///   就会被当成"同局域网"候选上报给对端，而那是一个只在本机可达的地址。
 fn is_useless_ipv4_candidate(ip: &std::net::Ipv4Addr) -> bool {
     let o = ip.octets();
-    ip.is_link_local() || (o[0] == 198 && (o[1] == 18 || o[1] == 19)) || is_overlay_subnet_ipv4(ip)
+    ip.is_link_local() || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
 }
 
 /// 本产品服务端分配的 overlay 网段：`172.16.0.0/12`
 /// （动态房间网段 `172.16.0.0/13` + 固定 Host 地址段 `172.24.0.0/13`，
 /// 见 `server/src/database.rs::allocate_subnet`）。
-///
-/// 名字匹配（[`is_overlay_interface`]）在 macOS 上失效时，这是唯一还能
-/// 挡住"把自己的虚拟网卡地址当局域网候选上报"的兜底，见
-/// [`is_useless_ipv4_candidate`] 的说明。
 pub fn is_overlay_subnet_ipv4(ip: &std::net::Ipv4Addr) -> bool {
     let o = ip.octets();
     o[0] == 172 && (16..=31).contains(&o[1])
 }
 
+/// 该网卡名是不是 macOS 内核给 utun 设备分配的名字（`utun0`、`utun4`……）。
+///
+/// [`is_overlay_interface`] 靠请求的网卡名（`phantomp2p*`）排除本产品自己
+/// 创建的 overlay 网卡，但 macOS 的 utun 设备名由内核分配，我们请求的名字
+/// 会被直接忽略——名字过滤在 macOS 上永远不命中。
+pub fn is_macos_utun_name(name: &str) -> bool {
+    name.strip_prefix("utun")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// 该 (网卡名, IPv4 地址) 是否应该被当成本产品自己的 overlay 网卡排除掉。
+///
+/// 正常靠网卡名（[`is_overlay_interface`]）就够。退化方案只在网卡名是
+/// macOS 内核分配的 `utunN`、**且**地址落在本产品的 overlay 网段时才生效
+/// ——真实局域网网卡不会叫 `utunN`，不会被误伤；`172.16/12` 里其余不是
+/// 跑在 utun 网卡上的地址（比如用户自己的路由器就用这个网段）仍然保留。
+fn is_overlay_adapter(name: &str, ip: &std::net::Ipv4Addr) -> bool {
+    is_overlay_interface(name) || (is_macos_utun_name(name) && is_overlay_subnet_ipv4(ip))
+}
+
 /// 枚举本机所有可用作候选的 IPv4 地址。
 ///
-/// 排除本产品自己的 overlay 网卡（否则会把虚拟地址当候选上报），
-/// 以及 [`is_useless_ipv4_candidate`] 判定为无效的地址。
+/// 排除本产品自己的 overlay 网卡（否则会把虚拟地址当候选上报，见
+/// [`is_overlay_adapter`]），以及 [`is_useless_ipv4_candidate`] 判定为
+/// 无效的地址。
 pub fn local_ipv4_addrs() -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     if let Ok(list) = local_ip_address::list_afinet_netifas() {
         for (name, ip) in list {
-            if is_overlay_interface(&name) {
+            let IpAddr::V4(v4) = ip else { continue };
+            if is_overlay_adapter(&name, &v4) {
                 continue;
             }
-            let IpAddr::V4(v4) = ip else { continue };
             if v4.is_loopback() || v4.is_unspecified() || is_useless_ipv4_candidate(&v4) {
                 continue;
             }
