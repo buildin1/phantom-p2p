@@ -15,15 +15,21 @@ pub fn bind_dual_stack_udp(port: u16) -> std::io::Result<UdpSocket> {
     Ok(socket)
 }
 
-/// 调优打洞 socket。
+/// 调优一个数据面/打洞用的 UDP socket。
 ///
-/// **放大接收缓冲区**是关键：撒网策略下瞬时到达速率很高，
-/// 默认 64KB 缓冲区会在不到一秒内被填满，真正的应答包随之丢失。
+/// **放大接收缓冲区**是关键：撒网打洞策略下瞬时到达速率很高，中继/隧道的
+/// QUIC 数据面在真实游戏流量下同样如此（本产品自己的冗余补包机制还会把
+/// 吞吐再放大一截）。系统默认缓冲区通常只有几十 KB，在 macOS 上尤其小
+/// （远小于 Windows/Linux 的默认值），洪峰下会在不到一秒内被填满，真正的
+/// 包随之丢失——丢包一大，`crates/core/src/tun_bridge.rs` 里那套"拥塞时
+/// 给冗余补包踩刹车"逻辑就可能被持续触发，QUIC 连接最终被兜底关闭，表现
+/// 为游戏内"连接中断"。中继/隧道路径此前没有调用这个函数，只有打洞探测
+/// 阶段的 socket 被调过。
 ///
 /// Windows 上还必须关闭 `SIO_UDP_CONNRESET`——否则向不存在的端口发包
 /// 收到 ICMP Port Unreachable 后，**后续的 `recv_from` 会返回 `WSAECONNRESET`**
 /// 而不是正常数据，把接收路径彻底堵死。撒网场景下这几乎必然发生。
-pub fn tune_punch_socket(sock: &UdpSocket) {
+pub fn tune_udp_socket(sock: &UdpSocket) {
     const RECV_BUF: usize = 8 * 1024 * 1024;
     let s = socket2::SockRef::from(sock);
     if let Err(e) = s.set_recv_buffer_size(RECV_BUF) {

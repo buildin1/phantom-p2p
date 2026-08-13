@@ -3,6 +3,7 @@
 //! 将本地 TCP 连接通过 QUIC 流隧穿到对端。
 //! 支持 P2P 直连和中继模式（底层 QUIC 连接不同，上层逻辑一致）。
 
+use crate::network;
 use crate::stats::StatsManager;
 use crate::tun_bridge::TunBridge;
 use std::collections::HashMap;
@@ -587,6 +588,7 @@ pub async fn connect_relay_quic_host(
     // 创建新的 UDP socket
     let socket = std::net::UdpSocket::bind("0.0.0.0:0")
         .map_err(|e| format!("绑定 UDP socket 失败: {}", e))?;
+    network::tune_udp_socket(&socket);
 
     let client_config = build_relay_client_config()?;
     let runtime = quinn::default_runtime().ok_or("无法获取 quinn 运行时")?;
@@ -658,6 +660,7 @@ pub async fn connect_relay_quic_guest(
     // 创建新的 UDP socket
     let socket = std::net::UdpSocket::bind("0.0.0.0:0")
         .map_err(|e| format!("绑定 UDP socket 失败: {}", e))?;
+    network::tune_udp_socket(&socket);
 
     let client_config = build_relay_client_config()?;
     let runtime = quinn::default_runtime().ok_or("无法获取 quinn 运行时")?;
@@ -947,6 +950,7 @@ pub async fn preconnect_relay_quic_guest(
 ) -> Result<quinn::Connection, String> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0")
         .map_err(|e| format!("绑定 UDP socket 失败: {}", e))?;
+    network::tune_udp_socket(&socket);
 
     let client_config = build_relay_client_config()?;
     let runtime = quinn::default_runtime().ok_or("无法获取 quinn 运行时")?;
@@ -1001,6 +1005,7 @@ pub async fn preconnect_relay_quic_host(
 ) -> Result<quinn::Connection, String> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0")
         .map_err(|e| format!("绑定 UDP socket 失败: {}", e))?;
+    network::tune_udp_socket(&socket);
 
     let client_config = build_relay_client_config()?;
     let runtime = quinn::default_runtime().ok_or("无法获取 quinn 运行时")?;
