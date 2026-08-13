@@ -91,9 +91,26 @@ fn disable_udp_conn_reset(sock: &UdpSocket) {
 ///   实测一台机器上报了 4 个，把候选表撑到 6 个而其中只有 1 个有用。
 /// * `198.18/15` RFC 2544 基准测试段：正常网络不会出现，
 ///   实测是代理软件 fake-IP 模式的虚拟网卡。
+/// * 本产品自己的 overlay 网段（见 [`is_overlay_subnet_ipv4`]）：正常应该靠
+///   `is_overlay_interface` 按网卡名排除掉这块网卡，但 macOS 的 utun 设备名
+///   由内核分配（`utun0`/`utun4`/……），我们请求的 `phantomp2p*` 名字会被
+///   直接忽略——名字过滤在 macOS 上永远不命中，overlay 网卡自己的虚拟地址
+///   就会被当成"同局域网"候选上报给对端，而那是一个只在本机可达的地址。
 fn is_useless_ipv4_candidate(ip: &std::net::Ipv4Addr) -> bool {
     let o = ip.octets();
-    ip.is_link_local() || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+    ip.is_link_local() || (o[0] == 198 && (o[1] == 18 || o[1] == 19)) || is_overlay_subnet_ipv4(ip)
+}
+
+/// 本产品服务端分配的 overlay 网段：`172.16.0.0/12`
+/// （动态房间网段 `172.16.0.0/13` + 固定 Host 地址段 `172.24.0.0/13`，
+/// 见 `server/src/database.rs::allocate_subnet`）。
+///
+/// 名字匹配（[`is_overlay_interface`]）在 macOS 上失效时，这是唯一还能
+/// 挡住"把自己的虚拟网卡地址当局域网候选上报"的兜底，见
+/// [`is_useless_ipv4_candidate`] 的说明。
+pub fn is_overlay_subnet_ipv4(ip: &std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 172 && (16..=31).contains(&o[1])
 }
 
 /// 枚举本机所有可用作候选的 IPv4 地址。
