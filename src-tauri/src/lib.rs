@@ -147,6 +147,14 @@ struct StatsState {
     manager: Arc<stats::StatsManager>,
 }
 
+/// 风控自校准库的持有者。
+///
+/// 单独 manage 出来，是为了让打洞成功、拿到本端公网 IP 和 NAT 类型之后，
+/// 能把库和"这个网络环境的指纹"一起绑到那条连接的 `LinkSignals` 上。
+struct CalibrationState {
+    store: Arc<phantom_core::repair::CalibrationStore>,
+}
+
 /// 网络诊断信息
 #[derive(Serialize, Deserialize)]
 pub struct NetworkInfo {
@@ -1731,6 +1739,16 @@ pub fn run(dev_mode: bool) {
 
     // 初始化设备身份
     let data_dir = app_data_dir;
+
+    // 风控自校准库：运营商的包速率阈值各地不同、用户无法预先测（《踩坑记录》
+    // 第十一条），只能在每个用户自己的环境里学，并且跨会话留存。
+    // 这里只是把库准备好；**链路干净的会话完全不会读它**，
+    // 见 `phantom_core::repair::calibration` 的"零开销路径"。
+    let calibration_store = Arc::new(phantom_core::repair::CalibrationStore::new(&data_dir));
+    tracing::info!(
+        "[启动] 风控自校准库: {}",
+        calibration_store.path().display()
+    );
     let identity = match identity::Identity::load_or_generate(&data_dir) {
         Ok(id) => Arc::new(id),
         Err(e) => {
@@ -1772,6 +1790,9 @@ pub fn run(dev_mode: bool) {
         })
         .manage(StatsState {
             manager: stats_manager.clone(),
+        })
+        .manage(CalibrationState {
+            store: calibration_store,
         })
         .setup(move |_app| {
             // WebView2 已就绪后再降低进程优先级，避免影响 WebView2 子进程初始化速度
