@@ -424,6 +424,11 @@ struct PeerForwarder {
     repair_skipped_no_space: Arc<AtomicU64>,
     /// 因为发送队列没余量而被丢弃的**原包**数（累计）。见 `try_forward`。
     orig_dropped_queue_full: Arc<AtomicU64>,
+    /// 对端标识，只用于日志——多人房间里必须能分清哪一行属于哪条连接。
+    ///
+    /// 《踩坑记录》第十条：诊断计数器必须按会话/按对端，进程级的静态计数器
+    /// 会在重连之后串号，让日志失真。
+    peer_label: String,
     /// 链路信号与拥塞闸门，见 [`crate::repair`]。
     ///
     /// 闸门只做**减法**：分档表按丢包率算出该补几份，闸门可以往下压到 1 份或 0 份，
@@ -686,6 +691,35 @@ impl LossMeter {
 impl PeerForwarder {
     /// 加密并投递一个 IP 包。永不阻塞调用方。
     fn try_forward(&self, packet: &[u8]) -> bool {
+        // ── 队列满就丢当前这个包，**必须在 `seal()` 之前判断** ──────────────
+        //
+        // quinn 的 `send_datagram` 满队列时执行 `pop_front()`（丢最旧），这是最差的
+        // 队列管理策略：它把已经排了很久、马上就要发出去的包丢掉，最大化每个真正
+        // 通过的包的延迟，还会摧毁内层 TCP 的 RTT 采样，把平滑过载变成突发超时。
+        // 所以我们自己改成丢最新（尾丢）。
+        //
+        // **顺序是关键。** `seal()` 每次调用都会 `fetch_add` 消耗一个计数器
+        // （见 `crypto.rs`）。如果先 seal 再判断丢弃，这个包就烧掉了一个
+        // **永远不会上线**的计数器，接收端看到序号空洞、当成链路丢包上报回来，
+        // 发送端于是以为链路在丢包、抬高冗余档位——等于自己造了一个正反馈环。
+        //
+        // 实测数据坐实过这一点：host 在同一毫秒尾丢了 11 个满包，guest 随即报告
+        // "入方向丢包 12.79%"，而 11/86（窗口跨度）= 12.79%，精确到小数点后两位；
+        // 同期 QUIC 自己的 `lost` 全程为 0——**线路上一个包都没丢，全是本端自己
+        // 丢的**。本地队列丢弃和链路丢包需要完全相反的应对，绝不能混为一谈。
+        //
+        // 用 `packet.len() + crypto::OVERHEAD` 估算密文长度：`OVERHEAD` 是固定的
+        // （计数器 + 认证标签），所以这个估算是精确值，不是近似。
+        let projected_len = packet.len() + crate::crypto::OVERHEAD;
+        if self.conn.datagram_send_buffer_space() < projected_len {
+            self.orig_dropped_queue_full.fetch_add(1, Ordering::Relaxed);
+            // 连原包都塞不进去，说明链路已经被压到极限——这是**不需要任何推断**
+            // 的拥塞证据，立刻告诉闸门，别等下一次 50ms 采样。
+            self.signals.note_self_evict();
+            debug!("[TUN] 发送队列已满，丢弃原包 bytes={}", projected_len);
+            return false;
+        }
+
         let sealed = match self.crypto.seal(packet) {
             Ok(v) => v,
             Err(e) => {
@@ -756,26 +790,6 @@ impl PeerForwarder {
         // 没法把它们当成同一个包去重了。只有确定要发冗余份时才克隆，
         // 干净链路上这里零额外开销。
         let redundant_bytes = (extra_copies > 0).then(|| sealed.clone());
-
-        // 队列满时**丢当前这个包**，而不是让 quinn 去丢最旧的那个。
-        //
-        // quinn 的 `send_datagram` 满队列时执行 `pop_front()`（丢最旧），这是最差的
-        // 队列管理策略：它把已经排了很久、马上就要发出去的包丢掉，最大化每个真正
-        // 通过的包的延迟，还会摧毁内层 TCP 的 RTT 采样，把平滑过载变成突发超时。
-        // 改成丢最新（尾丢）之后，内层 TCP 能对着隧道的真实容量正常收敛，
-        // 而且我们顺带拿到一个精确的自挤占计数器——这个数非零就直接证明
-        // "我们自己是丢包来源"，不需要任何推断或对端往返。
-        if self.conn.datagram_send_buffer_space() < len {
-            self.orig_dropped_queue_full.fetch_add(1, Ordering::Relaxed);
-            // 连原包都塞不进去，说明链路已经被压到极限——这是**不需要任何推断**
-            // 的拥塞证据，立刻告诉闸门，别等下一次 50ms 采样。
-            self.signals.note_self_evict();
-            debug!(
-                "[TUN] 发送队列已满，丢弃原包 counter={} bytes={}",
-                counter, len
-            );
-            return false;
-        }
 
         // 记进发送缓冲，供后续命中 NACK 时原样重发；同时刷新心跳要带的
         // "最大计数器"。必须在真正调用 send_datagram 之前记，晚了的话
@@ -920,6 +934,11 @@ pub struct TunBridge {
     default_peer: Mutex<Option<PeerForwarder>>,
     closed: std::sync::atomic::AtomicBool,
     tx_packets: AtomicU64,
+    /// 因为对端转发失败（队列满、加密失败、连接已断等）而被丢弃的包数。
+    ///
+    /// 用来给那条 WARN 抽样，见 `tun_read_loop`。按 bridge 记而不是进程级静态，
+    /// 见《踩坑记录》第十条：进程级计数器跨重连会串号。
+    tx_dropped: AtomicU64,
     /// 所有已接入的对端连接。
     ///
     /// 必须显式持有：收包任务循环在自己克隆的那份 `Connection` 上，
@@ -999,6 +1018,7 @@ impl TunBridge {
             default_peer: Mutex::new(None),
             closed: std::sync::atomic::AtomicBool::new(false),
             tx_packets: AtomicU64::new(0),
+            tx_dropped: AtomicU64::new(0),
             conns: Mutex::new(Vec::new()),
         });
         let reader = bridge.clone();
@@ -1033,6 +1053,9 @@ impl TunBridge {
             min_rtt_ms: Arc::new(AtomicU64::new(u64::MAX)),
             repair_skipped_no_space: Arc::new(AtomicU64::new(0)),
             orig_dropped_queue_full: Arc::new(AtomicU64::new(0)),
+            peer_label: peer_hint
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| conn.remote_address().to_string()),
             signals: Arc::new(crate::repair::LinkSignals::new()),
         };
         // 20Hz 采样：把 quinn 的连接状态翻译成闸门看得懂的观测量。
@@ -1074,6 +1097,25 @@ impl TunBridge {
                     let highest = heartbeat.highest_sent.load(Ordering::Relaxed);
                     let loss_bp = heartbeat.measured_loss_bp.load(Ordering::Relaxed);
                     heartbeat.send_control(encode_heartbeat(highest, loss_bp));
+
+                    // 每秒一行结构化诊断。
+                    //
+                    // 验收标准：**把日志交给一个没读过代码的人，他应该能一眼说出
+                    // 上次掉线是自挤占还是链路丢包。** 旧日志里只有零散的
+                    // `[TUN] 入方向丢包 x.xx%`，而那条对两种成因都兼容——
+                    // 这正是几次排查都要来回好几轮的原因。
+                    //
+                    // 上一版把计数器加上了却从没打印过，等于白加：实测那次只能
+                    // 靠零散的 DEBUG 行反推，而 DEBUG 还会被去重折叠。
+                    tracing::info!(
+                        "[REPAIR] peer={} {} tier={} loss_in={}bp orig_dropped={} repair_noroom={}",
+                        heartbeat.peer_label,
+                        heartbeat.signals.diagnostic_line(),
+                        heartbeat.current_tier.load(Ordering::Relaxed),
+                        loss_bp,
+                        heartbeat.orig_dropped_queue_full.load(Ordering::Relaxed),
+                        heartbeat.repair_skipped_no_space.load(Ordering::Relaxed),
+                    );
                 }
             });
         }
@@ -1145,10 +1187,18 @@ impl TunBridge {
                         );
                     }
                 } else {
-                    warn!(
-                        "[TUN] peer forward queue rejected packet {} -> {} ({} bytes)",
-                        src, dst, n
-                    );
+                    // 抽样。这条是 WARN，而重复抑制只作用于 DEBUG/TRACE
+                    // （见 `logging.rs`），所以一次突发会原样刷出十几条。
+                    // 实测一毫秒内刷了 11 条，把真正有用的上下文顶出了视野。
+                    // 真实的丢弃总数由每秒那行 `[REPAIR]` 的
+                    // `orig_dropped` 给出，这里只留个别样本说明丢的是什么包。
+                    let dropped = self.tx_dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                    if dropped <= 10 || dropped % 100 == 0 {
+                        warn!(
+                            "[TUN] peer forward queue rejected packet {} -> {} ({} bytes, 累计 {})",
+                            src, dst, n, dropped
+                        );
+                    }
                 }
             } else {
                 warn!(
