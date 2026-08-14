@@ -42,7 +42,7 @@ use tracing::{debug, info, warn};
 /// `datagram_send_buffer_space()`，队列满就丢**当前这个**包，把 quinn 默认的
 /// "丢最旧"换成"丢最新"。丢最旧会把马上要发出去的包丢掉，最大化通过包的延迟，
 /// 并摧毁内层 TCP 的 RTT 采样。
-const DATAGRAM_SEND_BUFFER_BYTES: usize = 32 * 1024;
+pub const DATAGRAM_SEND_BUFFER_BYTES: usize = 32 * 1024;
 
 /// 生成自签名 TLS 证书，返回 (cert_der, key_der)
 fn generate_self_signed_cert() -> Result<(Vec<u8>, Vec<u8>), String> {

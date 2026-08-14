@@ -23,5 +23,7 @@
 //! 但永远不会往上加。
 
 pub mod gate;
+pub mod signals;
 
 pub use gate::{Gate, GateController, MinRttFilter, Observation, TripReason};
+pub use signals::{spawn_sampler, LinkSignals};

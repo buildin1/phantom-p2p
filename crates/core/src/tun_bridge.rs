@@ -450,6 +450,14 @@ struct PeerForwarder {
     repair_skipped_no_space: Arc<AtomicU64>,
     /// 因为发送队列没余量而被丢弃的**原包**数（累计）。见 `try_forward`。
     orig_dropped_queue_full: Arc<AtomicU64>,
+    /// 链路信号与拥塞闸门，见 [`crate::repair`]。
+    ///
+    /// 闸门只做**减法**：分档表按丢包率算出该补几份，闸门可以往下压到 1 份或 0 份，
+    /// 但永远不会往上加。判断"是不是我自己把链路压垮了"用的全是本地信号
+    /// （队列余量、排队延迟梯度、拥塞事件），不需要等对端往返，所以刹车是
+    /// 毫秒级的；而加码要等对端心跳上报丢包率，是秒级的。
+    /// 安全攸关的方向必须最快——上一版正好反过来。
+    signals: Arc<crate::repair::LinkSignals>,
 }
 
 impl PeerForwarder {
@@ -543,6 +551,7 @@ impl PeerForwarder {
                     // 跟主动冗余同一道闸：重传包也不能挤掉还没发出去的原包。
                     if !self.repair_has_room(len) {
                         self.repair_skipped_no_space.fetch_add(1, Ordering::Relaxed);
+                        self.signals.note_self_evict();
                         debug!("[TUN] 发送队列无余量，放弃重传 counter={}", counter);
                         continue;
                     }
@@ -751,8 +760,13 @@ impl PeerForwarder {
                 .filter(|s| s.until > Instant::now())
                 .map(|s| s.extra_copies)
         });
-        let extra_copies =
+        // 分档表提议，闸门封顶——闸门只减不增。
+        //
+        // 这一步是"按丢包率该补几份"和"这条链路现在还承受得起几份"两个问题的
+        // 交汇点。上一版只有前者，于是链路被自己压垮时档位反而一路爬到顶。
+        let proposed =
             effective_extra_copies(self.current_tier.load(Ordering::Relaxed), flow_specific);
+        let extra_copies = proposed.min(self.signals.max_extra_copies());
         // 冗余份必须复用这份密文字节原样重发，不能对同一个包再调一次
         // `crypto.seal()`——那样会拿到不同计数器的两个包，现有重放窗口就
         // 没法把它们当成同一个包去重了。只有确定要发冗余份时才克隆，
@@ -769,6 +783,9 @@ impl PeerForwarder {
         // "我们自己是丢包来源"，不需要任何推断或对端往返。
         if self.conn.datagram_send_buffer_space() < len {
             self.orig_dropped_queue_full.fetch_add(1, Ordering::Relaxed);
+            // 连原包都塞不进去，说明链路已经被压到极限——这是**不需要任何推断**
+            // 的拥塞证据，立刻告诉闸门，别等下一次 50ms 采样。
+            self.signals.note_self_evict();
             debug!(
                 "[TUN] 发送队列已满，丢弃原包 counter={} bytes={}",
                 counter, len
@@ -829,10 +846,22 @@ impl PeerForwarder {
                         // 原包，见 `repair_has_room`。这一条必须在预算检查之前：
                         // 预算管的是"发太多会不会触发运营商风控"，这一条管的是
                         // "这一份会不会直接害死一个原包"，后者更硬。
+                        // 闸门可能在这份副本排队等待错峰的这几十毫秒里关掉了
+                        // ——链路状态是会变的，不能只凭发起时刻的判断就一路发完。
+                        if forwarder.signals.max_extra_copies() == 0 {
+                            debug!(
+                                "[TUN] 闸门已关闭，放弃剩余冗余份 counter={} copy={}/{}",
+                                counter,
+                                i + 1,
+                                extra_copies
+                            );
+                            break;
+                        }
                         if !forwarder.repair_has_room(len) {
                             forwarder
                                 .repair_skipped_no_space
                                 .fetch_add(1, Ordering::Relaxed);
+                            forwarder.signals.note_self_evict();
                             debug!(
                                 "[TUN] 发送队列无余量，放弃剩余冗余份 counter={} copy={}/{}",
                                 counter,
@@ -1019,7 +1048,15 @@ impl TunBridge {
             repair_budget: Arc::new(SyncMutex::new((Instant::now(), 0))),
             repair_skipped_no_space: Arc::new(AtomicU64::new(0)),
             orig_dropped_queue_full: Arc::new(AtomicU64::new(0)),
+            signals: Arc::new(crate::repair::LinkSignals::new()),
         };
+        // 20Hz 采样：把 quinn 的连接状态翻译成闸门看得懂的观测量。
+        // 连接关闭后任务自行退出。
+        crate::repair::spawn_sampler(
+            conn.clone(),
+            forwarder.signals.clone(),
+            crate::tunnel::DATAGRAM_SEND_BUFFER_BYTES,
+        );
         tracing::info!(
             "[TUN] 数据报通道就绪 (local={}, peer_hint={:?}, host={}, max_datagram={:?})",
             self.my_vip,
