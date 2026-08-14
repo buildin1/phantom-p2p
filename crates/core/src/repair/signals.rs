@@ -18,10 +18,11 @@
 //! `tun_bridge.rs` 的发送路径上直接读 `datagram_send_buffer_space()`，
 //! 采样器这边只负责把"最近有没有发生过自挤占"汇总给闸门。
 
+use super::budget::RepairBudget;
 use super::gate::{Gate, GateController, MinRttFilter, Observation, TripReason};
 use quinn::Connection;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as SyncMutex};
 use std::time::{Duration, Instant};
 
 /// 采样周期。
@@ -54,6 +55,21 @@ pub struct LinkSignals {
     /// 采样任务是否还活着。连接关闭后置 false，避免重复启动。
     running: AtomicBool,
 
+    /// 业务原包的累计字节数与包数（**只算原包，不含补发**）。
+    ///
+    /// 采样器做差算出源速率，预算桶按它的比例定上限。必须只算原包：
+    /// 把补发也算进"源速率"会形成自我强化的循环——补得越多，算出来的
+    /// 源速率越高，允许补的量又跟着涨。
+    source_bytes: AtomicU64,
+    source_pkts: AtomicU64,
+
+    /// 补发预算，见 [`RepairBudget`]。
+    ///
+    /// 写入方是采样器（每 50ms 更新速率），读取方是发送路径（每份补发申请一次）。
+    /// 用同步锁而不是原子量，是因为令牌桶是有状态的多字段结构，没法拆成独立原子量。
+    /// 只在**要发补发包时**才会取这把锁，干净链路上根本不会走到。
+    budget: SyncMutex<RepairBudget>,
+
     // ── 以下仅供日志与诊断，不参与决策 ────────────────────────────
     occupancy_pct: AtomicU8,
     gradient_pct: AtomicU8,
@@ -72,6 +88,9 @@ impl LinkSignals {
             last_self_evict_ms: AtomicU64::new(0),
             origin: Instant::now(),
             running: AtomicBool::new(false),
+            source_bytes: AtomicU64::new(0),
+            source_pkts: AtomicU64::new(0),
+            budget: SyncMutex::new(RepairBudget::new(Instant::now())),
             occupancy_pct: AtomicU8::new(0),
             gradient_pct: AtomicU8::new(0),
             srtt_ms: AtomicU64::new(0),
@@ -102,6 +121,26 @@ impl LinkSignals {
         let ms = self.origin.elapsed().as_millis() as u64;
         // 存 ms+1，把 0 保留给"从未发生"
         self.last_self_evict_ms.store(ms + 1, Ordering::Relaxed);
+    }
+
+    /// 发送路径每发出一个**原包**时调用，用于估计源速率。
+    ///
+    /// 补发包绝不能算进来：那会形成自我强化的循环（补得越多 → 算出的源速率越高
+    /// → 允许补的量越大）。
+    pub fn note_original(&self, len: usize) {
+        self.source_bytes.fetch_add(len as u64, Ordering::Relaxed);
+        self.source_pkts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 申请发一份 `len` 字节的补发包。两个预算桶都批准才放行。
+    ///
+    /// 锁中毒时放行：预算是"锦上添花"的限制，不该因为它自己出问题就
+    /// 把补包功能整个废掉。
+    pub fn admit_repair(&self, len: usize) -> bool {
+        match self.budget.lock() {
+            Ok(mut b) => b.try_admit(len, Instant::now()),
+            Err(_) => true,
+        }
     }
 
     fn recent_self_evict(&self, now_ms: u64) -> bool {
@@ -172,6 +211,8 @@ pub fn spawn_sampler(conn: Connection, signals: Arc<LinkSignals>, queue_capacity
         // 累计计数器要做差，先记住上一次的读数
         let mut prev_tx_bytes = 0u64;
         let mut prev_congestion_events = 0u64;
+        let mut prev_source_bytes = 0u64;
+        let mut prev_source_pkts = 0u64;
         let mut prev_sample = Instant::now();
         // 带宽估计取窗口内最大值（BBR 的思路）：单次采样受调度抖动影响很大，
         // 而链路容量是相对稳定的，取最大值比取平均更接近真实上限。
@@ -240,6 +281,17 @@ pub fn spawn_sampler(conn: Connection, signals: Arc<LinkSignals>, queue_capacity
             let state = gate.step(&obs, now);
             signals.gate.store(state as u8, Ordering::Relaxed);
             signals.store_reason(gate.last_reason());
+
+            // 用实测的源速率刷新补发预算。源速率只统计原包，见 `note_original`。
+            let src_bytes = signals.source_bytes.load(Ordering::Relaxed);
+            let src_pkts = signals.source_pkts.load(Ordering::Relaxed);
+            let source_bps = src_bytes.saturating_sub(prev_source_bytes) as f32 / elapsed as f32;
+            let source_pps = src_pkts.saturating_sub(prev_source_pkts) as f32 / elapsed as f32;
+            prev_source_bytes = src_bytes;
+            prev_source_pkts = src_pkts;
+            if let Ok(mut b) = signals.budget.lock() {
+                b.update(headroom as f32, source_bps, source_pps, now);
+            }
 
             // 诊断量
             signals.occupancy_pct.store(

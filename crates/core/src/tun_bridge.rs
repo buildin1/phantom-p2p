@@ -109,29 +109,6 @@ fn is_congested(min_rtt_ms: u64, current_rtt_ms: u64) -> bool {
     min_rtt_ms != u64::MAX && current_rtt_ms > min_rtt_ms.saturating_mul(CONGESTION_RTT_MULTIPLIER)
 }
 
-/// 补发流量（冗余份 + NACK 重传）的硬性速率上限——每条连接每秒最多发这么
-/// 多份补发包，不管上面 tier 算出来该补多少。
-///
-/// 这是最后一道硬闸门，不依赖"拥塞判断得准不准"：就算上面的 RTT 检测这次
-/// 没抓住（比如拥塞发生在对端、本端自己测的 RTT 没体现出来），补发流量
-/// 物理上也不可能超过这个数，从根上堵死"冗余把链路自己压垮"这种失控放大。
-const MAX_REPAIR_PACKETS_PER_SEC: u32 = 300;
-
-/// 纯逻辑：给定补发预算窗口的当前状态和这一刻的时间，算出这次要不要放行、
-/// 放行/拒绝之后窗口状态该更新成什么样。不摸真实时钟或锁，方便单测。
-fn reserve_repair_budget(window_start: Instant, used: u32, now: Instant) -> (bool, Instant, u32) {
-    let (window_start, used) = if now.duration_since(window_start) >= Duration::from_secs(1) {
-        (now, 0)
-    } else {
-        (window_start, used)
-    };
-    if used < MAX_REPAIR_PACKETS_PER_SEC {
-        (true, window_start, used + 1)
-    } else {
-        (false, window_start, used)
-    }
-}
-
 /// NACK 请求重传的最长等待时间，**按这条连接实测的 RTT 动态算**，不能写死。
 ///
 /// 曾经写死成 150ms，在低延迟链路上没问题，但拿到一条真实高丢包链路
@@ -439,9 +416,6 @@ struct PeerForwarder {
     /// 这条连接见过的最小 RTT（毫秒），拥塞判定的基线。`u64::MAX` 表示还
     /// 没有过任何样本。见 [`is_congested`]。
     min_rtt_ms: Arc<AtomicU64>,
-    /// 补发流量速率限制的窗口状态：(当前窗口起始时间, 这个窗口已经用掉的
-    /// 份数)。见 [`reserve_repair_budget`]。
-    repair_budget: Arc<SyncMutex<(Instant, u32)>>,
     /// 因为发送队列没余量而被放弃的补发包数（累计）。见 [`Self::repair_has_room`]。
     ///
     /// **这个计数器是"副本挤掉原包"这个诊断的直接检验**：它在实测中频繁非零，
@@ -495,15 +469,6 @@ impl PeerForwarder {
         congested
     }
 
-    /// 申请一份补发预算；申请不到就不该再发这一份补发包了。见
-    /// [`reserve_repair_budget`]。
-    fn try_reserve_repair_budget(&self) -> bool {
-        let mut guard = self.repair_budget.lock().unwrap();
-        let (allowed, window_start, used) = reserve_repair_budget(guard.0, guard.1, Instant::now());
-        *guard = (window_start, used);
-        allowed
-    }
-
     /// 队列里还塞得下 `len` 字节的补发包吗？
     ///
     /// **这是整套机制里最关键的一道闸。** quinn 的数据报发送队列在满的时候
@@ -555,10 +520,9 @@ impl PeerForwarder {
                         debug!("[TUN] 发送队列无余量，放弃重传 counter={}", counter);
                         continue;
                     }
-                    if !self.try_reserve_repair_budget() {
-                        // 补发预算已经用完——见 `MAX_REPAIR_PACKETS_PER_SEC`
-                        // 的说明，这不是丢包，是主动放弃这次重传，避免补发
-                        // 流量自己把链路打满。
+                    if !self.signals.admit_repair(len) {
+                        // 预算用完——不是丢包，是主动放弃这次重传，避免补发
+                        // 流量自己把链路打满。见 `crate::repair::budget`。
                         debug!("[TUN] 补发预算已耗尽，放弃重传 counter={}", counter);
                         continue;
                     }
@@ -824,6 +788,9 @@ impl PeerForwarder {
 
         let sent = match self.conn.send_datagram(sealed.into()) {
             Ok(()) => {
+                // 记进源速率统计。**只算原包**——把补发也算进来会形成自我强化的
+                // 循环：补得越多，算出来的源速率越高，允许补的量又跟着涨。
+                self.signals.note_original(len);
                 // 数据面迁到 DATAGRAM 之后，这个埋点一直没跟着迁过来，
                 // 于是不管传多少数据带宽都显示 0。
                 if let Some((stats, user)) = &self.stats {
@@ -851,13 +818,12 @@ impl PeerForwarder {
             if let Some(bytes) = redundant_bytes {
                 let conn = self.conn.clone();
                 let stats = self.stats.clone();
-                // 克隆整个 forwarder（内部都是 Arc，克隆很轻）只是为了在
-                // 这个后台任务里也能申请补发预算——不能省，见
-                // `MAX_REPAIR_PACKETS_PER_SEC` 的说明：这道闸门必须卡在
-                // "实际要发出去"这一刻，不能只在 try_forward 这次调用的
-                // 决策时刻查一次，因为同一秒里还有别的包也在各自的后台
-                // 任务里排队发补发份，只有在真正发送前查预算才挡得住
-                // 大家加起来的总量。
+                // 克隆整个 forwarder（内部都是 Arc，克隆很轻）只是为了在这个
+                // 后台任务里也能查闸门和预算——不能省。这几道闸必须卡在
+                // "**实际要发出去**"这一刻，不能只在 try_forward 的决策时刻查
+                // 一次：同一时间还有别的包在各自的后台任务里排队发补发份，
+                // 只有在真正发送前查才挡得住大家加起来的总量；而且链路状态在
+                // 这份副本等待错峰的几十毫秒里可能已经变了。
                 let forwarder = self.clone();
                 tokio::spawn(async move {
                     for i in 0..extra_copies {
@@ -890,7 +856,7 @@ impl PeerForwarder {
                             );
                             break;
                         }
-                        if !forwarder.try_reserve_repair_budget() {
+                        if !forwarder.signals.admit_repair(len) {
                             debug!(
                                 "[TUN] 补发预算已耗尽，放弃剩余冗余份 counter={} copy={}/{}",
                                 counter,
@@ -1065,7 +1031,6 @@ impl TunBridge {
             // （`set_tier`，见那里的说明）来定，收到第一条心跳之前不补冗余。
             current_tier: Arc::new(AtomicU8::new(0)),
             min_rtt_ms: Arc::new(AtomicU64::new(u64::MAX)),
-            repair_budget: Arc::new(SyncMutex::new((Instant::now(), 0))),
             repair_skipped_no_space: Arc::new(AtomicU64::new(0)),
             orig_dropped_queue_full: Arc::new(AtomicU64::new(0)),
             signals: Arc::new(crate::repair::LinkSignals::new()),
@@ -2102,35 +2067,6 @@ mod tests {
     fn congestion_detection_triggers_only_past_the_multiplier() {
         assert!(!is_congested(30, 30 * CONGESTION_RTT_MULTIPLIER as u64));
         assert!(is_congested(30, 30 * CONGESTION_RTT_MULTIPLIER as u64 + 1));
-    }
-
-    /// 补发预算在上限内一直放行，一超过上限就该拒绝。
-    #[test]
-    fn repair_budget_allows_up_to_the_cap_then_blocks() {
-        let start = Instant::now();
-        let mut window_start = start;
-        let mut used = 0u32;
-        for _ in 0..MAX_REPAIR_PACKETS_PER_SEC {
-            let (allowed, ws, u) = reserve_repair_budget(window_start, used, start);
-            assert!(allowed, "没到上限之前都该放行");
-            window_start = ws;
-            used = u;
-        }
-        let (allowed, ..) = reserve_repair_budget(window_start, used, start);
-        assert!(!allowed, "超过每秒上限之后必须拒绝，这是最后一道硬闸门");
-    }
-
-    /// 窗口过期（超过 1 秒）之后必须重新放行，不能被上一个窗口的旧计数
-    /// 卡死——链路缓过来之后补发不该被永久掐断。
-    #[test]
-    fn repair_budget_resets_after_the_window_expires() {
-        let start = Instant::now();
-        let later = start + Duration::from_millis(1001);
-        let (allowed, window_start, used) =
-            reserve_repair_budget(start, MAX_REPAIR_PACKETS_PER_SEC, later);
-        assert!(allowed, "窗口过期后应该重新放行，不能被旧窗口的计数卡住");
-        assert_eq!(used, 1);
-        assert_eq!(window_start, later);
     }
 
     /// 预测基线兜底、探测针实测只会往上修正，不会盖过更新鲜的基线。
