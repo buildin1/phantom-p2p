@@ -424,6 +424,8 @@ struct PeerForwarder {
     repair_skipped_no_space: Arc<AtomicU64>,
     /// 因为发送队列没余量而被丢弃的**原包**数（累计）。见 `try_forward`。
     orig_dropped_queue_full: Arc<AtomicU64>,
+    /// 这条连接的收包序号，见 [`tun_rx_counter`]。
+    rx_packets: Arc<AtomicU64>,
     /// 对端标识，只用于日志——多人房间里必须能分清哪一行属于哪条连接。
     ///
     /// 《踩坑记录》第十条：诊断计数器必须按会话/按对端，进程级的静态计数器
@@ -784,7 +786,25 @@ impl PeerForwarder {
             u8::MAX
         };
 
-        let extra_copies = proposed.min(self.signals.max_extra_copies()).min(size_cap);
+        // TCP 握手/挥手（SYN/FIN/RST）永远值得补一份。
+        //
+        // 丢一个 SYN 的代价是**一整秒的 RTO**——那是整个会话里最显眼的停顿，
+        // 而这类包极少、极小，补一份的开销可以忽略。所以它不受尺寸规则和
+        // 流分类的限制（它们本来也拦不住小包，这里是显式表达这个意图）。
+        let control_floor = Ipv4Header::from_bytes(packet)
+            .filter(|h| h.protocol == 6)
+            .and_then(|h| {
+                let header_len = ((packet[0] & 0x0f) as usize) * 4;
+                packet.get(header_len + 13).copied()
+            })
+            .filter(|flags| crate::repair::is_tcp_control(*flags))
+            .map(|_| 1u8)
+            .unwrap_or(0);
+
+        let extra_copies = proposed
+            .min(self.signals.max_extra_copies())
+            .min(size_cap)
+            .max(control_floor.min(self.signals.max_extra_copies()));
         // 冗余份必须复用这份密文字节原样重发，不能对同一个包再调一次
         // `crypto.seal()`——那样会拿到不同计数器的两个包，现有重放窗口就
         // 没法把它们当成同一个包去重了。只有确定要发冗余份时才克隆，
@@ -1051,6 +1071,7 @@ impl TunBridge {
             // （`set_tier`，见那里的说明）来定，收到第一条心跳之前不补冗余。
             current_tier: Arc::new(AtomicU8::new(0)),
             min_rtt_ms: Arc::new(AtomicU64::new(u64::MAX)),
+            rx_packets: Arc::new(AtomicU64::new(0)),
             repair_skipped_no_space: Arc::new(AtomicU64::new(0)),
             orig_dropped_queue_full: Arc::new(AtomicU64::new(0)),
             peer_label: peer_hint
@@ -1650,17 +1671,19 @@ fn packet_protocol(packet: &[u8]) -> String {
     }
 }
 
-// Kept separate from packet routing so the receive path remains allocation-free.
+/// 收包序号，**按对端连接计**，不是按进程计。
+///
+/// 曾经是一个进程级的 `static AtomicU64`。《踩坑记录》第十条记过这个坑：
+/// 进程级计数器跨重连、跨多个对端会串号，日志里的 `rx #N` 于是既不能用来
+/// 判断"这条连接收了多少包"，也不能用来对齐两侧日志——排障时反而误导。
+/// 挂到 `PeerForwarder` 上之后，每条连接从 1 开始，重连即归零。
 fn tun_rx_counter(
     _tun: &Arc<TunDevice>,
     _peers: &PeerSenders,
-    _sender: &PeerForwarder,
+    sender: &PeerForwarder,
     _is_host: bool,
 ) -> u64 {
-    // receive_frames is shared by host and guest and predates per-bridge state;
-    // the log counter is process-local and only used for diagnostics.
-    static COUNT: AtomicU64 = AtomicU64::new(0);
-    COUNT.fetch_add(1, Ordering::Relaxed) + 1
+    sender.rx_packets.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 fn parse_network(prefix: &str) -> Result<Ipv4Addr, TunError> {
