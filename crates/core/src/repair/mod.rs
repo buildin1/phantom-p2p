@@ -26,6 +26,8 @@ pub mod budget;
 pub mod classify;
 pub mod gate;
 pub mod signals;
+#[cfg(test)]
+pub mod simlink;
 
 pub use budget::RepairBudget;
 pub use classify::{is_bulk_sized, is_tcp_control, FlowClass, FlowProfile};
