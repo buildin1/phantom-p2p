@@ -39,6 +39,20 @@ const SELF_EVICT_MEMORY: Duration = Duration::from_millis(200);
 /// 不留边际的话，估计带宽本身的误差就足以让我们把链路刚好压到临界点。
 const HEADROOM_SAFETY: f64 = 0.85;
 
+/// 发送速率低于 `cwnd/rtt` 的这个比例时，认为是**业务没数据可发**
+/// （app-limited），这个样本不能拿来估计链路容量。
+///
+/// 判据必须是"我们有没有在尽力发"，而不是"队列里有没有东西"——健康链路的
+/// 队列在采样时刻永远是空的，用队列做判据等于永远不采样，见采样循环里的说明。
+const APP_LIMITED_RATIO: f64 = 0.25;
+
+/// 容量估计每次采样的衰减系数（50ms 一次）。
+///
+/// 0.999 每秒约衰减到 98%，十秒约 82%——足够慢，不会凭空制造"没余量"，
+/// 又足以让链路真的变差之后估计值跟着下来。上一版是 0.995，一秒就掉到 90%，
+/// 是闸门被错误关死的直接原因之一。
+const BTLBW_DECAY_PER_SAMPLE: f64 = 0.999;
+
 /// 供热路径无锁读取的链路状态。
 ///
 /// 每条对端连接一份。写入方是 20Hz 的采样任务，读取方是转发热路径。
@@ -241,23 +255,48 @@ pub fn spawn_sampler(conn: Connection, signals: Arc<LinkSignals>, queue_capacity
                 1.0 - (free.min(queue_capacity) as f32 / queue_capacity as f32)
             };
 
-            // 出方向实际投递速率。只有队列里有东西时才算数——链路空闲时这个数
-            // 反映的是业务发了多少，不是链路能承载多少，拿它当容量会严重低估。
+            // 出方向实际投递速率。
             let tx_bytes = stats.udp_tx.bytes;
             let delta_bytes = tx_bytes.saturating_sub(prev_tx_bytes);
             prev_tx_bytes = tx_bytes;
             let rate = delta_bytes as f64 / elapsed;
-            if occupancy > 0.0 && rate > btlbw_bps {
+
+            // 容量估计取窗口内最大投递速率（BBR 的思路）。
+            //
+            // **上一版这里的采样条件是错的，而且后果严重。** 它写的是
+            // "只在 `occupancy > 0` 时才接受采样"，本意是排除 app-limited 的样本
+            // （链路空闲时的速率反映的是业务发了多少，不是链路能承载多少）。
+            // 但实测证明：健康链路在采样时刻队列**永远是空的**——一整个会话里
+            // 每一条日志的 `occ` 都是 0.00。于是 btlbw 从不刷新，只剩下衰减，
+            // 几秒内就跌到当前速率以下，`headroom` 归零，闸门被错误地关死。
+            // 实测闸门有 75% 的时间是关着的，补包机制等于全程停摆，
+            // 而同期 `cwnd` 高达 327KB、链路丢包为 0——那是一条非常健康的链路。
+            //
+            // 正确的判据不是"队列非空"，而是"**这一刻我们是不是真的在尽力发**"。
+            // 用拥塞窗口做参照：发送速率已经接近 `cwnd/rtt` 允许的上限时，
+            // 说明是链路在限制我们而不是业务没数据可发，这个样本才反映真实容量。
+            let cwnd = stats.path.cwnd as f64;
+            let rtt_secs = srtt.as_secs_f64().max(0.001);
+            let cwnd_limited_rate = cwnd / rtt_secs;
+            let app_limited = rate < cwnd_limited_rate * APP_LIMITED_RATIO;
+            if !app_limited && rate > btlbw_bps {
                 btlbw_bps = rate;
             } else {
-                // 缓慢衰减，让长期没跑满的链路不会永远记着一个过时的高点
-                btlbw_bps *= 0.995;
+                // 衰减要比上一版慢得多。上一版每 50ms 乘 0.995，一秒就掉到 90%，
+                // 十秒只剩 1/3——真正的链路容量不会这样变化，那个速度的衰减
+                // 本身就是在制造假的"没余量"。
+                btlbw_bps *= BTLBW_DECAY_PER_SAMPLE;
             }
 
             // 余量 = 估计容量 × 安全边际 − 当前业务速率。
             // 注意这里用的是**当前实际发送速率**，因为源速率对我们是外生的：
             // 没法让游戏少发包，只能决定自己额外加多少。
-            let headroom = (btlbw_bps * HEADROOM_SAFETY - rate).max(0.0);
+            //
+            // 再用 `cwnd/rtt` 兜一个底：拥塞控制器自己算出来的可发送速率是
+            // 第一手信息，比我们观测到的历史最大投递速率更能反映"现在还能发多少"。
+            // 两者取大，避免估计器一时没跟上就把闸门误关。
+            let capacity = btlbw_bps.max(cwnd_limited_rate);
+            let headroom = (capacity * HEADROOM_SAFETY - rate).max(0.0);
 
             let congestion_events = stats.path.congestion_events;
             let delta_congestion = congestion_events.saturating_sub(prev_congestion_events);
@@ -268,9 +307,10 @@ pub fn spawn_sampler(conn: Connection, signals: Arc<LinkSignals>, queue_capacity
                 self_evicted: signals.recent_self_evict(now_ms),
                 occupancy,
                 delay_gradient: gradient,
-                // btlbw 还没建立起来时（连接刚起、还没跑满过）不要因为
-                // "算出来余量是 0"就误判成拥塞——那时根本还没有容量估计。
-                headroom_bps: if btlbw_bps <= 0.0 {
+                queueing_delay: srtt.saturating_sub(min_rtt.get().unwrap_or(srtt)),
+                // 还没有任何容量依据时（连接刚起、cwnd 也还没长起来）不要因为
+                // "算出来余量是 0"就误判成拥塞——那时根本谈不上容量估计。
+                headroom_bps: if capacity <= 0.0 {
                     i64::MAX
                 } else {
                     headroom as i64

@@ -90,12 +90,13 @@ impl TripReason {
     }
 }
 
-/// 发送队列占用率超过这个比例就判定为拥塞。
-///
-/// 队列本来就该是**空的**——它存在的意义是吸收瞬时突发，不是常驻数据。
-/// 稳定占用四分之一说明发送速率已经逼近链路承载能力。
-const OCCUPANCY_TRIP: f32 = 0.25;
 /// 占用率超过这个比例进入"谨慎"，还不关闸但不许升到 Open。
+///
+/// **占用率不再单独作为关闸条件。** 实测证明它在 20Hz 采样下几乎没有诊断价值：
+/// 一整个会话里每一条日志的 `occ` 都是 0.00，而同期本端因为队列满丢掉了 79 个包。
+/// 真实的溢出是亚 50ms 尺度的突发，采样点永远落在队列已经排空之后。
+/// 真正抓得住这件事的是 [`Observation::self_evicted`]——它是逐包判断的，
+/// 而且一旦触发就是**不需要推断的证据**。占用率降级为"谨慎"信号和诊断量。
 const OCCUPANCY_CAUTION: f32 = 0.10;
 
 /// 排队延迟相对基线涨了这个比例就判定为拥塞。
@@ -108,6 +109,17 @@ const OCCUPANCY_CAUTION: f32 = 0.10;
 /// 收到心跳时算一次。
 const GRADIENT_TRIP: f32 = 0.40;
 const GRADIENT_CAUTION: f32 = 0.15;
+
+/// 排队延迟的**绝对**下限：低于这个值，无论比值多大都不算拥塞。
+///
+/// 梯度是个比值，`rttmin` 越小，同样的绝对抖动算出来的比值越大。实测抓到过
+/// `grad=0.45 srtt=12ms rttmin=8ms` 就关闸——**4 毫秒的排队延迟**，相对内层
+/// TCP 的 55ms 自愈预算什么都不是，纯粹是低延迟链路上的正常抖动被比值放大了。
+///
+/// 分母兜底（`MinRttFilter::gradient` 里的 5ms）挡不住这种情况：那条只在
+/// `rttmin` 极小时生效，而 8ms 已经超过它了。所以这里再加一道绝对门槛：
+/// 排队延迟本身不到 12ms 就别谈拥塞，留给 55ms 预算足够的余量。
+const MIN_QUEUEING_DELAY: Duration = Duration::from_millis(12);
 
 /// 从 Closed 回到 Throttled 需要连续多久没有任何拥塞迹象。
 const REOPEN_TO_THROTTLED: Duration = Duration::from_millis(500);
@@ -129,6 +141,12 @@ pub struct Observation {
     pub occupancy: f32,
     /// 排队延迟梯度 `(srtt - rtt_min) / rtt_min`
     pub delay_gradient: f32,
+    /// 排队延迟的绝对值 `srtt - rtt_min`。
+    ///
+    /// 和梯度一起用：比值负责"相对这条链路自己算不算异常"，绝对值负责
+    /// "这点延迟到底值不值得在意"。缺了后者，低 RTT 链路上几毫秒的正常抖动
+    /// 会被比值放大成拥塞，见 [`MIN_QUEUEING_DELAY`]。
+    pub queueing_delay: Duration,
     /// 估计的可用带宽余量（字节/秒）。<= 0 表示业务流量已经把链路吃满。
     pub headroom_bps: i64,
     /// 距上次采样，拥塞控制器自己报了几次拥塞事件
@@ -142,6 +160,7 @@ impl Observation {
             self_evicted: false,
             occupancy: 0.0,
             delay_gradient: 0.0,
+            queueing_delay: Duration::ZERO,
             headroom_bps: i64::MAX,
             congestion_events: 0,
         }
@@ -152,9 +171,9 @@ impl Observation {
         // 顺序即优先级：先报最确凿的原因，日志才有诊断价值。
         if self.self_evicted {
             TripReason::SelfEvict
-        } else if self.occupancy > OCCUPANCY_TRIP {
-            TripReason::Occupancy
-        } else if self.delay_gradient > GRADIENT_TRIP {
+        } else if self.delay_gradient > GRADIENT_TRIP && self.queueing_delay >= MIN_QUEUEING_DELAY {
+            // 比值和绝对值**都**要超标。少了绝对值这一半，低 RTT 链路上
+            // 几毫秒的正常抖动就会关闸，见 `MIN_QUEUEING_DELAY`。
             TripReason::DelayGradient
         } else if self.headroom_bps <= 0 {
             TripReason::NoHeadroom
@@ -364,11 +383,65 @@ mod tests {
         let mut g = GateController::new();
         assert_eq!(g.step(&Observation::clean(), t), Gate::Open);
         let obs = Observation {
-            occupancy: 0.5,
+            headroom_bps: 0,
             ..Observation::clean()
         };
         assert_eq!(g.step(&obs, t), Gate::Closed);
-        assert_eq!(g.last_reason(), TripReason::Occupancy);
+        assert_eq!(g.last_reason(), TripReason::NoHeadroom);
+    }
+
+    /// **低 RTT 链路上的小抖动不得关闸。**
+    ///
+    /// 实测抓到过 `grad=0.45 srtt=12ms rttmin=8ms` 就关闸——4 毫秒的排队延迟，
+    /// 相对内层 TCP 的 55ms 自愈预算什么都不是。梯度是比值，`rttmin` 越小越容易
+    /// 被正常抖动顶过阈值，所以必须同时看绝对值。
+    #[test]
+    fn a_few_milliseconds_of_queueing_never_trips_the_gate() {
+        let t = Instant::now();
+        let mut g = GateController::new();
+        let obs = Observation {
+            // 比值远超阈值……
+            delay_gradient: 0.45,
+            // ……但绝对排队延迟只有 4ms
+            queueing_delay: Duration::from_millis(4),
+            ..Observation::clean()
+        };
+        assert_eq!(
+            g.step(&obs, t),
+            Gate::Open,
+            "4ms 排队不该被当成拥塞，哪怕比值到了 0.45"
+        );
+    }
+
+    /// 反过来：比值和绝对值都超标时必须关闸。
+    #[test]
+    fn real_queue_buildup_still_trips_the_gate() {
+        let t = Instant::now();
+        let mut g = GateController::new();
+        let obs = Observation {
+            delay_gradient: 0.8,
+            queueing_delay: Duration::from_millis(30),
+            ..Observation::clean()
+        };
+        assert_eq!(g.step(&obs, t), Gate::Closed);
+        assert_eq!(g.last_reason(), TripReason::DelayGradient);
+    }
+
+    /// 占用率单独不再关闸——20Hz 采样看不见亚 50ms 的突发溢出，
+    /// 实测一整个会话 `occ` 恒为 0.00 而本端丢了 79 个包。
+    #[test]
+    fn occupancy_alone_no_longer_trips_the_gate() {
+        let t = Instant::now();
+        let mut g = GateController::new();
+        let obs = Observation {
+            occupancy: 0.9,
+            ..Observation::clean()
+        };
+        assert_eq!(
+            g.step(&obs, t),
+            Gate::Open,
+            "占用率只当谨慎信号，真正抓突发的是 self_evicted"
+        );
     }
 
     /// **误触发防护。** 一个会在干净链路上乱关闸的控制器，等于把整个补包功能
