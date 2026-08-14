@@ -77,6 +77,22 @@ pub struct LinkSignals {
     source_bytes: AtomicU64,
     source_pkts: AtomicU64,
 
+    /// 本连接是否真的补过包。风控自校准只在这之后才需要查库，见
+    /// [`Self::calibrated_pps_cap`]。
+    ever_repaired: AtomicBool,
+    /// 风控自校准库 + 本环境指纹 + 已读到的缓存。
+    ///
+    /// 缓存是为了避免 20Hz 的采样循环每次都去碰数据库；`None` 表示没绑定
+    /// （不影响正常工作，只是退化成纯按比例算的预算）。
+    #[allow(clippy::type_complexity)]
+    calibration: SyncMutex<
+        Option<(
+            Arc<super::CalibrationStore>,
+            String,
+            Option<super::Calibration>,
+        )>,
+    >,
+
     /// 补发预算，见 [`RepairBudget`]。
     ///
     /// 写入方是采样器（每 50ms 更新速率），读取方是发送路径（每份补发申请一次）。
@@ -104,6 +120,8 @@ impl LinkSignals {
             running: AtomicBool::new(false),
             source_bytes: AtomicU64::new(0),
             source_pkts: AtomicU64::new(0),
+            ever_repaired: AtomicBool::new(false),
+            calibration: SyncMutex::new(None),
             budget: SyncMutex::new(RepairBudget::new(Instant::now())),
             occupancy_pct: AtomicU8::new(0),
             gradient_pct: AtomicU8::new(0),
@@ -151,10 +169,67 @@ impl LinkSignals {
     /// 锁中毒时放行：预算是"锦上添花"的限制，不该因为它自己出问题就
     /// 把补包功能整个废掉。
     pub fn admit_repair(&self, len: usize) -> bool {
+        // 记一笔"这条连接确实补过包"。校准库只在这之后才需要被查——
+        // 干净会话根本不用碰数据库。
+        self.ever_repaired.store(true, Ordering::Relaxed);
         match self.budget.lock() {
             Ok(mut b) => b.try_admit(len, Instant::now()),
             Err(_) => true,
         }
+    }
+
+    /// 绑定风控自校准库。由客户端在启动时调用一次。
+    ///
+    /// 不绑定也能正常工作，只是拿不到"这个用户环境的历史安全线"，
+    /// 退化成纯按比例算的预算。
+    pub fn attach_calibration(&self, store: Arc<super::CalibrationStore>, fingerprint: String) {
+        if let Ok(mut g) = self.calibration.lock() {
+            *g = Some((store, fingerprint, None));
+        }
+    }
+
+    /// 这个网络环境学到的安全补发包速率上限。
+    ///
+    /// **只有在本连接真的补过包之后才会去读数据库**，并且读到之后缓存起来，
+    /// 不会每 50ms 查一次。链路干净的会话全程返回 `None`，一次 I/O 都不做。
+    fn calibrated_pps_cap(&self) -> Option<u32> {
+        if !self.ever_repaired.load(Ordering::Relaxed) {
+            return None;
+        }
+        let mut g = self.calibration.lock().ok()?;
+        let (store, fp, cached) = g.as_mut()?;
+        if let Some(c) = cached {
+            return Some(c.max_safe_pps);
+        }
+        let loaded = store.load(fp);
+        let pps = loaded.max_safe_pps;
+        *cached = Some(loaded);
+        Some(pps)
+    }
+
+    /// 会话结束时结算：把这次是"干净"还是"疑似被风控"记进校准库。
+    ///
+    /// 用户永远不会主动报告"我好像被限速了"，所以只能靠这里自动积累。
+    pub fn finish_session(&self, suspected_throttle: bool) {
+        let Ok(mut g) = self.calibration.lock() else {
+            return;
+        };
+        let Some((store, fp, cached)) = g.as_mut() else {
+            return;
+        };
+        // 干净且从没补过包的会话没有信息量——它既没验证过上限安全，
+        // 也没触发过风控，不该拿去当"又一个干净会话"去推高上限。
+        if !suspected_throttle && !self.ever_repaired.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut c = cached.unwrap_or_else(|| store.load(fp));
+        if suspected_throttle {
+            c.on_suspected_throttle();
+        } else {
+            c.on_clean_session();
+        }
+        store.save(fp, &c);
+        *cached = Some(c);
     }
 
     fn recent_self_evict(&self, now_ms: u64) -> bool {
@@ -329,8 +404,17 @@ pub fn spawn_sampler(conn: Connection, signals: Arc<LinkSignals>, queue_capacity
             let source_pps = src_pkts.saturating_sub(prev_source_pkts) as f32 / elapsed as f32;
             prev_source_bytes = src_bytes;
             prev_source_pkts = src_pkts;
+            // 风控自校准：把这个用户环境里学到的安全包速率作为补发包速率的上限。
+            //
+            // **只在真的补过包之后才去查库**，链路干净的会话完全不碰数据库——
+            // 绝大多数会话都是干净的，不该为极少数出问题的场景付出每次都查库的
+            // 代价。见 `crate::repair::calibration` 的"零开销路径"。
+            let learned_cap = signals.calibrated_pps_cap();
             if let Ok(mut b) = signals.budget.lock() {
                 b.update(headroom as f32, source_bps, source_pps, now);
+                if let Some(cap) = learned_cap {
+                    b.clamp_packet_rate(cap as f32);
+                }
             }
 
             // 诊断量
