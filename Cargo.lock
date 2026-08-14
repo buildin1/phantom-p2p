@@ -3049,6 +3049,7 @@ dependencies = [
  "quinn",
  "rand 0.8.5",
  "rcgen",
+ "rusqlite",
  "rustls",
  "serde",
  "serde_json",
