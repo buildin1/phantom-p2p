@@ -22,8 +22,10 @@
 //! 控制面只做**减法**：数据面按丢包率算出该补几份，控制面可以往下压，
 //! 但永远不会往上加。
 
+pub mod classify;
 pub mod gate;
 pub mod signals;
 
+pub use classify::{is_bulk_sized, is_tcp_control, FlowClass, FlowProfile};
 pub use gate::{Gate, GateController, MinRttFilter, Observation, TripReason};
 pub use signals::{spawn_sampler, LinkSignals};

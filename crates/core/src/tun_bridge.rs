@@ -760,13 +760,33 @@ impl PeerForwarder {
                 .filter(|s| s.until > Instant::now())
                 .map(|s| s.extra_copies)
         });
-        // 分档表提议，闸门封顶——闸门只减不增。
+        // 分档表提议，闸门和流特征分别封顶——两者都只减不增。
         //
-        // 这一步是"按丢包率该补几份"和"这条链路现在还承受得起几份"两个问题的
-        // 交汇点。上一版只有前者，于是链路被自己压垮时档位反而一路爬到顶。
+        // 这一步是三个问题的交汇点：
+        //   1. 按丢包率**应该**补几份（分档表）
+        //   2. 这条链路现在**承受得起**几份（闸门，见 `crate::repair::gate`）
+        //   3. 这个包**值不值得**补（尺寸规则，见下）
+        // 上一版只有第 1 个，于是链路被自己压垮时档位反而一路爬到顶。
         let proposed =
             effective_extra_copies(self.current_tier.load(Ordering::Relaxed), flow_specific);
-        let extra_copies = proposed.min(self.signals.max_extra_copies());
+
+        // 满包不补。批量传输（HTTP 下载、区块同步）几乎全是 MSS 满包，它的吞吐
+        // 受带宽限制，复制等于自己抢自己的带宽，而且内层 TCP 本来就会重传；
+        // 而正是这类流在把链路占满。上一版的连接级基线对**每个包**一视同仁地
+        // 抬档，包括这条正在饱和链路的流——把一条已经饱和的流三倍，是填满
+        // 发送队列最快的方式，这是实测崩溃的根因之一。
+        //
+        // 用包尺寸而不是流标签做主判据，是因为 MC 在**同一条 TCP 连接**上先下
+        // 区块再进入交互，同一个五元组，任何粘在流上的标签在构造上就是错的，
+        // 而实测崩溃恰好发生在这个转换点。尺寸规则零状态、零滞后，
+        // 能在同一毫秒内正确区分区块包和玩家移动包。
+        let size_cap = if crate::repair::is_bulk_sized(packet.len(), TUN_MTU) {
+            0
+        } else {
+            u8::MAX
+        };
+
+        let extra_copies = proposed.min(self.signals.max_extra_copies()).min(size_cap);
         // 冗余份必须复用这份密文字节原样重发，不能对同一个包再调一次
         // `crypto.seal()`——那样会拿到不同计数器的两个包，现有重放窗口就
         // 没法把它们当成同一个包去重了。只有确定要发冗余份时才克隆，
