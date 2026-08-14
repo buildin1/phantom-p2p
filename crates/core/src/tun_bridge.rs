@@ -94,9 +94,15 @@ const CONGESTION_RTT_MULTIPLIER: u64 = 3;
 
 /// 判定为拥塞时，无论测出的丢包率多高，冗余档位最多压到这个值。
 ///
-/// 不是压到 0——已经被 NACK 证实丢包的流仍然值得担一份最基本的冗余，
-/// 只是不能再跟着丢包率往上加码，见 [`CONGESTION_RTT_MULTIPLIER`] 的说明。
-const CONGESTED_TIER_CAP: u8 = 1;
+/// **压到 0，不是 1。** 曾经是 1，理由写的是"已经被 NACK 证实丢包的流仍然值得担
+/// 一份最基本的冗余"——但判定为拥塞时，那一份副本恰恰**就是**丢包的来源，
+/// 再留一份等于继续给正在溢出的队列加料。而且拥塞丢包是突发的，错峰几十毫秒的
+/// 副本会和原包一起被同一次队列溢出吞掉，物理上救不回来。
+///
+/// 这条流并没有失去保护：ARQ（NACK 重传）照常覆盖它，而且 ARQ 在拥塞时是**自限**
+/// 的（要等对端发现空洞才触发，链路越堵触发越慢），冗余不是（不管链路什么状态都
+/// 按固定倍率往外推）。拥塞时正确的机制本来就是 ARQ。
+const CONGESTED_TIER_CAP: u8 = 0;
 
 /// 纯逻辑判断，不摸真实时钟——方便单测，不用真建一条 QUIC 连接。
 fn is_congested(min_rtt_ms: u64, current_rtt_ms: u64) -> bool {
@@ -194,44 +200,52 @@ fn counter_of(sealed: &[u8]) -> u64 {
         .unwrap_or(0)
 }
 
-/// 补发份数的硬上限（不含原包）——算法认为该补更多也不会超过这个数。
+/// 补发份数的硬上限（不含原包）。
 ///
-/// 这版实验性构建**不考虑带宽放大**（这是正式版才需要精打细算的事，见
-/// 《抗丢包方案设计》第一节的范围声明），所以宁可份数给足也不留一手；
-/// 但报文速率终归不能没有上限地涨，同一个包连续发 N 次这种模式本身也
-/// 可能被运营商当成异常流量处理，留一个明确的顶避免真的失控。
-const MAX_EXTRA_COPIES: u8 = 8;
+/// **曾经是 8，是错的。** 那个值的依据是一句注释——"这版实验性构建不考虑带宽放大
+/// （见《抗丢包方案设计》第一节的范围声明）"——而第一节**没有这条声明**：它的非目标
+/// 只有"中继路径补包"和"风控自校准持久化"两条，并且明确要求风控用"一个写死的保守
+/// 上限"。该表述实际只存在于第 4.5 节，而 4.5 节又反向引用第一节，整条引用链是空的。
+/// 第 4.4 节、第五节、《踩坑记录》第十一条方向完全相反，都在警告速率放大是运营商
+/// 风控的头号触发点。
+///
+/// 用文档自己第 4.5 节的公式（残余丢包 ≈ `p^(k+1)`）反推真正需要的份数：
+/// p=1% 时补 1 份残余就只剩 0.01%，p=5% 时补 2 份剩 0.0125%。**补 2 份足够覆盖
+/// 任何还值得用冗余去救的链路**；需要更多份意味着 p 高到几乎必然是拥塞，
+/// 而拥塞丢包是突发的（队列溢出连丢一串），错峰几十毫秒的副本会和原包一起被吞——
+/// 冗余对拥塞丢包在物理上就是无效的，加份数只会让拥塞更重。
+const MAX_EXTRA_COPIES: u8 = 2;
 
 /// 按最近一次测得的丢包率，决定冗余档位（额外补发份数，不含原包）。
 ///
-/// 对应《抗丢包方案设计》第 4.5 节的分档表——这版刻意压低了每一档的起点、
-/// 拉陡了升档曲线：不考虑带宽的实验构建里，"少补一份导致原包+补发一起丢"
-/// 比"多发几份包"贵得多，宁可 2% 出头就直接跳到 2 份额外拷贝：
-///
 /// | 丢包率 | 额外份数 | 总份数 |
 /// |---|---|---|
-/// | 0 | 0 | 1 |
-/// | 0~2% | 2 | 3 |
-/// | 2~5% | 3 | 4 |
-/// | 5~10% | 4 | 5 |
-/// | 10~20% | 6 | 7 |
-/// | 20%+ | 8（[`MAX_EXTRA_COPIES`]） | 9 |
+/// | <0.2% | 0 | 1 |
+/// | 0.2~5% | 1 | 2 |
+/// | 5%+ | 2（[`MAX_EXTRA_COPIES`]） | 3 |
+///
+/// **这张表曾经有个悬崖：只要测到任何丢包（哪怕 0.01%）就直接跳到 2 份额外拷贝，
+/// 也就是流量立刻三倍**，中间没有任何过渡，一路陡到 20% 丢包时 9 倍。
+/// 而 0.1%~0.5% 的丢包在公网上完全正常，内层 TCP 自己就能消化。
+/// 实测后果是一个正反馈环：大流量占满链路 → 出现正常的微量丢包 → 档位跳到 3 倍
+/// → 副本把原包挤出 QUIC 数据报发送缓冲（quinn 满时丢最旧的）→ 测到的丢包率
+/// 不降反升 → 档位继续爬 → RTT 从 35ms 塌到 5 秒 → 连接超时。
+/// macOS↔Windows 和 Windows↔Windows 都复现，纯单倍包时代从未出现过。
+///
+/// 现在的曲线按残余丢包 `p^(k+1)` 反推，只在真正需要时才加码：
+/// 0.2% 以下不补（这个量级内层协议自愈更划算），5% 以下补 1 份（残余 ≤0.25%），
+/// 再往上补 2 份封顶。
 ///
 /// `bp == 0` 必须映射到 0，不能给个"最低也算一档"的下限——这个值同时也是
 /// 连接级的**预测基线**（见 [`effective_extra_copies`]），链路真的干净时
 /// 基线要能跟着降到 0，不然新流量会一直白白多发，冗余没法在链路恢复之后
 /// 自己关掉。
 fn tier_for_bp(bp: u16) -> u8 {
-    if bp == 0 {
+    if bp < 20 {
+        // <0.2%：内层 TCP 的 RACK-TLP 自愈成本远低于给全链路加一份流量。
         0
-    } else if bp <= 200 {
-        2
     } else if bp <= 500 {
-        3
-    } else if bp <= 1000 {
-        4
-    } else if bp <= 2000 {
-        6
+        1
     } else {
         MAX_EXTRA_COPIES
     }
@@ -428,6 +442,14 @@ struct PeerForwarder {
     /// 补发流量速率限制的窗口状态：(当前窗口起始时间, 这个窗口已经用掉的
     /// 份数)。见 [`reserve_repair_budget`]。
     repair_budget: Arc<SyncMutex<(Instant, u32)>>,
+    /// 因为发送队列没余量而被放弃的补发包数（累计）。见 [`Self::repair_has_room`]。
+    ///
+    /// **这个计数器是"副本挤掉原包"这个诊断的直接检验**：它在实测中频繁非零，
+    /// 就说明补发流量确实一直在往一个已经排满的队列里挤；恒为零则说明诊断有偏差，
+    /// 后续的控制器设计需要重新审视。
+    repair_skipped_no_space: Arc<AtomicU64>,
+    /// 因为发送队列没余量而被丢弃的**原包**数（累计）。见 `try_forward`。
+    orig_dropped_queue_full: Arc<AtomicU64>,
 }
 
 impl PeerForwarder {
@@ -474,20 +496,57 @@ impl PeerForwarder {
         allowed
     }
 
+    /// 队列里还塞得下 `len` 字节的补发包吗？
+    ///
+    /// **这是整套机制里最关键的一道闸。** quinn 的数据报发送队列在满的时候
+    /// 丢的是**最旧的**那个（`Connection::send_datagram` 传 `drop=true`
+    /// → `pop_front()`），所以队列一满，后进来的副本会把还没发出去的**原包**
+    /// 挤掉——修复机制亲手摧毁它要修复的东西。实测就是这样塌的：
+    /// 副本挤掉原包 → 对端测到的丢包率不降反升 → 档位继续往上爬 → 越补越堵。
+    ///
+    /// `datagram_send_buffer_space()` 返回队列剩余空间，`> len` 就保证这次发送
+    /// 不会挤掉任何已排队的报文。补发包在这里让路给原包，是因为**一个没发出去的
+    /// 原包，比一个发出去的副本有价值得多**——副本的全部意义就是保住原包。
+    fn repair_has_room(&self, len: usize) -> bool {
+        self.conn.datagram_send_buffer_space() >= len
+    }
+
     /// 收到对端的 NACK：命中的计数器原样从发送缓冲重发，并把命中的流标记为
     /// "需要冗余"，让后续该流的包自动补发，不用等下一次 NACK 才反应过来。
     fn handle_nack(&self, ranges: &[(u64, u16)]) {
         let deadline = arq_deadline_for(self.conn.rtt());
         let mut flows_to_activate: Vec<FlowKey> = Vec::new();
+        // 一次 NACK 最多处理这么多个计数器。
+        //
+        // 区间长度是对端给的 `u16`，一个 1200 字节的数据报能塞进上百个区间，
+        // 最坏情况是上百万次迭代——而这个循环**全程持有 `send_buffer` 互斥锁**、
+        // 跑在接收热路径上，等于对端（或链路上任何能让报文通过认证的一方）
+        // 可以直接把本端的转发通道拖死。发送缓冲本身只有
+        // `SEND_BUFFER_CAP`(512) 条，扫超过这个量级纯属白扫。
+        const MAX_NACK_COUNTERS_PER_MESSAGE: usize = 256;
+        let mut scanned = 0usize;
         {
             let buffer = self.send_buffer.lock().unwrap();
-            for &(start, count) in ranges {
+            'outer: for &(start, count) in ranges {
                 for counter in start..start.saturating_add(count as u64) {
+                    if scanned >= MAX_NACK_COUNTERS_PER_MESSAGE {
+                        debug!("[TUN] NACK 请求的计数器过多，截断处理");
+                        break 'outer;
+                    }
+                    scanned += 1;
                     let Some(entry) = buffer.get(counter, deadline) else {
                         // 缓冲里没有（已经被淘汰或超过 ARQ 截止时间）——
                         // 放弃这个计数器，跟没收到 NACK 一样处理。
                         continue;
                     };
+                    let len = entry.bytes.len();
+                    // 跟主动冗余同一道闸：重传包也不能挤掉还没发出去的原包。
+                    if !self.repair_has_room(len) {
+                        self.repair_skipped_no_space
+                            .fetch_add(1, Ordering::Relaxed);
+                        debug!("[TUN] 发送队列无余量，放弃重传 counter={}", counter);
+                        continue;
+                    }
                     if !self.try_reserve_repair_budget() {
                         // 补发预算已经用完——见 `MAX_REPAIR_PACKETS_PER_SEC`
                         // 的说明，这不是丢包，是主动放弃这次重传，避免补发
@@ -500,7 +559,10 @@ impl PeerForwarder {
                     tokio::spawn(async move {
                         match conn.send_datagram(bytes.into()) {
                             Ok(()) => {
-                                tracing::info!("[TUN] tx-nack-resend counter={}", counter);
+                                // 抽样，理由同 `tx-repair`。
+                                if counter % 1000 == 0 {
+                                    tracing::info!("[TUN] tx-nack-resend counter={}", counter);
+                                }
                             }
                             Err(e) => {
                                 debug!("[TUN] NACK 重传失败 counter={}: {}", counter, e);
@@ -698,6 +760,21 @@ impl PeerForwarder {
         // 干净链路上这里零额外开销。
         let redundant_bytes = (extra_copies > 0).then(|| sealed.clone());
 
+        // 队列满时**丢当前这个包**，而不是让 quinn 去丢最旧的那个。
+        //
+        // quinn 的 `send_datagram` 满队列时执行 `pop_front()`（丢最旧），这是最差的
+        // 队列管理策略：它把已经排了很久、马上就要发出去的包丢掉，最大化每个真正
+        // 通过的包的延迟，还会摧毁内层 TCP 的 RTT 采样，把平滑过载变成突发超时。
+        // 改成丢最新（尾丢）之后，内层 TCP 能对着隧道的真实容量正常收敛，
+        // 而且我们顺带拿到一个精确的自挤占计数器——这个数非零就直接证明
+        // "我们自己是丢包来源"，不需要任何推断或对端往返。
+        if self.conn.datagram_send_buffer_space() < len {
+            self.orig_dropped_queue_full
+                .fetch_add(1, Ordering::Relaxed);
+            debug!("[TUN] 发送队列已满，丢弃原包 counter={} bytes={}", counter, len);
+            return false;
+        }
+
         // 记进发送缓冲，供后续命中 NACK 时原样重发；同时刷新心跳要带的
         // "最大计数器"。必须在真正调用 send_datagram 之前记，晚了的话
         // 一个几乎同时到达的 NACK 会查不到刚发出去的这个计数器。
@@ -747,6 +824,20 @@ impl PeerForwarder {
                 tokio::spawn(async move {
                     for i in 0..extra_copies {
                         tokio::time::sleep(redundancy_delay_for(i, extra_copies)).await;
+                        // 队列没地方了就整串放弃——绝不能让副本挤掉还没发出去的
+                        // 原包，见 `repair_has_room`。这一条必须在预算检查之前：
+                        // 预算管的是"发太多会不会触发运营商风控"，这一条管的是
+                        // "这一份会不会直接害死一个原包"，后者更硬。
+                        if !forwarder.repair_has_room(len) {
+                            forwarder.repair_skipped_no_space.fetch_add(1, Ordering::Relaxed);
+                            debug!(
+                                "[TUN] 发送队列无余量，放弃剩余冗余份 counter={} copy={}/{}",
+                                counter,
+                                i + 1,
+                                extra_copies
+                            );
+                            break;
+                        }
                         if !forwarder.try_reserve_repair_budget() {
                             debug!(
                                 "[TUN] 补发预算已耗尽，放弃剩余冗余份 counter={} copy={}/{}",
@@ -764,13 +855,21 @@ impl PeerForwarder {
                                         async move { stats.record_send(&user, len).await },
                                     );
                                 }
-                                tracing::info!(
-                                    "[TUN] tx-repair counter={} bytes={} copy={}/{}",
-                                    counter,
-                                    len,
-                                    i + 1,
-                                    extra_copies
-                                );
+                                // 抽样：跟 `tx-orig` 保持同一个策略。这条本来是
+                                // 每份补包都无条件打一次，最高 300 条/秒，而且
+                                // 偏偏在链路已经出问题时才触发——`tx-orig` 那边
+                                // 的注释早就写明"每包无条件打日志是大量发包时
+                                // ping 从 40ms 飙到 1300ms 的真正原因"，当时只修了
+                                // 原包路径，补发路径漏掉了。
+                                if counter % 1000 == 0 {
+                                    tracing::info!(
+                                        "[TUN] tx-repair counter={} bytes={} copy={}/{}",
+                                        counter,
+                                        len,
+                                        i + 1,
+                                        extra_copies
+                                    );
+                                }
                             }
                             Err(e) => {
                                 debug!(
@@ -915,6 +1014,8 @@ impl TunBridge {
             current_tier: Arc::new(AtomicU8::new(0)),
             min_rtt_ms: Arc::new(AtomicU64::new(u64::MAX)),
             repair_budget: Arc::new(SyncMutex::new((Instant::now(), 0))),
+            repair_skipped_no_space: Arc::new(AtomicU64::new(0)),
+            orig_dropped_queue_full: Arc::new(AtomicU64::new(0)),
         };
         tracing::info!(
             "[TUN] 数据报通道就绪 (local={}, peer_hint={:?}, host={}, max_datagram={:?})",
@@ -1149,6 +1250,9 @@ const REPLAY_REJECT_ALARM: u32 = 64;
 /// 命中缓冲之后才知道的事。
 struct GapTracker {
     highest_processed: u64,
+    /// 还没见过任何计数器。不能用 `highest_processed == 0` 代替：0 是合法计数器
+    /// （`crypto.rs` 的 `tx_counter` 从 0 开始），分不清"没开始"和"收到了 0 号"。
+    started: bool,
     /// 计数器 -> 首次发现缺失的时间
     pending: HashMap<u64, Instant>,
     last_nack: Option<Instant>,
@@ -1158,6 +1262,7 @@ impl GapTracker {
     fn new() -> Self {
         Self {
             highest_processed: 0,
+            started: false,
             pending: HashMap::new(),
             last_nack: None,
         }
@@ -1165,14 +1270,36 @@ impl GapTracker {
 
     /// 收到一个已解密、已认证的计数器就调用——不管内容是数据还是控制报文，
     /// 目的只是记录"这个序号存在过"。
-    fn observe(&mut self, counter: u64, now: Instant) {
-        self.pending.remove(&counter);
+    ///
+    /// **返回这个计数器是不是首次见到。** 调用方必须用这个返回值给
+    /// [`LossMeter::on_received`] 把门：冗余副本携带的是**同一个计数器**
+    /// （这是设计要求，见《抗丢包方案设计》第三节），15~60ms 后到达时仍落在
+    /// 同一个统计窗口内。如果每次到达都计入收包数，补 k 份时实测丢包率会恒为 0
+    /// 直到单次传输丢包率超过 `k/(k+1)`——k=2 就是 67%，等于把整个自适应闭环
+    /// 变成一个 67% 才动作的开关。这正是《踩坑记录》第九条记录过、
+    /// 而实现里又违反了的坑。
+    fn observe(&mut self, counter: u64, now: Instant) -> bool {
+        if !self.started {
+            // 从第一个真正见到的计数器起步，而不是从 0 起步——否则首个计数器
+            // 若不是 0，`0..counter` 会被整段当成空洞灌进 `pending`，
+            // 凭空造出一批不存在的丢包去 NACK。
+            self.started = true;
+            self.highest_processed = counter;
+            return true;
+        }
+        if self.pending.remove(&counter).is_some() {
+            // 补上了一个已知空洞：是首次见到。
+            return true;
+        }
         if counter > self.highest_processed {
             for missing in (self.highest_processed + 1)..counter {
                 self.pending.entry(missing).or_insert(now);
             }
             self.highest_processed = counter;
+            return true;
         }
+        // 走到这里只可能是：冗余副本 / NACK 重传的重复到达，或早已处理过的旧号。
+        false
     }
 
     /// 到了该发 NACK 的时候，取出当前该催的空洞（过了重排容忍期、
@@ -1277,8 +1404,13 @@ async fn receive_datagrams(
         // 心跳每秒占用一个计数器，如果只对数据报文调用 `loss.on_received`，
         // 心跳占的那个号会被 `LossMeter` 永远当成"没收到"算进丢包率——
         // 等于自己制造假丢包，还会被当成真信号触发冗余升级/误导排查。
-        gaps.observe(counter, now);
-        loss.on_received(counter, now);
+        //
+        // 只有**首次见到**的计数器才计入收包数。冗余副本带的是同一个计数器，
+        // 重复计数会把实测丢包率稀释成 0，见 `GapTracker::observe` 的说明。
+        let first_sighting = gaps.observe(counter, now);
+        if first_sighting {
+            loss.on_received(counter, now);
+        }
         if let Some(bp) = loss.poll(now) {
             if let Some((stats, user)) = &sender.stats {
                 let (stats, user) = (stats.clone(), user.clone());
@@ -1309,7 +1441,10 @@ async fn receive_datagrams(
                     }
                     CTRL_HEARTBEAT => {
                         if let Some((highest, remote_loss_bp)) = decode_heartbeat(&packet) {
-                            gaps.observe(highest, now);
+                            // 只为暴露尾部空洞（对端说它发到哪了），这个号本身
+                            // 并没有真的到达本端，**不能**计入收包数——所以这里
+                            // 明确丢弃返回值，不喂给 `LossMeter`。
+                            let _ = gaps.observe(highest, now);
                             // 对端汇报的是它自己的入方向丢包率，正好等于
                             // "我发给它"这个方向的丢包率——这是设出方向
                             // 预测基线唯一测得准的信号，见 `current_tier`
@@ -1599,6 +1734,56 @@ mod tests {
         assert_eq!(m.poll(t + LOSS_WINDOW), Some(0));
     }
 
+    /// 冗余副本**不得**计入收包数。
+    ///
+    /// 副本按设计携带同一个计数器，15~60ms 后到达、仍落在同一个统计窗口内。
+    /// 一旦每次到达都 `received += 1`，`poll` 里的 `received.min(span)` 会把
+    /// 丢包率一路吃到 0——补 k 份时实测丢包率恒为 0 直到单次传输丢包率超过
+    /// `k/(k+1)`（k=2 即 67%）。整个自适应闭环退化成一个 67% 才动作的开关，
+    /// 而且**所有**用来验证补包效果的测量都经过这个仪器，一并失真。
+    /// 这是《踩坑记录》第九条记录过、实现里又违反了的坑。
+    ///
+    /// 这里连同 `GapTracker` 一起测，因为首次判定是它给的。
+    #[test]
+    fn loss_meter_ignores_redundant_copies() {
+        let t = Instant::now();
+        let mut gaps = GapTracker::new();
+        let mut m = LossMeter::new(t);
+
+        // 0..200 只有偶数真的到了（丢一半），且每个到达的包都额外收到 2 份副本
+        // ——正是 k=2 时链路上的样子。
+        for c in (0..200u64).step_by(2) {
+            for _copy in 0..3 {
+                if gaps.observe(c, t) {
+                    m.on_received(c, t);
+                }
+            }
+        }
+
+        let bp = m.poll(t + LOSS_WINDOW).expect("窗口到期应结算");
+        assert!(
+            (4800..=5100).contains(&bp),
+            "丢一半仍应报 ~50%，副本不得稀释；实得 {}bp（0 就说明又被副本致盲了）",
+            bp
+        );
+    }
+
+    /// 首个计数器不为 0 时，不能把 `0..counter` 整段当成空洞。
+    ///
+    /// 否则连接一建立就凭空造出一批不存在的丢包去 NACK，既污染丢包率
+    /// 又白白触发补发。
+    #[test]
+    fn gap_tracker_does_not_invent_gaps_before_the_first_counter() {
+        let t = Instant::now();
+        let mut gaps = GapTracker::new();
+        assert!(gaps.observe(5000, t), "首个计数器必须算首次见到");
+        assert!(
+            gaps.ranges_to_nack(t + REORDER_GRACE * 2, ARQ_DEADLINE_CEILING)
+                .is_empty(),
+            "首个计数器之前的号从未存在过，不该被当成空洞"
+        );
+    }
+
     /// **空闲不是丢包。**
     ///
     /// 本端观测到"没有新序号"时，无法区分对端没发和全丢了。此前的实现会
@@ -1803,25 +1988,24 @@ mod tests {
         assert!(decode_heartbeat(&[CTRL_HEARTBEAT, 0, 0]).is_none());
     }
 
-    /// 分档必须跟《抗丢包方案设计》第 4.5 节的表格对齐，这版故意把每一档的
-    /// 起点压低、曲线拉陡——不考虑带宽的实验构建里，"少补一份导致原包+
-    /// 补发一起丢"比"多发几份包"贵得多：真没丢是 0 份额外，0~2% 就给 2 份
-    /// 额外（共 3 份），2~5% 给 3 份，5~10% 给 4 份，10~20% 给 6 份，
-    /// 20%+ 封顶在 `MAX_EXTRA_COPIES`（8 份）。`bp == 0` 必须是 0——它同时
-    /// 也是预测基线，链路干净时基线要能降到底，见 `tier_for_bp` 的说明。
+    /// 分档曲线：<0.2% 不补，0.2~5% 补 1 份，5%+ 补 2 份封顶。
+    ///
+    /// **关键回归：微量丢包不得触发加码。** 旧表在 `bp >= 1`（0.01%）时就直接跳到
+    /// 2 份额外拷贝，也就是流量立刻三倍；而 0.1~0.5% 的丢包在公网上完全正常。
+    /// 那个悬崖是"越补越堵 → 连接超时"正反馈环的起点，实测 macOS↔Windows 和
+    /// Windows↔Windows 都会复现，纯单倍包时代从未出现过。
     #[test]
     fn redundancy_tier_matches_the_design_thresholds() {
         assert_eq!(tier_for_bp(0), 0);
-        assert_eq!(tier_for_bp(1), 2);
-        assert_eq!(tier_for_bp(200), 2);
-        assert_eq!(tier_for_bp(201), 3);
-        assert_eq!(tier_for_bp(500), 3);
-        assert_eq!(tier_for_bp(501), 4);
-        assert_eq!(tier_for_bp(1000), 4);
-        assert_eq!(tier_for_bp(1001), 6);
-        assert_eq!(tier_for_bp(2000), 6);
-        assert_eq!(tier_for_bp(2001), MAX_EXTRA_COPIES);
+        // 微量丢包必须**不**触发任何补发——这一条是防止悬崖复活的守卫。
+        assert_eq!(tier_for_bp(1), 0, "0.01% 丢包不该触发补发");
+        assert_eq!(tier_for_bp(19), 0, "0.19% 丢包不该触发补发");
+        assert_eq!(tier_for_bp(20), 1);
+        assert_eq!(tier_for_bp(500), 1);
+        assert_eq!(tier_for_bp(501), MAX_EXTRA_COPIES);
         assert_eq!(tier_for_bp(10_000), MAX_EXTRA_COPIES);
+        // 上限本身不得回退到那个靠伪造引用授权的 8。
+        assert_eq!(MAX_EXTRA_COPIES, 2, "补发份数上限不得超过 2");
     }
 
     /// 份数少时维持原来的固定错峰间隔；份数多到会把最后一份推过

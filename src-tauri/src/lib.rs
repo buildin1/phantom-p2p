@@ -958,6 +958,10 @@ async fn create_room(
     punch_state: tauri::State<'_, PunchState>,
     stats_state: tauri::State<'_, StatsState>,
 ) -> Result<(), String> {
+    // 一次连接一份干净日志：把上一段会话归档，从空文件重新开始。
+    // 排障时最费时间的一步一直是"从混了七八次连接的大文件里找出出问题的那次"。
+    phantom_core::logging::begin_session("host");
+
     reset_punch_runtime(&punch_state).await;
     clear_virtual_network(&punch_state).await;
     // 标记为 Host
@@ -991,6 +995,10 @@ async fn join_room(
     punch_state: tauri::State<'_, PunchState>,
     stats_state: tauri::State<'_, StatsState>,
 ) -> Result<(), String> {
+    // 一次连接一份干净日志，理由同 `create_room`。用房间码命名，
+    // 用户说"我那次进 XXXXX 连不上"时能直接定位到对应的归档。
+    phantom_core::logging::begin_session(&room_code);
+
     reset_punch_runtime(&punch_state).await;
     // 标记为 Guest
     *punch_state.is_host.write().await = false;
