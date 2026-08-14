@@ -204,6 +204,17 @@ impl RepairBudget {
     pub fn byte_rate(&self) -> f32 {
         self.current_byte_rate
     }
+
+    /// 用风控自校准学到的上限压一下包速率。
+    ///
+    /// 跟前面所有的封顶一样**只减不增**：这是在这个用户自己的网络环境里
+    /// 实测出来的安全线（见 `crate::repair::calibration`），比任何按比例算出来的
+    /// 值都更有权威——那些只知道链路状况，不知道运营商在这条线路上的容忍度。
+    pub fn clamp_packet_rate(&mut self, max_pps: f32) {
+        let capped = self.packets.rate.min(max_pps.max(0.0));
+        let burst = self.packets.burst;
+        self.packets.set_rate(capped, burst);
+    }
 }
 
 #[cfg(test)]
