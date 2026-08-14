@@ -64,7 +64,17 @@ impl ReceiverReport {
     /// 残余丢包率（万分之一）——补完之后仍然彻底丢掉的比例。
     ///
     /// 这是**用户实际体验到**的丢包，是要优化的目标量。
+    ///
+    /// **一个包都没见到时返回 0，不是 100%。** 这是 `LossMeter` 早就踩过、
+    /// 文档里也写明过的坑（"空闲不是丢包"）：本端观测不到任何序号时，
+    /// 无法区分"对端根本没发"和"发了但全丢了"，报 100% 会让玩家一站着不动、
+    /// 一开菜单就刷满假丢包，还会把档位顶到最高。尾部全丢那种真实场景由
+    /// 心跳携带的 `highest` 另行覆盖（见《抗丢包方案设计》4.6 节），
+    /// 不该在这里靠猜。
     pub fn residual_loss_bp(&self) -> u16 {
+        if self.first_sightings == 0 {
+            return 0;
+        }
         let span = self.span();
         if span == 0 {
             return 0;
@@ -289,13 +299,26 @@ mod tests {
         );
     }
 
-    /// 空报告不能崩，也不能报出假的 100% 丢包。
+    /// **空闲不是丢包。**
+    ///
+    /// 一个包都没见到时无法区分"对端没发"和"全丢了"，报 100% 会让玩家
+    /// 站着不动就刷满假丢包、把档位顶到最高。`LossMeter` 早就踩过这个坑，
+    /// 这里是同一个陷阱的另一处入口。
     #[test]
     fn empty_report_is_not_total_loss() {
         let r = ReceiverReport::default();
-        assert_eq!(r.residual_loss_bp(), 0);
+        assert_eq!(r.residual_loss_bp(), 0, "没有观测 ≠ 全丢");
         assert_eq!(r.per_transmission_loss_bp(0), 0);
         assert_eq!(r.effective_copies(), 0.0);
+
+        // 有跨度但一个都没首见，同样不能报 100%
+        let silent = ReceiverReport {
+            window_start: 100,
+            highest: 200,
+            arrivals: 0,
+            first_sightings: 0,
+        };
+        assert_eq!(silent.residual_loss_bp(), 0, "没有观测 ≠ 全丢");
     }
 
     /// 补包确实有效时，不该被压档。

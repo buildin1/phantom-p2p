@@ -23,6 +23,7 @@
 //! 但永远不会往上加。
 
 pub mod budget;
+pub mod calibration;
 pub mod classify;
 pub mod effect;
 pub mod gate;
@@ -31,6 +32,7 @@ pub mod signals;
 pub mod simlink;
 
 pub use budget::RepairBudget;
+pub use calibration::{fingerprint, Calibration, CalibrationStore};
 pub use classify::{is_bulk_sized, is_tcp_control, FlowClass, FlowProfile};
 pub use effect::{AbPhase, EffectMeter, ReceiverReport, SenderEpoch, EPOCH};
 pub use gate::{Gate, GateController, MinRttFilter, Observation, TripReason};
