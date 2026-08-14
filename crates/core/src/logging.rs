@@ -703,16 +703,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let mut rf = RollingFile::new(&dir, "t");
-        rf.written = MAX_FILE_BYTES; // 强制触发轮转
-        rf.write_all(b"after-rotate\n").unwrap();
-        rf.flush().unwrap();
+        let rf = SharedRollingFile::new(&dir, "t");
+        // 强制触发轮转
+        rf.0.lock().unwrap().written = MAX_FILE_BYTES;
+        let mut w = rf.clone();
+        w.write_all(b"after-rotate\n").unwrap();
+        w.flush().unwrap();
 
         assert!(
             dir.join("archive").join("t.1.log").exists(),
             "轮转后旧文件应进入 archive"
         );
         assert!(dir.join("t.log").exists(), "轮转后应重新打开当前文件");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 换房间时整体轮转：四个日志打包成一个 zip，然后从空文件重开。
+    ///
+    /// 排障时最费时间的一步一直是"从混了七八次连接的大文件里，找出出问题的那一次"，
+    /// 这一条守住"一次连接一份干净日志"。
+    #[test]
+    fn begin_session_archives_and_starts_clean() {
+        let dir = std::env::temp_dir().join(format!("phantom-sess-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let router = LogRouter::new(&dir).unwrap();
+
+        // 直接写共享句柄，不走 `write_line`——那条路径经 `NonBlocking` 派给后台
+        // 线程落盘，什么时候真正写进文件不确定，测试会变成竞态。这里要验的是
+        // 归档与重开逻辑，不是异步写入本身。
+        {
+            let inner = router.inner.lock().unwrap();
+            let mut f = inner.files[2].clone(); // tunnel
+            f.write_all("上一段会话的内容\n".as_bytes()).unwrap();
+            f.flush().unwrap();
+        }
+
+        router.begin_session("ABC123");
+
+        let sessions = dir.join("sessions");
+        let zips: Vec<_> = std::fs::read_dir(&sessions)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "zip"))
+            .collect();
+        assert_eq!(zips.len(), 1, "应生成恰好一个会话归档");
+        assert!(
+            zips[0].file_name().to_string_lossy().starts_with("ABC123-"),
+            "归档名应带房间码，用户说'我那次进 XXXXX 连不上'时能直接定位"
+        );
+        assert!(
+            !sessions.join(".staging-ABC123").exists(),
+            "暂存目录应在打包后清掉"
+        );
+        // 新会话必须从空文件开始
+        assert_eq!(
+            std::fs::metadata(dir.join("tunnel.log")).unwrap().len(),
+            0,
+            "新会话的日志必须是空的，否则就不是'干净无污染'"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
