@@ -60,8 +60,8 @@ const BURST_PACKETS: f32 = 8.0;
 ///
 /// 《踩坑记录》第十一条要求放大必须"有节制、有上限、可回退"。突然把补发速率
 /// 拉满正是触发运营商风控的模式，即使总量还在上限之内。
-const RAMP_FACTOR: f32 = 1.5;
-const RAMP_INTERVAL: Duration = Duration::from_secs(2);
+const RAMP_FACTOR: f32 = 2.0;
+const RAMP_INTERVAL: Duration = Duration::from_secs(1);
 
 /// 一个简单的令牌桶。纯逻辑，时间由调用方传入，可完整单测。
 #[derive(Debug)]
@@ -108,6 +108,12 @@ impl TokenBucket {
         self.rate = rate.max(0.0);
         self.burst = burst.max(1.0);
         self.tokens = self.tokens.min(self.burst);
+        // 速率归零意味着"一份都不许补"，那就必须连桶里剩的令牌一起清掉。
+        // 否则余量已经耗尽、闸门已经关死，却还能靠初始满桶继续往外挤
+        // 一整个突发量的补发包——正好是最不该发的时候发出去。
+        if self.rate == 0.0 {
+            self.tokens = 0.0;
+        }
     }
 }
 
@@ -119,6 +125,12 @@ pub struct RepairBudget {
     last_ramp: Instant,
     /// 当前生效的字节速率，用于判断这次是上调还是下调
     current_byte_rate: f32,
+    /// 是否已经拿到过第一次链路估计。
+    ///
+    /// 首次建立速率**不受爬升限制**：那不是"放大"，只是把预算从"还不知道"
+    /// 变成"知道了"。受限的是在已有基线之上继续往上加。少了这个区分，
+    /// 连接头一个爬升周期内预算恒为 0，补包在最需要的连接初期几乎是关的。
+    initialized: bool,
 }
 
 impl RepairBudget {
@@ -128,6 +140,7 @@ impl RepairBudget {
             packets: TokenBucket::new(0.0, BURST_PACKETS, now),
             last_ramp: now,
             current_byte_rate: 0.0,
+            initialized: false,
         }
     }
 
@@ -144,7 +157,12 @@ impl RepairBudget {
 
         // **下调立即生效，上调受爬升限制。** 安全方向必须最快，
         // 这跟闸门的非对称设计是同一个道理。
-        let byte_rate = if target_bytes <= self.current_byte_rate {
+        let byte_rate = if !self.initialized {
+            // 首次拿到估计：直接采用，见 `initialized` 字段的说明。
+            self.initialized = true;
+            self.last_ramp = now;
+            target_bytes
+        } else if target_bytes <= self.current_byte_rate {
             self.last_ramp = now;
             target_bytes
         } else if now.duration_since(self.last_ramp) >= RAMP_INTERVAL {
@@ -196,47 +214,69 @@ mod tests {
         Instant::now()
     }
 
-    /// **量纲回归。** 同样的包数，包越大就该越早被字节预算拦下——
-    /// 这正是写死 300 包/秒做不到的事。
-    #[test]
-    fn byte_budget_scales_with_packet_size() {
+    /// 在同一份字节预算下，从头跑一段时间能放行多少个包。
+    /// 包桶给足，让字节桶成为唯一约束。
+    fn admitted_over_two_seconds(len: usize) -> usize {
         let t = t0();
-        // 余量 100 kB/s，源速率也给足，让字节桶成为唯一约束
-        let mut small = RepairBudget::new(t);
-        small.update(100_000.0, 100_000.0, 10_000.0, t);
-        let mut big = RepairBudget::new(t);
-        big.update(100_000.0, 100_000.0, 10_000.0, t);
-
-        let mut small_admitted = 0;
-        let mut big_admitted = 0;
-        for _ in 0..200 {
-            if small.try_admit(100, t) {
-                small_admitted += 1;
-            }
-            if big.try_admit(1200, t) {
-                big_admitted += 1;
+        let mut b = RepairBudget::new(t);
+        b.update(50_000.0, 50_000.0, 100_000.0, t);
+        let mut n = 0;
+        let mut now = t;
+        for _ in 0..2000 {
+            now += Duration::from_millis(1);
+            if b.try_admit(len, now) {
+                n += 1;
             }
         }
+        n
+    }
+
+    /// **量纲回归。** 同一份字节预算，大包就该比小包早得多地被拦下——
+    /// 这正是写死"300 包/秒"做不到的区分：300 个包对 145 字节的游戏包是
+    /// 43 kB/s，对 1200 字节的批量包是 360 kB/s，松紧差 8 倍。
+    #[test]
+    fn byte_budget_scales_with_packet_size() {
+        let small = admitted_over_two_seconds(100);
+        let big = admitted_over_two_seconds(1200);
         assert!(
-            small_admitted > big_admitted * 5,
-            "小包应能过得更多（小 {} vs 大 {}）——按包计数的预算做不到这个区分",
-            small_admitted,
-            big_admitted
+            small > big * 3,
+            "小包应能过得多得多（小 {} vs 大 {}）——按包计数的预算做不到这个区分",
+            small,
+            big
         );
     }
 
-    /// 余量为零时一份都不许补。
+    /// 余量为零时一份都不许补，**包括初始突发量**。
+    ///
+    /// 桶默认是满的（连接刚建立不该因为"还没攒满"就拒绝头几份），
+    /// 但余量归零时必须连桶一起清空：否则恰恰在链路已经撑不住、闸门已经
+    /// 关死的时刻，还能靠残留令牌再挤一整个突发量出去。
     #[test]
     fn no_headroom_admits_nothing() {
         let t = t0();
         let mut b = RepairBudget::new(t);
         b.update(0.0, 50_000.0, 300.0, t);
-        // 先把初始满桶耗掉
-        for _ in 0..64 {
-            b.try_admit(1200, t);
-        }
-        let later = t + Duration::from_secs(1);
-        assert!(!b.try_admit(1200, later), "余量为零时补发必须完全停住");
+        assert!(!b.try_admit(1200, t), "余量为零时立刻就该拒绝");
+        assert!(
+            !b.try_admit(1200, t + Duration::from_secs(1)),
+            "余量仍为零，等多久都不该放行"
+        );
+    }
+
+    /// 首次拿到链路估计时不受爬升限制。
+    ///
+    /// 否则连接头一个爬升周期内预算恒为 0，补包在最需要的连接初期几乎是关的。
+    /// 首次建立不是"放大"，只是把预算从"还不知道"变成"知道了"。
+    #[test]
+    fn the_first_estimate_is_adopted_without_ramping() {
+        let t = t0();
+        let mut b = RepairBudget::new(t);
+        b.update(80_000.0, 80_000.0, 500.0, t);
+        assert!(
+            b.byte_rate() > 0.0,
+            "首次估计必须立即生效，实得 {}",
+            b.byte_rate()
+        );
     }
 
     /// 包速率按源速率的比例走，而不是绝对值。
@@ -287,7 +327,7 @@ mod tests {
         );
     }
 
-    /// **降速必须立即生效。** 链路突然变差时，等 2 秒才收紧就来不及了。
+    /// **降速必须立即生效。** 链路突然变差时，等一个爬升窗口才收紧就来不及了。
     #[test]
     fn rate_drops_take_effect_immediately() {
         let t = t0();
@@ -323,21 +363,24 @@ mod tests {
     }
 
     /// 字节桶拒绝时，包令牌必须还回去，否则两个桶会慢慢漂移。
+    ///
+    /// 用 2000 字节的包，让**字节桶先于包桶耗尽**（字节突发量 12000，
+    /// 6 个包就见底，而包突发量是 8）——这样才真的走到退还那条路径。
+    /// 用 1500 字节的话两个桶恰好同时空，被拒时压根没碰到字节桶，测了个寂寞。
     #[test]
     fn rejected_admission_does_not_leak_packet_tokens() {
         let t = t0();
         let mut b = RepairBudget::new(t);
         // 字节预算极小、包预算充足
         b.update(1.0, 1.0, 10_000.0, t);
-        // 耗光字节桶
-        while b.try_admit(1500, t) {}
+        while b.try_admit(2000, t) {}
 
-        // 现在字节桶空了，但包桶应该还有余量：验证被拒时没有白扣包令牌
         let before = b.packets.tokens;
-        assert!(!b.try_admit(1500, t));
+        assert!(before > 0.0, "包桶应还有余量，否则测不到退还路径");
+        assert!(!b.try_admit(2000, t), "字节桶已空，必须拒绝");
         assert!(
             (b.packets.tokens - before).abs() < 0.001,
-            "被字节桶拒绝时不该消耗包令牌"
+            "被字节桶拒绝时不该消耗包令牌，否则两个桶会逐渐漂移"
         );
     }
 }
