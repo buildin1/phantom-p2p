@@ -542,8 +542,7 @@ impl PeerForwarder {
                     let len = entry.bytes.len();
                     // 跟主动冗余同一道闸：重传包也不能挤掉还没发出去的原包。
                     if !self.repair_has_room(len) {
-                        self.repair_skipped_no_space
-                            .fetch_add(1, Ordering::Relaxed);
+                        self.repair_skipped_no_space.fetch_add(1, Ordering::Relaxed);
                         debug!("[TUN] 发送队列无余量，放弃重传 counter={}", counter);
                         continue;
                     }
@@ -769,9 +768,11 @@ impl PeerForwarder {
         // 而且我们顺带拿到一个精确的自挤占计数器——这个数非零就直接证明
         // "我们自己是丢包来源"，不需要任何推断或对端往返。
         if self.conn.datagram_send_buffer_space() < len {
-            self.orig_dropped_queue_full
-                .fetch_add(1, Ordering::Relaxed);
-            debug!("[TUN] 发送队列已满，丢弃原包 counter={} bytes={}", counter, len);
+            self.orig_dropped_queue_full.fetch_add(1, Ordering::Relaxed);
+            debug!(
+                "[TUN] 发送队列已满，丢弃原包 counter={} bytes={}",
+                counter, len
+            );
             return false;
         }
 
@@ -829,7 +830,9 @@ impl PeerForwarder {
                         // 预算管的是"发太多会不会触发运营商风控"，这一条管的是
                         // "这一份会不会直接害死一个原包"，后者更硬。
                         if !forwarder.repair_has_room(len) {
-                            forwarder.repair_skipped_no_space.fetch_add(1, Ordering::Relaxed);
+                            forwarder
+                                .repair_skipped_no_space
+                                .fetch_add(1, Ordering::Relaxed);
                             debug!(
                                 "[TUN] 发送队列无余量，放弃剩余冗余份 counter={} copy={}/{}",
                                 counter,
