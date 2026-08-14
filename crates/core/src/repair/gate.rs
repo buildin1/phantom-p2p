@@ -216,6 +216,9 @@ impl GateController {
             return self.state;
         }
 
+        // 驻留期从**第一次观测到干净的那一刻**起算，不是从关闸那一刻。
+        // 采样是离散的，关闸和下一次干净采样之间链路究竟何时恢复无从得知，
+        // 按观测时刻起算是保守的那一侧（宁可晚放开）。
         let clean_since = *self.clean_since.get_or_insert(now);
         if obs.is_cautious() {
             self.calm_since = None;
@@ -328,34 +331,30 @@ mod tests {
     }
 
     /// 恢复必须是分级的、慢的。刚喘一口气就满血加码，只会在拥塞边缘反复横跳。
+    ///
+    /// 注意驻留期的起点是**第一次观测到干净的那一刻**，不是关闸那一刻——
+    /// 采样是离散的（50ms 一次），关闸和下一次干净采样之间链路到底什么时候
+    /// 恢复的，我们并不知道。按观测到的时刻起算是保守的那一侧。
     #[test]
     fn gate_requires_full_dwell_before_reopening() {
         let t = Instant::now();
+        let ms = Duration::from_millis;
+        let clean = Observation::clean();
         let mut g = GateController::new();
         g.step(&congested(), t);
         assert_eq!(g.state(), Gate::Closed);
 
-        // 还没到 500ms：仍然关着
-        assert_eq!(
-            g.step(&Observation::clean(), t + Duration::from_millis(400)),
-            Gate::Closed
-        );
-        // 满 500ms：升到 Throttled，但只允许 1 份
-        assert_eq!(
-            g.step(&Observation::clean(), t + Duration::from_millis(500)),
-            Gate::Throttled
-        );
+        // t+400 第一次看到干净：驻留期从这里开始计时，本次仍然关着
+        assert_eq!(g.step(&clean, t + ms(400)), Gate::Closed);
+        // 距起点才 400ms，不够
+        assert_eq!(g.step(&clean, t + ms(800)), Gate::Closed);
+        // 距起点满 500ms：升到 Throttled，但只允许 1 份
+        assert_eq!(g.step(&clean, t + ms(900)), Gate::Throttled);
         assert_eq!(Gate::Throttled.max_extra_copies(), 1);
-        // 再等不满 2 秒：还不能到 Open
-        assert_eq!(
-            g.step(&Observation::clean(), t + Duration::from_millis(2000)),
-            Gate::Throttled
-        );
-        // 从"平静"起算满 2 秒才放开
-        assert_eq!(
-            g.step(&Observation::clean(), t + Duration::from_millis(2600)),
-            Gate::Open
-        );
+        // 距平静起点不满 2 秒：还不能到 Open
+        assert_eq!(g.step(&clean, t + ms(2000)), Gate::Throttled);
+        // 满 2 秒才放开
+        assert_eq!(g.step(&clean, t + ms(2400)), Gate::Open);
     }
 
     /// 任何 trip 都要把状态一路打回 Closed，不是逐级下降。
@@ -406,19 +405,28 @@ mod tests {
     #[test]
     fn caution_holds_the_gate_at_throttled() {
         let t = Instant::now();
+        let ms = Duration::from_millis;
+        let clean = Observation::clean();
         let mut g = GateController::new();
         g.step(&congested(), t);
-        g.step(&Observation::clean(), t + Duration::from_millis(500));
-        assert_eq!(g.state(), Gate::Throttled);
+        // 驻留期从第一次看到干净（t+500）起算，满 500ms 后升到 Throttled
+        g.step(&clean, t + ms(500));
+        assert_eq!(g.step(&clean, t + ms(1000)), Gate::Throttled);
 
-        // 持续有轻微拥塞迹象：即使过了很久也停在 Throttled
+        // 此后持续有轻微拥塞迹象：即使过很久也只能停在 Throttled，
+        // 不能一路升到 Open——占用率 0.15 说明队列一直有存货。
         let cautious = Observation {
             occupancy: 0.15,
             ..Observation::clean()
         };
         for i in 1..100 {
-            let now = t + Duration::from_millis(500 + i * 50);
-            assert_eq!(g.step(&cautious, now), Gate::Throttled);
+            let now = t + ms(1000 + i * 50);
+            assert_eq!(
+                g.step(&cautious, now),
+                Gate::Throttled,
+                "第 {} 次采样仍有谨慎信号，不该升到 Open",
+                i
+            );
         }
     }
 
