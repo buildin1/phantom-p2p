@@ -195,13 +195,13 @@ jobs:
     name: macOS ${{ matrix.arch }}
     # dev 分支现在也构建 macOS，但**只出 arm64**：验证分支要的是"几分钟拿到能实测的
     # 产物"，Intel 那台 runner 纯属陪跑。全平台仍然留到进 main / 打正式版 tag。
-    if: ${{ needs.meta.outputs.kind != 'test' && (github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || startsWith(inputs.platform, 'macos-')) }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || startsWith(inputs.platform, 'macos-') }}
     runs-on: ${{ matrix.runner }}
     needs: [checks, meta]
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(github.ref == 'refs/heads/dev' && '[{"arch":"arm64","target":"aarch64-apple-darwin","runner":"macos-15"}]' || (github.event_name != 'workflow_dispatch' || inputs.platform == 'all') && '[{"arch":"x64","target":"x86_64-apple-darwin","runner":"macos-15-intel"},{"arch":"arm64","target":"aarch64-apple-darwin","runner":"macos-15"}]' || inputs.platform == 'macos-x64' && '[{"arch":"x64","target":"x86_64-apple-darwin","runner":"macos-15-intel"}]' || '[{"arch":"arm64","target":"aarch64-apple-darwin","runner":"macos-15"}]') }}
+        include: ${{ fromJSON((github.ref == 'refs/heads/dev' || needs.meta.outputs.kind == 'test') && '[{"arch":"arm64","target":"aarch64-apple-darwin","runner":"macos-15"}]' || (github.event_name != 'workflow_dispatch' || inputs.platform == 'all') && '[{"arch":"x64","target":"x86_64-apple-darwin","runner":"macos-15-intel"},{"arch":"arm64","target":"aarch64-apple-darwin","runner":"macos-15"}]' || inputs.platform == 'macos-x64' && '[{"arch":"x64","target":"x86_64-apple-darwin","runner":"macos-15-intel"}]' || '[{"arch":"arm64","target":"aarch64-apple-darwin","runner":"macos-15"}]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -335,6 +335,8 @@ jobs:
       - uses: actions/download-artifact@v4
         with: { name: phantom-p2p-windows-x64, path: dist/windows-x64 }
       - uses: actions/download-artifact@v4
+        with: { name: phantom-p2p-macos-arm64, path: dist/macos-arm64 }
+      - uses: actions/download-artifact@v4
         with: { name: phantom-p2p-windows-arm64, path: dist/windows-arm64 }
       - uses: actions/download-artifact@v4
         with: { name: phantom-p2p-macos-x64, path: dist/macos-x64 }
@@ -425,7 +427,7 @@ jobs:
   release-test:
     name: Publish Test Build
     if: ${{ needs.meta.outputs.kind == 'test' }}
-    needs: [meta, windows-x64]
+    needs: [meta, windows-x64, macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -459,6 +461,11 @@ jobs:
 
           stage dist/windows-x64 '*setup.exe'        "PhantomP2P_${VERSION}_x64-setup.exe"
           stage dist/windows-x64 'phantom-server.exe' phantom-server-x64.exe
+          # 测试版同时发 macOS arm64：实测就是在这两个平台之间做的，
+          # 只发一个平台的话另一端只能去 Actions 页面翻 artifact。
+          stage dist/macos-arm64 '*.dmg'          "PhantomP2P_${VERSION}_macos-arm.dmg"
+          stage dist/macos-arm64 'phantom-server' phantom-server-macos-arm
+          chmod +x assets/phantom-server-macos-arm
 
           echo "=== 待发布资产 ==="
           ls -la assets/
