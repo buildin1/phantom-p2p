@@ -30,12 +30,19 @@ use tracing::{debug, info, warn};
 /// （实测能到 1 秒量级），冗余份跟原包一起被团灭，反倒是 Minecraft 这类
 /// 游戏里报的"reset"的直接原因。
 ///
-/// 调小到 128KB（约 100+ 个满载包的余量）：让超出实际链路承载能力的部分
-/// 更早、更小批量地被 quinn 自己按"新包挤掉旧包"的规则丢弃（见
-/// `TransportConfig::datagram_send_buffer_size` 文档），而不是攒成一个大包
-/// 之后被拥塞控制一次性团灭——这样每次真正需要补的量小得多，也终于落在
-/// 我们补包机制的设计前提（应对短暂、小规模丢包）之内。
-const DATAGRAM_SEND_BUFFER_BYTES: usize = 128 * 1024;
+/// 从 1MB 调到 128KB 之后仍然太大，现在定在 **32KB**。
+///
+/// 队列深度的正确量纲是**时间**，不是字节。128KB 在一条 3 Mbps 的链路上是
+/// **340ms 的站队延迟**——是内层 TCP（RACK-TLP）55ms 自愈预算的 6 倍多，
+/// 光靠这一项就足以让游戏体感崩掉，补包机制再怎么调都救不回来。
+/// 合理目标是大约一个 BDP：3 Mbps × 45ms ≈ 17KB。取 32KB（约 27 个满载包）
+/// 留出突发余量，对应约 85ms 站队上限。
+///
+/// 配套改动见 `tun_bridge.rs` 的 `try_forward`：原包在入队前自查
+/// `datagram_send_buffer_space()`，队列满就丢**当前这个**包，把 quinn 默认的
+/// "丢最旧"换成"丢最新"。丢最旧会把马上要发出去的包丢掉，最大化通过包的延迟，
+/// 并摧毁内层 TCP 的 RTT 采样。
+const DATAGRAM_SEND_BUFFER_BYTES: usize = 32 * 1024;
 
 /// 生成自签名 TLS 证书，返回 (cert_der, key_der)
 fn generate_self_signed_cert() -> Result<(Vec<u8>, Vec<u8>), String> {

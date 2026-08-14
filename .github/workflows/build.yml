@@ -2,9 +2,11 @@ name: Build PhantomP2P
 
 on:
   push:
-    # dev 是验证分支：只构建 Windows x64（客户端 + 服务端），一轮几分钟就能拿到
-    # 可实测的产物。跨平台构建留到进 main 之后——本地无法交叉编译，改动的正确性
-    # 只能靠真机验证，先在一个平台上确认能用，比每次等全平台构建高效得多。
+    # dev 是验证分支：只构建 Windows x64 + macOS arm64（客户端 + 服务端），
+    # 一轮几分钟就能拿到可实测的产物。这两个平台覆盖了实际测试用的两台机器。
+    # 其余平台（Windows ARM64 / macOS x64 / Linux）留到进 main 之后——本地无法
+    # 交叉编译，改动的正确性只能靠真机验证，先在实际会跑的平台上确认能用，
+    # 比每次等全平台构建高效得多。
     branches: [main, dev]
     # 打 v* 标签触发发布：构建全部平台并自动发 GitHub Release
     tags: ['v*']
@@ -191,13 +193,15 @@ jobs:
 
   macos:
     name: macOS ${{ matrix.arch }}
-    if: ${{ github.ref != 'refs/heads/dev' && needs.meta.outputs.kind != 'test' && (github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || startsWith(inputs.platform, 'macos-')) }}
+    # dev 分支现在也构建 macOS，但**只出 arm64**：验证分支要的是"几分钟拿到能实测的
+    # 产物"，Intel 那台 runner 纯属陪跑。全平台仍然留到进 main / 打正式版 tag。
+    if: ${{ needs.meta.outputs.kind != 'test' && (github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || startsWith(inputs.platform, 'macos-')) }}
     runs-on: ${{ matrix.runner }}
     needs: [checks, meta]
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON((github.event_name != 'workflow_dispatch' || inputs.platform == 'all') && '[{"arch":"x64","target":"x86_64-apple-darwin","runner":"macos-15-intel"},{"arch":"arm64","target":"aarch64-apple-darwin","runner":"macos-15"}]' || inputs.platform == 'macos-x64' && '[{"arch":"x64","target":"x86_64-apple-darwin","runner":"macos-15-intel"}]' || '[{"arch":"arm64","target":"aarch64-apple-darwin","runner":"macos-15"}]') }}
+        include: ${{ fromJSON(github.ref == 'refs/heads/dev' && '[{"arch":"arm64","target":"aarch64-apple-darwin","runner":"macos-15"}]' || (github.event_name != 'workflow_dispatch' || inputs.platform == 'all') && '[{"arch":"x64","target":"x86_64-apple-darwin","runner":"macos-15-intel"},{"arch":"arm64","target":"aarch64-apple-darwin","runner":"macos-15"}]' || inputs.platform == 'macos-x64' && '[{"arch":"x64","target":"x86_64-apple-darwin","runner":"macos-15-intel"}]' || '[{"arch":"arm64","target":"aarch64-apple-darwin","runner":"macos-15"}]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
