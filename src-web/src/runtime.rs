@@ -947,6 +947,10 @@ impl HeadlessRuntime {
     }
 
     async fn create_room(&self) -> Result<(), String> {
+        // 一次连接一份干净日志：把上一段会话归档，从空文件重新开始。
+        // headless 端更需要这个——服务器上跑的会话往往一开就是几天，
+        // 日志混在一起之后排障几乎无从下手。
+        phantom_core::logging::begin_session("host");
         self.reset_room().await;
         self.stats.set_host_mode(true);
         self.state.lock().await.is_host = true;
@@ -954,6 +958,8 @@ impl HeadlessRuntime {
     }
 
     async fn join_room(&self, room_code: String) -> Result<(), String> {
+        // 用房间码命名归档，理由同 `create_room`。
+        phantom_core::logging::begin_session(&room_code);
         self.reset_room().await;
         self.stats.set_host_mode(false);
         self.signal

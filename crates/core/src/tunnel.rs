@@ -3,6 +3,7 @@
 //! 将本地 TCP 连接通过 QUIC 流隧穿到对端。
 //! 支持 P2P 直连和中继模式（底层 QUIC 连接不同，上层逻辑一致）。
 
+use crate::network;
 use crate::stats::StatsManager;
 use crate::tun_bridge::TunBridge;
 use std::collections::HashMap;
@@ -29,12 +30,31 @@ use tracing::{debug, info, warn};
 /// （实测能到 1 秒量级），冗余份跟原包一起被团灭，反倒是 Minecraft 这类
 /// 游戏里报的"reset"的直接原因。
 ///
-/// 调小到 128KB（约 100+ 个满载包的余量）：让超出实际链路承载能力的部分
-/// 更早、更小批量地被 quinn 自己按"新包挤掉旧包"的规则丢弃（见
-/// `TransportConfig::datagram_send_buffer_size` 文档），而不是攒成一个大包
-/// 之后被拥塞控制一次性团灭——这样每次真正需要补的量小得多，也终于落在
-/// 我们补包机制的设计前提（应对短暂、小规模丢包）之内。
-const DATAGRAM_SEND_BUFFER_BYTES: usize = 128 * 1024;
+/// 从 1MB → 128KB → 32KB 之后**又调回 96KB**，因为 32KB 收得过头了。
+///
+/// 队列深度的正确量纲是**时间**，不是字节：128KB 在一条 3 Mbps 的链路上是
+/// 340ms 站队延迟，是内层 TCP（RACK-TLP）55ms 自愈预算的 6 倍多。
+/// 当时按"大约一个 BDP"取了 32KB。
+///
+/// 但实测数据推翻了那个取值的前提。同一条链路上：
+///
+/// * `cwnd` 稳定在 **327KB**——拥塞控制器认为网络能容纳的量是我们队列的 10 倍
+/// * 排队延迟梯度实测只有 **4~19ms**，站队根本不是问题
+/// * 而本端因为队列装不下，一个会话里主动丢了 **79 个原包**
+///
+/// 也就是说 32KB 之后，**瓶颈从网络挪到了我们自己的队列上**，丢的包全是自己
+/// 勒出来的，还得靠内层 TCP 重传补回去。当初怕的"攒满再炸"由**尾丢**解决
+/// （见下），不需要靠把队列压到极小来防。
+///
+/// 96KB ≈ 81 个满载包，在实测的 1.7 MB/s 链路上约 55ms 站队上限——正好落在
+/// 内层 TCP 自愈预算之内，同时能吃下 host 卡顿后一次性吐出的整批数据。
+///
+/// 配套改动见 `tun_bridge.rs` 的 `try_forward`：原包在入队前自查
+/// `datagram_send_buffer_space()`，队列满就丢**当前这个**包，把 quinn 默认的
+/// "丢最旧"换成"丢最新"。丢最旧会把马上要发出去的包丢掉，最大化通过包的延迟，
+/// 并摧毁内层 TCP 的 RTT 采样。**这一条才是解决"攒满再炸"的机制**，
+/// 队列大小只负责决定能吸收多大的突发。
+pub const DATAGRAM_SEND_BUFFER_BYTES: usize = 96 * 1024;
 
 /// 生成自签名 TLS 证书，返回 (cert_der, key_der)
 fn generate_self_signed_cert() -> Result<(Vec<u8>, Vec<u8>), String> {
@@ -587,6 +607,7 @@ pub async fn connect_relay_quic_host(
     // 创建新的 UDP socket
     let socket = std::net::UdpSocket::bind("0.0.0.0:0")
         .map_err(|e| format!("绑定 UDP socket 失败: {}", e))?;
+    network::tune_udp_socket(&socket);
 
     let client_config = build_relay_client_config()?;
     let runtime = quinn::default_runtime().ok_or("无法获取 quinn 运行时")?;
@@ -658,6 +679,7 @@ pub async fn connect_relay_quic_guest(
     // 创建新的 UDP socket
     let socket = std::net::UdpSocket::bind("0.0.0.0:0")
         .map_err(|e| format!("绑定 UDP socket 失败: {}", e))?;
+    network::tune_udp_socket(&socket);
 
     let client_config = build_relay_client_config()?;
     let runtime = quinn::default_runtime().ok_or("无法获取 quinn 运行时")?;
@@ -947,6 +969,7 @@ pub async fn preconnect_relay_quic_guest(
 ) -> Result<quinn::Connection, String> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0")
         .map_err(|e| format!("绑定 UDP socket 失败: {}", e))?;
+    network::tune_udp_socket(&socket);
 
     let client_config = build_relay_client_config()?;
     let runtime = quinn::default_runtime().ok_or("无法获取 quinn 运行时")?;
@@ -1001,6 +1024,7 @@ pub async fn preconnect_relay_quic_host(
 ) -> Result<quinn::Connection, String> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0")
         .map_err(|e| format!("绑定 UDP socket 失败: {}", e))?;
+    network::tune_udp_socket(&socket);
 
     let client_config = build_relay_client_config()?;
     let runtime = quinn::default_runtime().ok_or("无法获取 quinn 运行时")?;

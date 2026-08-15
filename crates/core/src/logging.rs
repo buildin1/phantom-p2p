@@ -34,7 +34,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 
 /// 单个日志文件的大小上限；超过即轮转
@@ -99,24 +99,75 @@ impl RollingFile {
     }
 }
 
-impl Write for RollingFile {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if self.written >= MAX_FILE_BYTES {
-            self.rotate();
+impl RollingFile {
+    /// 把当前这个日志文件整体移进 `dest_dir`，然后开一个全新的空文件。
+    ///
+    /// 用途是"每次进/重进房间 = 一份干净日志"（见 [`LogRouter::begin_session`]）。
+    /// 沿用 [`Self::rotate`] 同一套顺序：**先丢掉文件句柄再改名，改完重新打开**——
+    /// Windows 上带着打开的句柄去 rename 会直接失败，这个顺序不能动。
+    fn move_to(&mut self, dest_dir: &Path) {
+        self.file = None;
+        let _ = std::fs::create_dir_all(dest_dir);
+        let _ = std::fs::rename(self.path(), dest_dir.join(format!("{}.log", self.stem)));
+        // `open()` 会重新统计文件大小；文件刚被移走，这里自然归零。
+        self.open();
+    }
+}
+
+/// 可共享的 [`RollingFile`]。
+///
+/// `tracing_appender::non_blocking` 会拿走写入器的所有权并搬进后台线程，
+/// 所以想在外部（换房间时）主动触发一次整体轮转，就必须让写入端和控制端
+/// 共享同一份状态。
+#[derive(Clone)]
+struct SharedRollingFile(Arc<Mutex<RollingFile>>);
+
+impl SharedRollingFile {
+    fn new(dir: &Path, stem: &str) -> Self {
+        Self(Arc::new(Mutex::new(RollingFile::new(dir, stem))))
+    }
+
+    fn move_to(&self, dest_dir: &Path) {
+        if let Ok(mut f) = self.0.lock() {
+            f.move_to(dest_dir);
         }
-        match self.file.as_mut() {
-            Some(f) => {
-                let n = f.write(buf)?;
-                self.written += n as u64;
-                Ok(n)
+    }
+}
+
+impl Write for SharedRollingFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // 锁中毒也要继续写：日志写不进去绝不能拖垮业务。
+        let mut f = match self.0.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        if f.written >= MAX_FILE_BYTES {
+            f.rotate();
+        }
+        let written = match f.file.as_mut() {
+            Some(file) => {
+                let n = file.write(buf)?;
+                Some(n)
             }
             // 打不开文件时静默丢弃：日志写不进去绝不能拖垮业务
+            None => None,
+        };
+        match written {
+            Some(n) => {
+                f.written += n as u64;
+                Ok(n)
+            }
             None => Ok(buf.len()),
         }
     }
+
     fn flush(&mut self) -> io::Result<()> {
-        match self.file.as_mut() {
-            Some(f) => f.flush(),
+        let mut f = match self.0.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        match f.file.as_mut() {
+            Some(file) => file.flush(),
             None => Ok(()),
         }
     }
@@ -133,6 +184,10 @@ struct RouterInner {
     signal: NonBlocking,
     tunnel: NonBlocking,
     app: NonBlocking,
+    /// 日志目录，`begin_session` 要用它定位归档位置。
+    dir: PathBuf,
+    /// 四个滚动文件的共享句柄，供 [`LogRouter::begin_session`] 整体轮转。
+    files: Vec<SharedRollingFile>,
     /// 模板 → (首次出现时刻, 已折叠条数)
     dedup: HashMap<String, (Instant, u32)>,
     /// 只用来延续后台落盘线程的生命周期，本身不读不写。
@@ -150,22 +205,153 @@ struct RouterInner {
 impl LogRouter {
     pub fn new(dir: &Path) -> io::Result<Self> {
         std::fs::create_dir_all(dir)?;
-        let (ice, ice_guard) = tracing_appender::non_blocking(RollingFile::new(dir, "ice"));
-        let (signal, signal_guard) =
-            tracing_appender::non_blocking(RollingFile::new(dir, "signal"));
-        let (tunnel, tunnel_guard) =
-            tracing_appender::non_blocking(RollingFile::new(dir, "tunnel"));
-        let (app, app_guard) = tracing_appender::non_blocking(RollingFile::new(dir, "app"));
+        let ice_file = SharedRollingFile::new(dir, "ice");
+        let signal_file = SharedRollingFile::new(dir, "signal");
+        let tunnel_file = SharedRollingFile::new(dir, "tunnel");
+        let app_file = SharedRollingFile::new(dir, "app");
+        let (ice, ice_guard) = tracing_appender::non_blocking(ice_file.clone());
+        let (signal, signal_guard) = tracing_appender::non_blocking(signal_file.clone());
+        let (tunnel, tunnel_guard) = tracing_appender::non_blocking(tunnel_file.clone());
+        let (app, app_guard) = tracing_appender::non_blocking(app_file.clone());
         Ok(Self {
             inner: Arc::new(Mutex::new(RouterInner {
                 ice,
                 signal,
                 tunnel,
                 app,
+                dir: dir.to_path_buf(),
+                files: vec![ice_file, signal_file, tunnel_file, app_file],
                 dedup: HashMap::new(),
                 _guards: vec![ice_guard, signal_guard, tunnel_guard, app_guard],
             })),
         })
+    }
+
+    /// 开启一段新的日志会话：把当前四个日志文件打包成一个 zip 收进
+    /// `log/sessions/`，然后从空文件重新开始。
+    ///
+    /// **每次创建/加入/重连房间都应该调一次。** 排障时最费时间的一步往往是
+    /// "从一个混了七八次连接的大文件里，找出出问题的那一次"——这次 macOS 的
+    /// 几轮排查全都卡在这上面。一次连接一份干净日志之后，
+    /// `sessions/` 下按时间排开的每个 zip 就直接对应用户说的"我那次连不上"。
+    ///
+    /// 用户永远不会自己去找日志，所以这里不需要任何用户操作：
+    /// 打包、命名、按量淘汰全自动，需要时由 [`crate::log_upload`] 直接上传。
+    ///
+    /// `label` 通常是房间码；会被清洗成文件名安全的形式。失败只记不抛——
+    /// 日志归档失败绝不能影响进房间。
+    pub fn begin_session(&self, label: &str) {
+        let (dir, files) = {
+            let inner = match self.inner.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            (inner.dir.clone(), inner.files.clone())
+        };
+
+        let safe: String = label
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .take(32)
+            .collect();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let sessions = dir.join("sessions");
+        let staging = sessions.join(format!(".staging-{}-{}", safe, stamp));
+
+        // 把四个文件整体搬进暂存目录，随后立刻拿到全新的空日志文件。
+        let mut moved_any = false;
+        for f in &files {
+            f.move_to(&staging);
+            moved_any = true;
+        }
+        if !moved_any {
+            return;
+        }
+
+        // 暂存目录里若全是空文件就没有归档价值，直接删掉。
+        let has_content = std::fs::read_dir(&staging)
+            .map(|rd| {
+                rd.flatten()
+                    .any(|e| e.metadata().map(|m| m.len() > 0).unwrap_or(false))
+            })
+            .unwrap_or(false);
+        if !has_content {
+            let _ = std::fs::remove_dir_all(&staging);
+            return;
+        }
+
+        let zip_path = sessions.join(format!("{}-{}.zip", safe, stamp));
+        if let Err(e) = zip_dir(&staging, &zip_path) {
+            // 打包失败就把原始文件留在暂存目录里，至少不丢数据。
+            eprintln!("[日志] 会话归档失败: {}", e);
+            return;
+        }
+        let _ = std::fs::remove_dir_all(&staging);
+        prune_sessions(&sessions);
+    }
+}
+
+/// 会话归档最多保留的份数
+const MAX_SESSION_ARCHIVES: usize = 20;
+/// 会话归档目录的总体积上限
+const MAX_SESSION_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
+
+/// 把一个目录下的文件打成 zip。
+fn zip_dir(src: &Path, dest: &Path) -> Result<(), String> {
+    let entries: Vec<PathBuf> = std::fs::read_dir(src)
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect();
+    if entries.is_empty() {
+        return Err("没有可归档的文件".into());
+    }
+    let file = File::create(dest).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipWriter::new(file);
+    let opts: zip::write::FileOptions<()> =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    for path in entries {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown.log".into());
+        let data = std::fs::read(&path).map_err(|e| e.to_string())?;
+        zip.start_file(name, opts).map_err(|e| e.to_string())?;
+        zip.write_all(&data).map_err(|e| e.to_string())?;
+    }
+    zip.finish().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 按份数和总体积双上限淘汰最旧的会话归档。
+///
+/// 双上限是因为两种失控形态都真实存在：短时间反复重连会撞份数上限，
+/// 一次长时间高流量联机会撞体积上限。
+fn prune_sessions(sessions: &Path) {
+    let mut zips: Vec<(PathBuf, u64, SystemTime)> = match std::fs::read_dir(sessions) {
+        Ok(rd) => rd
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "zip"))
+            .filter_map(|e| {
+                let md = e.metadata().ok()?;
+                Some((e.path(), md.len(), md.modified().ok()?))
+            })
+            .collect(),
+        Err(_) => return,
+    };
+    // 新的在前
+    zips.sort_by(|a, b| b.2.cmp(&a.2));
+
+    let mut total = 0u64;
+    for (idx, (path, size, _)) in zips.iter().enumerate() {
+        total += size;
+        if idx >= MAX_SESSION_ARCHIVES || total > MAX_SESSION_ARCHIVE_BYTES {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -328,7 +514,24 @@ pub fn init(log_dir: &Path, dev_mode: bool) -> Result<LogRouter, String> {
         .with(files)
         .init();
 
+    let _ = ROUTER.set(router.clone());
     Ok(router)
+}
+
+/// 进程内唯一的日志路由器。
+///
+/// [`init`] 的返回值在两个调用端（Tauri 客户端、headless 客户端）都被丢弃了，
+/// 而按房间轮转日志需要在"进房间"那一刻拿到它。与其把句柄一路穿过各自的
+/// 状态容器，不如在这里存一份——日志本来就是全进程唯一的设施。
+static ROUTER: std::sync::OnceLock<LogRouter> = std::sync::OnceLock::new();
+
+/// 开启一段新的日志会话，见 [`LogRouter::begin_session`]。
+///
+/// 每次创建/加入/重连房间调一次。日志系统还没初始化时静默跳过。
+pub fn begin_session(label: &str) {
+    if let Some(r) = ROUTER.get() {
+        r.begin_session(label);
+    }
 }
 
 /// 把 tracing 事件格式化成一行并交给 [`LogRouter`] 分流
@@ -500,16 +703,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let mut rf = RollingFile::new(&dir, "t");
-        rf.written = MAX_FILE_BYTES; // 强制触发轮转
-        rf.write_all(b"after-rotate\n").unwrap();
-        rf.flush().unwrap();
+        let rf = SharedRollingFile::new(&dir, "t");
+        // 强制触发轮转
+        rf.0.lock().unwrap().written = MAX_FILE_BYTES;
+        let mut w = rf.clone();
+        w.write_all(b"after-rotate\n").unwrap();
+        w.flush().unwrap();
 
         assert!(
             dir.join("archive").join("t.1.log").exists(),
             "轮转后旧文件应进入 archive"
         );
         assert!(dir.join("t.log").exists(), "轮转后应重新打开当前文件");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 换房间时整体轮转：四个日志打包成一个 zip，然后从空文件重开。
+    ///
+    /// 排障时最费时间的一步一直是"从混了七八次连接的大文件里，找出出问题的那一次"，
+    /// 这一条守住"一次连接一份干净日志"。
+    #[test]
+    fn begin_session_archives_and_starts_clean() {
+        let dir = std::env::temp_dir().join(format!("phantom-sess-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let router = LogRouter::new(&dir).unwrap();
+
+        // 直接写共享句柄，不走 `write_line`——那条路径经 `NonBlocking` 派给后台
+        // 线程落盘，什么时候真正写进文件不确定，测试会变成竞态。这里要验的是
+        // 归档与重开逻辑，不是异步写入本身。
+        {
+            let inner = router.inner.lock().unwrap();
+            let mut f = inner.files[2].clone(); // tunnel
+            f.write_all("上一段会话的内容\n".as_bytes()).unwrap();
+            f.flush().unwrap();
+        }
+
+        router.begin_session("ABC123");
+
+        let sessions = dir.join("sessions");
+        let zips: Vec<_> = std::fs::read_dir(&sessions)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "zip"))
+            .collect();
+        assert_eq!(zips.len(), 1, "应生成恰好一个会话归档");
+        assert!(
+            zips[0].file_name().to_string_lossy().starts_with("ABC123-"),
+            "归档名应带房间码，用户说'我那次进 XXXXX 连不上'时能直接定位"
+        );
+        assert!(
+            !sessions.join(".staging-ABC123").exists(),
+            "暂存目录应在打包后清掉"
+        );
+        // 新会话必须从空文件开始
+        assert_eq!(
+            std::fs::metadata(dir.join("tunnel.log")).unwrap().len(),
+            0,
+            "新会话的日志必须是空的，否则就不是'干净无污染'"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

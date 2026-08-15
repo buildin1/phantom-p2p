@@ -63,13 +63,24 @@ pub fn ice_priority_ipv6_host() -> u32 {
 // 策略 1+7: 主机候选收集（本地 IP 地址）
 // ============================================================
 
-/// 获取所有本机 IPv4 地址（排除回环和链路本地）
+/// 获取所有本机 IPv4 地址（排除回环、链路本地、以及本产品自己的 overlay 网段）
 fn get_all_local_ipv4s() -> Vec<String> {
     let mut result = Vec::new();
 
     if let Ok(interfaces) = local_ip_address::list_afinet_netifas() {
         for (name, ip) in interfaces {
-            if is_overlay_interface(&name) {
+            if let IpAddr::V4(v4) = ip {
+                // 名字过滤在 macOS 上不生效（utun 设备名由内核分配，不是
+                // 我们请求的 phantomp2p*）；退化到"网卡名是 utunN 且地址
+                // 落在 overlay 网段"兜底排除，见 network::is_overlay_adapter
+                // 同款逻辑的说明——不能只按网段过滤，会误伤用户自己就用
+                // 172.16/12 的真实局域网。
+                if is_overlay_interface(&name)
+                    || (network::is_macos_utun_name(&name) && network::is_overlay_subnet_ipv4(&v4))
+                {
+                    continue;
+                }
+            } else if is_overlay_interface(&name) {
                 continue;
             }
             if ip.is_ipv4() && !ip.is_loopback() && !ip.is_unspecified() {

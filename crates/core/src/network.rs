@@ -15,15 +15,21 @@ pub fn bind_dual_stack_udp(port: u16) -> std::io::Result<UdpSocket> {
     Ok(socket)
 }
 
-/// 调优打洞 socket。
+/// 调优一个数据面/打洞用的 UDP socket。
 ///
-/// **放大接收缓冲区**是关键：撒网策略下瞬时到达速率很高，
-/// 默认 64KB 缓冲区会在不到一秒内被填满，真正的应答包随之丢失。
+/// **放大接收缓冲区**是关键：撒网打洞策略下瞬时到达速率很高，中继/隧道的
+/// QUIC 数据面在真实游戏流量下同样如此（本产品自己的冗余补包机制还会把
+/// 吞吐再放大一截）。系统默认缓冲区通常只有几十 KB，在 macOS 上尤其小
+/// （远小于 Windows/Linux 的默认值），洪峰下会在不到一秒内被填满，真正的
+/// 包随之丢失——丢包一大，`crates/core/src/tun_bridge.rs` 里那套"拥塞时
+/// 给冗余补包踩刹车"逻辑就可能被持续触发，QUIC 连接最终被兜底关闭，表现
+/// 为游戏内"连接中断"。中继/隧道路径此前没有调用这个函数，只有打洞探测
+/// 阶段的 socket 被调过。
 ///
 /// Windows 上还必须关闭 `SIO_UDP_CONNRESET`——否则向不存在的端口发包
 /// 收到 ICMP Port Unreachable 后，**后续的 `recv_from` 会返回 `WSAECONNRESET`**
 /// 而不是正常数据，把接收路径彻底堵死。撒网场景下这几乎必然发生。
-pub fn tune_punch_socket(sock: &UdpSocket) {
+pub fn tune_udp_socket(sock: &UdpSocket) {
     const RECV_BUF: usize = 8 * 1024 * 1024;
     let s = socket2::SockRef::from(sock);
     if let Err(e) = s.set_recv_buffer_size(RECV_BUF) {
@@ -96,18 +102,47 @@ fn is_useless_ipv4_candidate(ip: &std::net::Ipv4Addr) -> bool {
     ip.is_link_local() || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
 }
 
+/// 本产品服务端分配的 overlay 网段：`172.16.0.0/12`
+/// （动态房间网段 `172.16.0.0/13` + 固定 Host 地址段 `172.24.0.0/13`，
+/// 见 `server/src/database.rs::allocate_subnet`）。
+pub fn is_overlay_subnet_ipv4(ip: &std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 172 && (16..=31).contains(&o[1])
+}
+
+/// 该网卡名是不是 macOS 内核给 utun 设备分配的名字（`utun0`、`utun4`……）。
+///
+/// [`is_overlay_interface`] 靠请求的网卡名（`phantomp2p*`）排除本产品自己
+/// 创建的 overlay 网卡，但 macOS 的 utun 设备名由内核分配，我们请求的名字
+/// 会被直接忽略——名字过滤在 macOS 上永远不命中。
+pub fn is_macos_utun_name(name: &str) -> bool {
+    name.strip_prefix("utun")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// 该 (网卡名, IPv4 地址) 是否应该被当成本产品自己的 overlay 网卡排除掉。
+///
+/// 正常靠网卡名（[`is_overlay_interface`]）就够。退化方案只在网卡名是
+/// macOS 内核分配的 `utunN`、**且**地址落在本产品的 overlay 网段时才生效
+/// ——真实局域网网卡不会叫 `utunN`，不会被误伤；`172.16/12` 里其余不是
+/// 跑在 utun 网卡上的地址（比如用户自己的路由器就用这个网段）仍然保留。
+fn is_overlay_adapter(name: &str, ip: &std::net::Ipv4Addr) -> bool {
+    is_overlay_interface(name) || (is_macos_utun_name(name) && is_overlay_subnet_ipv4(ip))
+}
+
 /// 枚举本机所有可用作候选的 IPv4 地址。
 ///
-/// 排除本产品自己的 overlay 网卡（否则会把虚拟地址当候选上报），
-/// 以及 [`is_useless_ipv4_candidate`] 判定为无效的地址。
+/// 排除本产品自己的 overlay 网卡（否则会把虚拟地址当候选上报，见
+/// [`is_overlay_adapter`]），以及 [`is_useless_ipv4_candidate`] 判定为
+/// 无效的地址。
 pub fn local_ipv4_addrs() -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     if let Ok(list) = local_ip_address::list_afinet_netifas() {
         for (name, ip) in list {
-            if is_overlay_interface(&name) {
+            let IpAddr::V4(v4) = ip else { continue };
+            if is_overlay_adapter(&name, &v4) {
                 continue;
             }
-            let IpAddr::V4(v4) = ip else { continue };
             if v4.is_loopback() || v4.is_unspecified() || is_useless_ipv4_candidate(&v4) {
                 continue;
             }

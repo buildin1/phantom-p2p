@@ -507,7 +507,7 @@ pub async fn execute(
         let _ = s.set_nonblocking(true);
         // 显式放大接收缓冲区：撒网场景下瞬时到达速率很高，
         // 默认 64KB 会在不到一秒内被填满，真正的应答包就此丢失。
-        network::tune_punch_socket(s);
+        network::tune_udp_socket(s);
     }
 
     // 打洞 socket 是 AF_INET6 双栈的，**不能直接接收 IPv4 的 sockaddr_in**——
