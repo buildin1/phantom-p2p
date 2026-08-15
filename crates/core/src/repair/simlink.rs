@@ -201,6 +201,8 @@ mod tests {
                     occupancy: 1.0 - link.free_space() as f32 / link.queue_bytes_max as f32,
                     delay_gradient: min_rtt.gradient(srtt),
                     queueing_delay: srtt.saturating_sub(rtt_min),
+                    // 模型里业务一直在推数据，等价于窗口早已长起来
+                    cwnd_grown: true,
                     headroom_bps: headroom as i64,
                     congestion_events: 0,
                 };

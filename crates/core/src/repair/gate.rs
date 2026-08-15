@@ -147,6 +147,20 @@ pub struct Observation {
     /// "这点延迟到底值不值得在意"。缺了后者，低 RTT 链路上几毫秒的正常抖动
     /// 会被比值放大成拥塞，见 [`MIN_QUEUEING_DELAY`]。
     pub queueing_delay: Duration,
+    /// 拥塞窗口是否已经长过初始窗口。
+    ///
+    /// **延迟型拥塞判据的必要前提。** 实测抓到过这种情况：`cwnd` 全程停在
+    /// quinn 的初始窗口（12000B，从未增长），链路丢包为 0，而 RTT 却从 5ms
+    /// 尖峰到 614ms，于是梯度判据一路关闸。
+    ///
+    /// 窗口没长起来说明**我们根本没在压这条链路**，排队就不可能是延迟上涨的
+    /// 解释。那些尖峰更可能来自对端机器 CPU 被饿死、ACK 处理不过来——
+    /// 延迟型判据天生分不清"网络在排队"和"对端太慢来不及回 ACK"，
+    /// 只能靠这个前提把后者排除掉。
+    ///
+    /// 后果不是理论问题：一条**真有丢包、确实需要补包**的链路上，
+    /// 如果对端机器慢，误判会关掉本该有的保护。
+    pub cwnd_grown: bool,
     /// 估计的可用带宽余量（字节/秒）。<= 0 表示业务流量已经把链路吃满。
     pub headroom_bps: i64,
     /// 距上次采样，拥塞控制器自己报了几次拥塞事件
@@ -161,6 +175,7 @@ impl Observation {
             occupancy: 0.0,
             delay_gradient: 0.0,
             queueing_delay: Duration::ZERO,
+            cwnd_grown: true,
             headroom_bps: i64::MAX,
             congestion_events: 0,
         }
@@ -171,9 +186,16 @@ impl Observation {
         // 顺序即优先级：先报最确凿的原因，日志才有诊断价值。
         if self.self_evicted {
             TripReason::SelfEvict
-        } else if self.delay_gradient > GRADIENT_TRIP && self.queueing_delay >= MIN_QUEUEING_DELAY {
-            // 比值和绝对值**都**要超标。少了绝对值这一半，低 RTT 链路上
-            // 几毫秒的正常抖动就会关闸，见 `MIN_QUEUEING_DELAY`。
+        } else if self.cwnd_grown
+            && self.delay_gradient > GRADIENT_TRIP
+            && self.queueing_delay >= MIN_QUEUEING_DELAY
+        {
+            // 三个条件**都**要成立：
+            //   * 拥塞窗口长过初始值——否则我们压根没在压链路，
+            //     延迟上涨不可能是排队造成的（见 `cwnd_grown`）
+            //   * 比值超标——相对这条链路自己算异常
+            //   * 绝对值超标——这点延迟确实值得在意（见 `MIN_QUEUEING_DELAY`）
+            // 少任何一个，延迟型判据都会在真实链路上误关闸。
             TripReason::DelayGradient
         } else if self.headroom_bps <= 0 {
             TripReason::NoHeadroom
@@ -413,7 +435,7 @@ mod tests {
         );
     }
 
-    /// 反过来：比值和绝对值都超标时必须关闸。
+    /// 反过来：三个条件都成立时必须关闸。
     #[test]
     fn real_queue_buildup_still_trips_the_gate() {
         let t = Instant::now();
@@ -421,10 +443,37 @@ mod tests {
         let obs = Observation {
             delay_gradient: 0.8,
             queueing_delay: Duration::from_millis(30),
+            cwnd_grown: true,
             ..Observation::clean()
         };
         assert_eq!(g.step(&obs, t), Gate::Closed);
         assert_eq!(g.last_reason(), TripReason::DelayGradient);
+    }
+
+    /// **拥塞窗口没长起来时，延迟尖峰不算拥塞。**
+    ///
+    /// 实测抓到过：`cwnd` 全程停在初始窗口、链路丢包为 0，而 RTT 从 5ms 尖峰到
+    /// 614ms，梯度判据一路关闸。窗口没长说明我们根本没在压链路，排队不可能是
+    /// 解释——那些尖峰更像对端机器 CPU 被饿死、ACK 回不及时。
+    ///
+    /// 这条在干净链路上只是浪费；在**真有丢包**的链路上会关掉本该有的保护。
+    #[test]
+    fn delay_spikes_without_a_grown_cwnd_are_not_congestion() {
+        let t = Instant::now();
+        let mut g = GateController::new();
+        let obs = Observation {
+            // 梯度和绝对延迟都远超阈值……
+            delay_gradient: 100.0,
+            queueing_delay: Duration::from_millis(600),
+            // ……但拥塞窗口还停在初始值
+            cwnd_grown: false,
+            ..Observation::clean()
+        };
+        assert_eq!(
+            g.step(&obs, t),
+            Gate::Open,
+            "没压过链路就谈不上排队，不该关闸"
+        );
     }
 
     /// 占用率单独不再关闸——20Hz 采样看不见亚 50ms 的突发溢出，
