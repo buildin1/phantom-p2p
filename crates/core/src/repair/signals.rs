@@ -21,7 +21,7 @@
 use super::budget::RepairBudget;
 use super::gate::{Gate, GateController, MinRttFilter, Observation, TripReason};
 use quinn::Connection;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as SyncMutex};
 use std::time::{Duration, Instant};
 
@@ -52,6 +52,14 @@ const APP_LIMITED_RATIO: f64 = 0.25;
 /// 又足以让链路真的变差之后估计值跟着下来。上一版是 0.995，一秒就掉到 90%，
 /// 是闸门被错误关死的直接原因之一。
 const BTLBW_DECAY_PER_SAMPLE: f64 = 0.999;
+
+/// QUIC 的初始拥塞窗口（字节）。
+///
+/// quinn 用的是 RFC 9002 建议的 10 个包，实测读到的就是 12000。
+/// 拥塞窗口还等于这个值，说明连接从没把链路压到需要扩窗——
+/// 此时任何延迟尖峰都不该被当成排队，见 [`Observation::cwnd_grown`]。
+/// 留一点余量用 `>` 比较，避免不同版本的初始值算法差几个字节就失效。
+const QUIC_INITIAL_WINDOW_BYTES: u64 = 12_000;
 
 /// 供热路径无锁读取的链路状态。
 ///
@@ -102,7 +110,12 @@ pub struct LinkSignals {
 
     // ── 以下仅供日志与诊断，不参与决策 ────────────────────────────
     occupancy_pct: AtomicU8,
-    gradient_pct: AtomicU8,
+    /// 排队延迟梯度 ×100。
+    ///
+    /// 用 `u16` 不是 `u8`：`u8` 会在 2.55 处饱和，而实测真实梯度轻松超过它——
+    /// 一整批 `reason=grad` 的日志全都显示 `grad=2.55`，等于把"到底多严重"
+    /// 这个关键信息抹平成一个常量，排障时完全看不出区别。
+    gradient_pct: AtomicU16,
     srtt_ms: AtomicU64,
     min_rtt_ms: AtomicU64,
     cwnd_bytes: AtomicU64,
@@ -124,7 +137,7 @@ impl LinkSignals {
             calibration: SyncMutex::new(None),
             budget: SyncMutex::new(RepairBudget::new(Instant::now())),
             occupancy_pct: AtomicU8::new(0),
-            gradient_pct: AtomicU8::new(0),
+            gradient_pct: AtomicU16::new(0),
             srtt_ms: AtomicU64::new(0),
             min_rtt_ms: AtomicU64::new(0),
             cwnd_bytes: AtomicU64::new(0),
@@ -245,15 +258,24 @@ impl LinkSignals {
     /// 是自挤占还是链路丢包。** 旧日志里那条 `[TUN] 入方向丢包 x.xx%` 对两种
     /// 成因都兼容，这正是最近几次排查都要来回好几轮的原因。
     pub fn diagnostic_line(&self) -> String {
+        let cwnd = self.cwnd_bytes.load(Ordering::Relaxed);
         format!(
-            "gate={} reason={} occ={:.2} grad={:.2} srtt={}ms rttmin={}ms cwnd={}B headroom={}B/s",
+            "gate={} reason={} occ={:.2} grad={:.2} srtt={}ms rttmin={}ms cwnd={}B{} headroom={}B/s",
             self.gate_state().as_str(),
             self.reason_str(),
             self.occupancy_pct.load(Ordering::Relaxed) as f32 / 100.0,
             self.gradient_pct.load(Ordering::Relaxed) as f32 / 100.0,
             self.srtt_ms.load(Ordering::Relaxed),
             self.min_rtt_ms.load(Ordering::Relaxed),
-            self.cwnd_bytes.load(Ordering::Relaxed),
+            cwnd,
+            // 标出"窗口还没长起来"——这种情况下延迟尖峰不代表排队，
+            // 排障时看到 `cwnd=12000B(iw)` 就知道该往对端 CPU / 调度那边找，
+            // 而不是往网络拥塞上找。
+            if cwnd <= QUIC_INITIAL_WINDOW_BYTES {
+                "(iw)"
+            } else {
+                ""
+            },
             self.headroom_bps.load(Ordering::Relaxed),
         )
     }
@@ -383,6 +405,8 @@ pub fn spawn_sampler(conn: Connection, signals: Arc<LinkSignals>, queue_capacity
                 occupancy,
                 delay_gradient: gradient,
                 queueing_delay: srtt.saturating_sub(min_rtt.get().unwrap_or(srtt)),
+                // 拥塞窗口长过初始值才算"压过链路"，见 `Observation::cwnd_grown`。
+                cwnd_grown: stats.path.cwnd > QUIC_INITIAL_WINDOW_BYTES,
                 // 还没有任何容量依据时（连接刚起、cwnd 也还没长起来）不要因为
                 // "算出来余量是 0"就误判成拥塞——那时根本谈不上容量估计。
                 headroom_bps: if capacity <= 0.0 {
@@ -423,7 +447,7 @@ pub fn spawn_sampler(conn: Connection, signals: Arc<LinkSignals>, queue_capacity
                 Ordering::Relaxed,
             );
             signals.gradient_pct.store(
-                (gradient * 100.0).clamp(0.0, 255.0) as u8,
+                (gradient * 100.0).clamp(0.0, u16::MAX as f32) as u16,
                 Ordering::Relaxed,
             );
             signals
