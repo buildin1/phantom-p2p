@@ -1,6 +1,6 @@
 [package]
 name = "phantom-core"
-version = "3.1.1"
+version = "3.2.0"
 edition = "2021"
 
 [lib]
@@ -26,6 +26,9 @@ ipnetwork = "0.20"
 socket2 = { version = "0.5", features = ["all"] }
 ureq = { version = "2", features = ["json"] }
 serde_json = "1"
+# 风控自校准库：阈值各地不同、用户无法预先测，只能在每个用户自己的环境里学，
+# 而且学到的东西必须跨会话留存。版本与服务端保持一致。
+rusqlite = { version = "0.32", features = ["bundled"] }
 # overlay 端到端加密：中继只做盲转发，永远看不到明文
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 chacha20poly1305 = "0.10"
