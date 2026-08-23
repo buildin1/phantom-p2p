@@ -1,7 +1,7 @@
 {
   "name": "phantom-p2p",
   "private": true,
-  "version": "3.2.1",
+  "version": "3.2.2",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
