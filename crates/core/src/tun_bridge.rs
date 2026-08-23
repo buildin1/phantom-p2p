@@ -439,6 +439,22 @@ struct PeerForwarder {
     /// 毫秒级的；而加码要等对端心跳上报丢包率，是秒级的。
     /// 安全攸关的方向必须最快——上一版正好反过来。
     signals: Arc<crate::repair::LinkSignals>,
+    /// 这条连接是否经由中继（按握手协商出的 ALPN 判定，见 `attach_peer`）。
+    ///
+    /// 中继链路上**主动冗余必须关死**，原因是整套刹车信号的作用域错位：
+    /// 闸门/预算读的 `conn.stats()`（RTT、cwnd、队列余量、headroom）全部只
+    /// 覆盖"本端 ↔ 中继服务器"这第一跳，而真正的拥塞点几乎总在中继的
+    /// **出向**（它还要把 Host 的每个包扇出给房间里所有 Guest）；与此同时
+    /// 加码信号（对端心跳汇报的丢包率）却是端到端的。结果就是：中继出口
+    /// 越堵 → 档位越高 → 闸门看第一跳一片健康、不刹车 → 多倍流量把中继
+    /// 挤得更死——P2P 上被本地信号切断的那个正反馈环，在中继上没有任何
+    /// 一方测得到，只能从源头上不给它成环的机会。
+    /// 《抗丢包方案设计》第一节本来就把范围定为"只做 P2P 直连，中继路径
+    /// 不动"，这里是把那条边界真正落到代码上。
+    ///
+    /// NACK 命中的定向重发**保留**：它按实际丢掉的那个包 1:1 补发、受预算
+    /// 与队列余量双重限制，不放大流量，正是重丢包中继链路最需要的形态。
+    is_relay: bool,
 }
 
 impl PeerForwarder {
@@ -460,6 +476,11 @@ impl PeerForwarder {
     }
 
     fn set_tier(&self, tier: u8) {
+        // 中继链路上档位钉死在 0：对端在中继上测到的丢包多半正是冗余流量
+        // 自己挤出来的（见 `is_relay` 字段的说明），照单加码只会成环。
+        if self.is_relay {
+            return;
+        }
         self.current_tier.store(tier, Ordering::Relaxed);
     }
 
@@ -767,8 +788,15 @@ impl PeerForwarder {
         //   2. 这条链路现在**承受得起**几份（闸门，见 `crate::repair::gate`）
         //   3. 这个包**值不值得**补（尺寸规则，见下）
         // 上一版只有第 1 个，于是链路被自己压垮时档位反而一路爬到顶。
-        let proposed =
-            effective_extra_copies(self.current_tier.load(Ordering::Relaxed), flow_specific);
+        //
+        // 中继链路上主动冗余整体关闭（含下面的 TCP 控制包保底）——刹车信号
+        // 只覆盖第一跳、看不到中继出向的拥塞，多倍发包在这里没有任何一道闸
+        // 拦得住，见 `is_relay` 字段的说明。NACK 定向重发不受影响。
+        let proposed = if self.is_relay {
+            0
+        } else {
+            effective_extra_copies(self.current_tier.load(Ordering::Relaxed), flow_specific)
+        };
 
         // 满包不补。批量传输（HTTP 下载、区块同步）几乎全是 MSS 满包，它的吞吐
         // 受带宽限制，复制等于自己抢自己的带宽，而且内层 TCP 本来就会重传；
@@ -791,15 +819,19 @@ impl PeerForwarder {
         // 丢一个 SYN 的代价是**一整秒的 RTO**——那是整个会话里最显眼的停顿，
         // 而这类包极少、极小，补一份的开销可以忽略。所以它不受尺寸规则和
         // 流分类的限制（它们本来也拦不住小包，这里是显式表达这个意图）。
-        let control_floor = Ipv4Header::from_bytes(packet)
-            .filter(|h| h.protocol == 6)
-            .and_then(|h| {
-                let header_len = ((packet[0] & 0x0f) as usize) * 4;
-                packet.get(header_len + 13).copied()
-            })
-            .filter(|flags| crate::repair::is_tcp_control(*flags))
-            .map(|_| 1u8)
-            .unwrap_or(0);
+        let control_floor = if self.is_relay {
+            0u8
+        } else {
+            Ipv4Header::from_bytes(packet)
+                .filter(|h| h.protocol == 6)
+                .and_then(|_| {
+                    let header_len = ((packet[0] & 0x0f) as usize) * 4;
+                    packet.get(header_len + 13).copied()
+                })
+                .filter(|flags| crate::repair::is_tcp_control(*flags))
+                .map(|_| 1u8)
+                .unwrap_or(0)
+        };
 
         let extra_copies = proposed
             .min(self.signals.max_extra_copies())
@@ -1059,6 +1091,16 @@ impl TunBridge {
         peer_hint: Option<Ipv4Addr>,
         stats: PeerStats,
     ) -> Result<(), TunError> {
+        // 从握手协商出的 ALPN 判定这条连接是直连还是中继（直连 `phantom-p2p`，
+        // 中继 `phantom-relay`，见 `tunnel.rs` 的三份配置）。在这里判而不是让
+        // 调用方传参，是因为静默升级等路径会拿着不同来源的连接调进来，靠人
+        // 记得传对参数迟早出错；ALPN 是连接自己带的事实，不会说谎。
+        let is_relay = conn
+            .handshake_data()
+            .and_then(|d| d.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+            .and_then(|d| d.protocol)
+            .map(|p| p == b"phantom-relay")
+            .unwrap_or(false);
         let forwarder = PeerForwarder {
             conn: conn.clone(),
             crypto,
@@ -1078,6 +1120,7 @@ impl TunBridge {
                 .map(|ip| ip.to_string())
                 .unwrap_or_else(|| conn.remote_address().to_string()),
             signals: Arc::new(crate::repair::LinkSignals::new()),
+            is_relay,
         };
         // 20Hz 采样：把 quinn 的连接状态翻译成闸门看得懂的观测量。
         // 连接关闭后任务自行退出。
@@ -1087,12 +1130,18 @@ impl TunBridge {
             crate::tunnel::DATAGRAM_SEND_BUFFER_BYTES,
         );
         tracing::info!(
-            "[TUN] 数据报通道就绪 (local={}, peer_hint={:?}, host={}, max_datagram={:?})",
+            "[TUN] 数据报通道就绪 (local={}, peer_hint={:?}, host={}, relay={}, max_datagram={:?})",
             self.my_vip,
             peer_hint,
             self.is_host,
+            is_relay,
             conn.max_datagram_size()
         );
+        if is_relay {
+            tracing::info!(
+                "[TUN] 中继链路：主动冗余已停用（刹车信号只覆盖第一跳，测不到中继出向拥塞），仅保留 NACK 定向补发"
+            );
+        }
         self.conns.lock().await.push(conn.clone());
         if let Some(ip) = peer_hint {
             self.peers.lock().await.insert(ip, forwarder.clone());

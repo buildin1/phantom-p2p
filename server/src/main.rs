@@ -1320,13 +1320,22 @@ async fn try_advance_punch(room_code: &str, guest_sid: &str, state: &SharedState
         guest_needs,
     )) = plan
     {
+        // 策略名与真实分类要一起打：任一侧探测失败（Unknown）时策略同样叫
+        // cone_to_cone，只看策略名会误以为"双方都是锥形"。detail 里带着
+        // unknown / symmetric_incremental_stepN 等第一手判定。
         info!(
-            "[打洞] 房间 {} 配对 {}↔{}: 策略 host={} guest={} (attempt={})",
+            "[打洞] 房间 {} 配对 {}↔{}: 策略 host={} guest={} | host_nat={:?}({}, base_port={}) guest_nat={:?}({}, base_port={}) (attempt={})",
             room_code,
             host_sid,
             guest_sid,
             host_strategy.as_str(),
             guest_strategy.as_str(),
+            host_profile.class,
+            host_profile.detail,
+            host_profile.base_port,
+            guest_profile.class,
+            guest_profile.detail,
+            guest_profile.base_port,
             attempt_id
         );
         let st = state.lock().await;
@@ -1858,16 +1867,24 @@ async fn handle_host_ready(session_id: &str, state: &SharedState) {
 async fn handle_join_room(session_id: &str, room_code: &str, state: &SharedState) {
     let mut st = state.lock().await;
 
-    // 检查是否已在房间中
-    if let Some(session) = st.sessions.get(session_id) {
-        if session.room_code.is_some() {
-            let _ = session.sender.send(ServerMessage::Error {
-                message: "你已经在一个房间中，请先离开当前房间".to_string(),
-            });
-            return;
-        }
-    } else {
-        return;
+    // 已在房间中：隐式先离开、再继续加入。
+    //
+    // 客户端切换房间时并不发 LeaveRoom（join_room 命令只重置本地隧道），而
+    // session.room_code 挂在 WebSocket 会话上，只有 LeaveRoom / 断线才会清。
+    // 旧实现在这里直接拒绝，于是"连过 A 房间后不重启就连不上 B、重启（新
+    // WebSocket 会话）就好了"——整个症状就是这一条造成的；而且拒绝用的是
+    // Error 而不是 JoinFailed，前端只记日志不复位状态，表现为卡在"连接中"。
+    // 对"我要加入另一个房间"这个请求，先离开旧房间本来就是唯一合理的语义。
+    let existing_room = match st.sessions.get(session_id) {
+        Some(session) => session.room_code.clone(),
+        None => return,
+    };
+    if let Some(old_code) = existing_room {
+        info!(
+            "[房间] {} 尚在房间 {}，先隐式离开再加入 {}",
+            session_id, old_code, room_code
+        );
+        do_leave_room(session_id, &mut st);
     }
 
     // 标准化配对码（转大写、去空格）

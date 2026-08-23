@@ -227,6 +227,18 @@ pub async fn start_quic_relay(bind_port: u16, registry: SharedRegistry) -> Resul
     let mut transport = quinn::TransportConfig::default();
     transport.max_concurrent_bidi_streams(4096u32.into());
     transport.keep_alive_interval(Some(Duration::from_secs(10)));
+    // 数据报发送缓冲必须和客户端（tunnel.rs 的 DATAGRAM_SEND_BUFFER_BYTES）
+    // 保持同一个量级。quinn 默认 1MB，在中继出向拥塞时表现为"攒满再一次性
+    // 大批丢弃"——原包和客户端补发的冗余份前后脚进队、一起被丢，错峰彻底
+    // 失效，这正是客户端把这个值从 1MB 压到 96KB 的原因（tunnel.rs:19-56 有
+    // 完整推导）。中继是转发路径上的第二跳，同样的道理同样成立；之前漏配，
+    // 客户端修完之后"攒满再炸"只是从第一跳挪到了这里。
+    transport.datagram_send_buffer_size(96 * 1024);
+    // 与客户端的 60s idle 对齐。之前没配走 quinn 默认值，两端对"这条连接
+    // 还活着吗"的判断不一致，掉线表现取决于哪端先放弃，排查时对不上号。
+    transport.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(Duration::from_secs(60)).expect("60s 在 VarInt 范围内"),
+    ));
     server_config.transport_config(Arc::new(transport));
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", bind_port).parse().unwrap();
@@ -525,10 +537,27 @@ async fn bridge_datagrams(
     // Guest → Host：单向转发，没有歧义。
     let gc = guest_conn.clone();
     let hc = host_conn.clone();
+    let token_g2h = token.clone();
     tokio::spawn(async move {
+        let mut dropped: u64 = 0;
         loop {
             match gc.read_datagram().await {
                 Ok(data) => {
+                    // quinn 的发送队列满时会静默丢**最旧**的包（不返回错误）——
+                    // 那是排队最久、马上要发出去的包，丢它对内层 TCP 的伤害最大
+                    // （客户端 tun_bridge 对第一跳早已改成尾丢，这里是同一个道理）。
+                    // 改为：没余量就丢**当前这个**包，并记账。之前这里既不判余量
+                    // 也不计数，中继丢包对两端完全不可见。
+                    if hc.datagram_send_buffer_space() < data.len() {
+                        dropped += 1;
+                        if dropped.is_power_of_two() || dropped % 1000 == 0 {
+                            warn!(
+                                "[中继-QUIC] token={} Guest→Host 发送队列满，累计丢弃 {}",
+                                token_g2h, dropped
+                            );
+                        }
+                        continue;
+                    }
                     if hc.send_datagram(data).is_err() {
                         break;
                     }
@@ -541,11 +570,23 @@ async fn bridge_datagrams(
     // Host → Guest：整个 token 只起一次。
     if registry.lock().await.claim_datagram_fanout(&token) {
         tokio::spawn(async move {
+            let mut dropped: u64 = 0;
             loop {
                 match host_conn.read_datagram().await {
                     Ok(data) => {
                         let guests = registry.lock().await.live_guest_bridges(&token);
                         for guest in &guests {
+                            // 同上：尾丢 + 记账，不让 quinn 静默挤掉队首的包。
+                            if guest.datagram_send_buffer_space() < data.len() {
+                                dropped += 1;
+                                if dropped.is_power_of_two() || dropped % 1000 == 0 {
+                                    warn!(
+                                        "[中继-QUIC] token={} Host→Guest 发送队列满，累计丢弃 {}",
+                                        token, dropped
+                                    );
+                                }
+                                continue;
+                            }
                             let _ = guest.send_datagram(data.clone());
                         }
                     }

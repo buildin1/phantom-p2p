@@ -1794,6 +1794,16 @@ async function setupEventListeners() {
   await listen("signal:error", (event) => {
     const payload = event.payload || {};
     addLog(`服务端错误: ${payload.message || "未知错误"}`, "ERROR", "system");
+    // 正在等待加入结果时收到 Error（而不是 JoinFailed），同样意味着这次加入
+    // 不会再有下文了——不复位的话 UI 会永远停在"连接中"。
+    if (!state.isHost && state.guest.mode === "连接中") {
+      state.guestActive = false;
+      state.roomCode = null;
+      state.guest.mode = "待连接";
+      state.guest.addr = "--";
+      resetProgress();
+      toast(`连接失败: ${payload.message || "服务端错误"}`, "error", 2200);
+    }
     refresh();
   });
 

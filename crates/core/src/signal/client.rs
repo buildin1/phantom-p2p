@@ -85,6 +85,15 @@ pub struct SignalClient {
     /// 服务端下发的网络配置（STUN 列表、中继地址与端口）。
     /// 客户端不内置任何端口常量或 STUN 地址，一律以此为准。
     network_config: Arc<RwLock<Option<NetworkConfig>>>,
+    /// 当前连接/重连循环的任务句柄。
+    ///
+    /// 没有它的话，`disconnect()` 只能靠 `running` 标志间接停掉旧循环——
+    /// 但旧循环可能正卡在指数退避的 `sleep`（最长 30 秒）里，此时紧接着的
+    /// `connect()` 会先把 `running` 置回 true，旧任务睡醒后检查通过、继续
+    /// 重连，于是出现**两条并发 WebSocket、同一个身份**，都往同一个
+    /// `cmd_tx` 槽位写、往同一个 `event_tx` 灌事件，行为完全不可预测。
+    /// 持有句柄、换代前先 abort，这条竞态路径就不存在了。
+    conn_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl SignalClient {
@@ -102,6 +111,7 @@ impl SignalClient {
             expose_signal_address,
             signal_rtt_ms: Arc::new(AtomicU32::new(0)),
             network_config: Arc::new(RwLock::new(None)),
+            conn_task: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -171,6 +181,11 @@ impl SignalClient {
 
     /// 连接到信令服务器（启动后台任务）
     pub async fn connect(&self, url: String) {
+        // 换代前必须先干掉上一条连接循环（见 `conn_task` 字段的说明），
+        // 否则旧循环若正睡在退避里，会在这里把 running 置 true 之后醒来继续跑。
+        if let Some(old) = self.conn_task.lock().await.take() {
+            old.abort();
+        }
         // 标记为运行中
         *self.running.write().await = true;
 
@@ -185,7 +200,7 @@ impl SignalClient {
         let signal_rtt_ms = self.signal_rtt_ms.clone();
         let network_config = self.network_config.clone();
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut retry_count: u32 = 0;
             let max_retry_delay = Duration::from_secs(30);
 
@@ -429,11 +444,17 @@ impl SignalClient {
             *state.write().await = ConnectionState::Disconnected;
             info!("[信令] 连接循环已停止");
         });
+        *self.conn_task.lock().await = Some(handle);
     }
 
     /// 断开连接
     pub async fn disconnect(&self) {
         *self.running.write().await = false;
+        // 直接 abort，不等旧循环自己发现 running 变了——它可能正睡在
+        // 最长 30 秒的退避里（见 `conn_task` 字段的说明）。
+        if let Some(task) = self.conn_task.lock().await.take() {
+            task.abort();
+        }
         *self.cmd_tx.lock().await = None;
         *self.state.write().await = ConnectionState::Disconnected;
         *self.session_id.write().await = None;
