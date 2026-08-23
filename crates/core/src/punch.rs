@@ -30,7 +30,7 @@
 //! 这类错误是**永久性**的，首次失败就该摘除，而不是每 20ms 重试一次直到窗口结束。
 
 use crate::network;
-use crate::stun::{self, StunMapping};
+use crate::stun;
 use phantom_protocol::{
     CandidateType, IceCandidate, NatClass, NatProfile, NetworkType, PunchParams, PunchStrategy,
     TargetPortMode,
@@ -99,35 +99,72 @@ fn analyze_step(ports: &[u16]) -> (i32, f32) {
     (step.clamp(1, 16), ratio)
 }
 
-/// 由 STUN 采样判定三分类。
+/// 由 STUN 采样判定三分类（RFC 5780 映射行为测试）。
 ///
 /// 只分三类是有意的：打洞策略只关心"端口能不能预测"，
 /// 锥形 NAT 的 NAT1/2/3 子类在打洞时行为一致，细分没有收益。
-fn classify(samples: &[StunMapping]) -> (NatClass, i32, f32) {
+///
+/// 返回 `(分类, 步长, 置信度, 是否地址相关映射)`。判定按目标分组：
+/// * 同一目标 IP 的不同端口之间映射就变 → 端口相关映射(APDM)，经典对称；
+/// * 每个 IP 内部稳定、跨 IP 不同     → 地址相关映射(ADM)对称——CGNAT 常见，
+///   **单 IP 采样在结构上永远看不见它**，会 100% 误判成锥形；
+/// * 处处相同                         → 端点无关映射(EIM)，锥形。
+fn classify(samples: &[stun::MappingSample]) -> (NatClass, i32, f32, bool) {
     if samples.is_empty() {
-        return (NatClass::Unknown, 0, 0.0);
+        return (NatClass::Unknown, 0, 0.0, false);
     }
     if samples.len() == 1 {
         // 单点无法判定映射行为，按最乐观的锥形处理——试一次的成本远低于直接放弃
-        return (NatClass::Cone, 0, 0.0);
+        return (NatClass::Cone, 0, 0.0, false);
     }
-    let ports: Vec<u16> = samples.iter().map(|m| m.port).collect();
-    if ports.iter().all(|p| *p == ports[0]) {
-        return (NatClass::Cone, 0, 1.0);
+    let ports: Vec<u16> = samples.iter().map(|s| s.mapping.port).collect();
+
+    // 按目标 IP 分组（保持采样顺序，端口计数器类 NAT 的步进依赖顺序）
+    let mut ip_order: Vec<IpAddr> = Vec::new();
+    let mut by_ip: std::collections::HashMap<IpAddr, Vec<u16>> = std::collections::HashMap::new();
+    for s in samples {
+        let ip = s.target.ip();
+        if !by_ip.contains_key(&ip) {
+            ip_order.push(ip);
+        }
+        by_ip.entry(ip).or_default().push(s.mapping.port);
     }
-    let (step, conf) = analyze_step(&ports);
-    if step > 0 {
-        (NatClass::LinearSymmetric, step, conf)
-    } else {
-        (NatClass::RandomSymmetric, 0, conf)
+
+    let apdm = by_ip
+        .values()
+        .any(|g| g.len() >= 2 && g.iter().any(|p| *p != g[0]));
+    if apdm {
+        let (step, conf) = analyze_step(&ports);
+        return if step > 0 {
+            (NatClass::LinearSymmetric, step, conf, false)
+        } else {
+            (NatClass::RandomSymmetric, 0, conf, false)
+        };
     }
+
+    // 每个 IP 内部映射稳定；比较跨 IP 的代表端口
+    let ip_ports: Vec<u16> = ip_order.iter().map(|ip| by_ip[ip][0]).collect();
+    if ip_ports.iter().any(|p| *p != ip_ports[0]) {
+        // ADM：映射只随目标 IP 变化。步进按"每换一个 IP"计算——
+        // 对同一 IP 的重复采样不推进计数器，混进全序列会稀释步进比例。
+        let (step, conf) = analyze_step(&ip_ports);
+        return if step > 0 {
+            (NatClass::LinearSymmetric, step, conf, true)
+        } else {
+            (NatClass::RandomSymmetric, 0, conf, true)
+        };
+    }
+
+    (NatClass::Cone, 0, 1.0, false)
 }
 
 /// 细分类展示名（仅用于展示与遥测，不参与策略选择）
-fn detail_name(class: NatClass, step: i32) -> String {
+fn detail_name(class: NatClass, step: i32, adm: bool) -> String {
     match class {
         NatClass::Cone => "cone".to_string(),
+        NatClass::LinearSymmetric if adm => format!("symmetric_adm_step{}", step),
         NatClass::LinearSymmetric => format!("symmetric_incremental_step{}", step),
+        NatClass::RandomSymmetric if adm => "symmetric_adm_random".to_string(),
         NatClass::RandomSymmetric => "symmetric_random".to_string(),
         NatClass::Unknown => "unknown".to_string(),
     }
@@ -175,16 +212,11 @@ pub fn probe(
 ) -> ProbeResult {
     let started = Instant::now();
 
-    let samples = stun::query_all_on(sock, stun_servers);
-    let (class, step, step_confidence) = classify(&samples);
+    let samples = stun::sample_mappings_on(sock, stun_servers);
+    let (class, step, step_confidence, adm) = classify(&samples);
 
     // 判定质量自检——"日志说 cone_to_cone 却打洞失败"的两大来源都在采样环节，
-    // 必须在第一现场把话说清楚，不能等到失败之后无从追溯：
-    // 1) 只剩 1 个样本时 classify 乐观判锥形，但那是零置信度的猜测；
-    // 2) 所有 STUN 目标同一个 IP（默认下发的就是自建 STUN 的 3478/3479 两个
-    //    端口）时，地址相关映射(ADM)型对称 NAT 对同一目标 IP 复用同一映射，
-    //    两次采样端口必然相同，会被 100% 误判成锥形——区分它必须要有两个
-    //    **不同 IP** 的 STUN 端点。
+    // 必须在第一现场把话说清楚，不能等到失败之后无从追溯。
     if samples.len() == 1 {
         warn!(
             "[打洞] STUN 仅 1 个样本（{} 台里只有 1 台应答），无法判定映射行为，\
@@ -192,22 +224,48 @@ pub fn probe(
             stun_servers.len()
         );
     }
-    if class == NatClass::Cone && samples.len() >= 2 {
-        let distinct_hosts: std::collections::HashSet<&str> =
-            stun_servers.iter().map(|(h, _)| h.as_str()).collect();
-        if distinct_hosts.len() < 2 {
-            warn!(
-                "[打洞] 所有 STUN 目标都是同一个主机（{} 个端口），地址相关映射型\
-                 对称 NAT 会被误判为锥形；建议在服务端 [stun].fallback_servers \
-                 配置至少一台不同 IP 的 STUN",
-                stun_servers.len()
-            );
-        }
+    let distinct_ips: std::collections::HashSet<IpAddr> =
+        samples.iter().map(|s| s.target.ip()).collect();
+    if class == NatClass::Cone && samples.len() >= 2 && distinct_ips.len() < 2 {
+        warn!(
+            "[打洞] 采样只覆盖到 1 个目标 IP（{} 个样本，OTHER-ADDRESS 也没发现第二个 IP），\
+             地址相关映射型对称 NAT 仍会被误判为锥形；建议在服务端 [stun].fallback_servers \
+             配置至少一台**不同 IP** 且支持 RFC 5780 的 STUN（可写裸主机名，默认端口 3478）",
+            samples.len()
+        );
     }
 
-    let public_ip = samples.last().map(|m| m.ip.clone());
-    let base_port = samples.last().map(|m| m.port).unwrap_or(0);
-    let sample_ports: Vec<u16> = samples.iter().map(|m| m.port).collect();
+    // 过滤行为探测（RFC 5780 Test II/III）：只向已采样过的目标发请求，
+    // 不新增出网目标、不推进对称 NAT 的端口计数器。优先选自带换 IP 端点
+    // （OTHER-ADDRESS 是另一个 IP）的服务器做主目标，Test II 才做得了。
+    let filtering = if samples.is_empty() {
+        None
+    } else {
+        let full_5780 = samples.iter().find(|s| {
+            s.alt_server
+                .map(|a| a.ip() != s.target.ip())
+                .unwrap_or(false)
+        });
+        let (primary, alt) = match full_5780 {
+            Some(s) => (s.target, s.alt_server),
+            None => (samples[0].target, None),
+        };
+        let f = stun::probe_filtering_on(sock, primary, alt);
+        info!(
+            "[打洞] 入向过滤行为: {}{}",
+            f.behavior.display_name(),
+            if f.certain {
+                ""
+            } else {
+                "（无换 IP 端点，只能给上界）"
+            }
+        );
+        Some(f)
+    };
+
+    let public_ip = samples.last().map(|s| s.mapping.ip.clone());
+    let base_port = samples.last().map(|s| s.mapping.port).unwrap_or(0);
+    let sample_ports: Vec<u16> = samples.iter().map(|s| s.mapping.port).collect();
 
     let (has_ipv6, ipv6_addrs) = probe_ipv6();
 
@@ -215,9 +273,25 @@ pub fn probe(
     base_candidates.extend(srflx_candidates(&samples));
     dedup_and_sort(&mut base_candidates);
 
+    // detail 尾部带上过滤行为（=确定 / ~上界），供对端日志与遥测排障；
+    // 字段是自由文本，旧版本对端原样展示，不存在兼容问题
+    let mut detail = detail_name(class, step, adm);
+    if let Some(f) = &filtering {
+        let tag = match f.behavior {
+            stun::FilteringBehavior::EndpointIndependent => "eif",
+            stun::FilteringBehavior::AddressDependent => "adf",
+            stun::FilteringBehavior::AddressPortDependent => "apdf",
+            stun::FilteringBehavior::Unknown => "",
+        };
+        if !tag.is_empty() {
+            detail.push_str(if f.certain { ",filter=" } else { ",filter~" });
+            detail.push_str(tag);
+        }
+    }
+
     let profile = NatProfile {
         class,
-        detail: detail_name(class, step),
+        detail,
         base_port,
         step,
         step_confidence,
@@ -313,10 +387,11 @@ fn gather_host_candidates(sock: &UdpSocket, ipv6_addrs: &[String]) -> Vec<IceCan
     out
 }
 
-fn srflx_candidates(samples: &[StunMapping]) -> Vec<IceCandidate> {
+fn srflx_candidates(samples: &[stun::MappingSample]) -> Vec<IceCandidate> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for (idx, m) in samples.iter().enumerate() {
+    for (idx, s) in samples.iter().enumerate() {
+        let m = &s.mapping;
         if !seen.insert((m.ip.clone(), m.port)) {
             continue;
         }
@@ -1095,54 +1170,112 @@ fn placeholder_profile() -> NatProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stun::StunMapping;
 
-    fn mapping(port: u16) -> StunMapping {
-        StunMapping {
-            ip: "1.2.3.4".to_string(),
-            port,
+    /// target 用 "IP:port" 字面量；判定 ADM 的关键维度就是目标 IP
+    fn sample(target: &str, mapped_port: u16) -> stun::MappingSample {
+        stun::MappingSample {
+            server: target.to_string(),
+            target: target.parse().unwrap(),
+            mapping: StunMapping {
+                ip: "1.2.3.4".to_string(),
+                port: mapped_port,
+            },
+            alt_server: None,
         }
     }
 
     #[test]
-    fn identical_ports_classify_as_cone() {
-        let s = vec![mapping(50000), mapping(50000), mapping(50000)];
-        let (class, step, _) = classify(&s);
+    fn identical_ports_across_ips_classify_as_cone() {
+        let s = vec![
+            sample("9.9.9.9:3478", 50000),
+            sample("9.9.9.9:3479", 50000),
+            sample("8.8.8.8:3478", 50000),
+        ];
+        let (class, step, conf, adm) = classify(&s);
         assert_eq!(class, NatClass::Cone);
         assert_eq!(step, 0);
+        assert!(conf >= 1.0);
+        assert!(!adm);
     }
 
     #[test]
     fn incrementing_ports_classify_as_linear() {
         let s = vec![
-            mapping(50000),
-            mapping(50001),
-            mapping(50002),
-            mapping(50003),
+            sample("9.9.9.9:3478", 50000),
+            sample("9.9.9.9:3479", 50001),
+            sample("9.9.9.9:3480", 50002),
+            sample("9.9.9.9:3481", 50003),
         ];
-        let (class, step, conf) = classify(&s);
+        let (class, step, conf, adm) = classify(&s);
         assert_eq!(class, NatClass::LinearSymmetric);
         assert_eq!(step, 1);
         assert!(conf > 0.9);
+        assert!(!adm);
     }
 
     #[test]
     fn jumpy_ports_classify_as_random() {
-        let s = vec![mapping(50000), mapping(9312), mapping(41200), mapping(1099)];
-        let (class, step, _) = classify(&s);
+        let s = vec![
+            sample("9.9.9.9:3478", 50000),
+            sample("9.9.9.9:3479", 9312),
+            sample("9.9.9.9:3480", 41200),
+            sample("9.9.9.9:3481", 1099),
+        ];
+        let (class, step, _, _) = classify(&s);
         assert_eq!(class, NatClass::RandomSymmetric);
         assert_eq!(step, 0);
     }
 
     #[test]
+    fn adm_symmetric_is_detected_across_ips() {
+        // 每个目标 IP 内部映射稳定、跨 IP 端口前进——单 IP 采样会把它当锥形，
+        // 这正是 "日志 cone_to_cone 却打不通" 的元凶之一
+        let s = vec![
+            sample("9.9.9.9:3478", 50000),
+            sample("9.9.9.9:3479", 50000),
+            sample("8.8.8.8:3478", 50002),
+        ];
+        let (class, step, _, adm) = classify(&s);
+        assert_eq!(class, NatClass::LinearSymmetric);
+        assert_eq!(step, 2);
+        assert!(adm);
+        assert_eq!(detail_name(class, step, adm), "symmetric_adm_step2");
+    }
+
+    #[test]
+    fn adm_with_unpredictable_ports_is_random_symmetric() {
+        let s = vec![
+            sample("9.9.9.9:3478", 50000),
+            sample("9.9.9.9:3479", 50000),
+            sample("8.8.8.8:3478", 3777),
+        ];
+        let (class, _, _, adm) = classify(&s);
+        assert_eq!(class, NatClass::RandomSymmetric);
+        assert!(adm);
+    }
+
+    #[test]
+    fn single_ip_sampling_cannot_see_adm_and_stays_cone() {
+        // 结构性盲区：只有一个目标 IP 时 ADM 与锥形不可区分，
+        // classify 只能给 Cone——probe() 里对应的 WARN 必须存在
+        let s = vec![sample("9.9.9.9:3478", 50000), sample("9.9.9.9:3479", 50000)];
+        let (class, _, _, adm) = classify(&s);
+        assert_eq!(class, NatClass::Cone);
+        assert!(!adm);
+    }
+
+    #[test]
     fn single_sample_is_optimistically_cone() {
         // 只有一个采样点无法判定映射行为；按锥形试一次的成本远低于直接放弃
-        let (class, _, _) = classify(&[mapping(50000)]);
+        let (class, _, conf, _) = classify(&[sample("9.9.9.9:3478", 50000)]);
         assert_eq!(class, NatClass::Cone);
+        assert_eq!(conf, 0.0);
     }
 
     #[test]
     fn no_sample_is_unknown() {
-        let (class, _, _) = classify(&[]);
+        let (class, _, _, _) = classify(&[]);
         assert_eq!(class, NatClass::Unknown);
     }
 
@@ -1150,13 +1283,13 @@ mod tests {
     fn step_uses_mode_not_mean() {
         // 大多数步进为 2，个别为 9；众数应给出 2 而不是被拉高的平均值
         let s = vec![
-            mapping(1000),
-            mapping(1002),
-            mapping(1004),
-            mapping(1013),
-            mapping(1015),
+            sample("9.9.9.9:3478", 1000),
+            sample("9.9.9.9:3479", 1002),
+            sample("9.9.9.9:3480", 1004),
+            sample("9.9.9.9:3481", 1013),
+            sample("9.9.9.9:3482", 1015),
         ];
-        let (class, step, _) = classify(&s);
+        let (class, step, _, _) = classify(&s);
         assert_eq!(class, NatClass::LinearSymmetric);
         assert_eq!(step, 2);
     }

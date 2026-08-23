@@ -4,7 +4,7 @@
 //! 与 Python 的 `stun.py` 保持接口一致。
 
 use rand::Rng;
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
@@ -179,13 +179,23 @@ pub fn query_with_options(
     change_ip: bool,
     change_port: bool,
 ) -> Option<StunQueryResult> {
+    query_with_timeout(sock, stun_addr, change_ip, change_port, STUN_TIMEOUT)
+}
+
+pub fn query_with_timeout(
+    sock: &UdpSocket,
+    stun_addr: SocketAddr,
+    change_ip: bool,
+    change_port: bool,
+    timeout: Duration,
+) -> Option<StunQueryResult> {
     debug!(
         "[STUN] 发送 Binding Request → {} (change_ip={}, change_port={})",
         stun_addr, change_ip, change_port
     );
 
     let (transaction_id, msg) = build_binding_request(change_ip, change_port);
-    sock.set_read_timeout(Some(STUN_TIMEOUT)).ok()?;
+    sock.set_read_timeout(Some(timeout)).ok()?;
     let start = Instant::now();
     let stun_addr = crate::network::compatible_socket_addr(sock, stun_addr);
     if let Err(e) = sock.send_to(&msg, stun_addr) {
@@ -216,7 +226,7 @@ pub fn query_with_options(
             continue;
         }
         if data[8..20] != transaction_id {
-            if start.elapsed() >= STUN_TIMEOUT {
+            if start.elapsed() >= timeout {
                 return None;
             }
             continue;
@@ -333,40 +343,210 @@ pub fn query_all_detailed(sock: &UdpSocket) -> Vec<StunServerSample> {
     samples
 }
 
-/// 用**服务端下发**的 STUN 列表在指定 socket 上采样。
+/// 打洞路径的映射采样：一条样本 = 一个实际发包的目标端点 + 它看到的公网映射。
 ///
-/// 与旧的 [`query_all`] 有两点关键差别：
+/// 必须带上解析后的目标地址：判定**地址相关映射(ADM)对称 NAT** 的唯一依据是
+/// "对不同目标 IP 的映射是否一致"，丢掉目标信息就只能按端口序列瞎比。
+#[derive(Debug, Clone)]
+pub struct MappingSample {
+    /// 展示用标签（配置里的 host:port，或经 OTHER-ADDRESS 发现的端点）
+    pub server: String,
+    /// 实际发包的目标（DNS 解析后的 IP:port）
+    pub target: SocketAddr,
+    pub mapping: StunMapping,
+    /// 响应携带的备用端点：OTHER-ADDRESS（RFC 5780）优先，
+    /// CHANGED-ADDRESS（RFC 3489 遗留）兜底
+    pub alt_server: Option<SocketAddr>,
+}
+
+/// OTHER-ADDRESS 发现的端点必须是可打的公网 IPv4，
+/// 否则一台配置错误（或恶意）的 STUN 能引导我们向内网地址发包。
+fn is_probeable_public_addr(addr: &SocketAddr) -> bool {
+    match addr.ip() {
+        IpAddr::V4(v4) => {
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast())
+        }
+        // 打洞映射采样只针对 IPv4——IPv6 没有 NAT 端口映射可判
+        IpAddr::V6(_) => false,
+    }
+}
+
+/// 用**服务端下发**的 STUN 列表在指定 socket 上采样（RFC 5780 映射行为测试）。
+///
+/// 关键约束：
 /// 1. 服务器列表来自服务端下发（自建优先），客户端不内置任何地址——
 ///    实测三台境外公共 STUN 曾在单次会话内全部超时，
 ///    而 STUN 一失败就拿不到 srflx 候选，必然落中继；
 /// 2. **必须在同一个 socket 上顺序采样**，因为我们要观察的正是
 ///    "同一源端口对不同目标的映射变化"——这是判定 NAT 分类的依据，
-///    换 socket 采样会让判定失去意义。
-pub fn query_all_on(sock: &UdpSocket, servers: &[(String, u16)]) -> Vec<StunMapping> {
-    let mut out = Vec::new();
+///    换 socket 采样会让判定失去意义；
+/// 3. 判 ADM 对称需要**两个不同 IP** 的目标。配置里凑不齐时，用响应中的
+///    OTHER-ADDRESS / CHANGED-ADDRESS（服务器自己声明的备用端点）补采样——
+///    这样哪怕只配了一台支持 RFC 5780 的服务器也能拿到第二个 IP。
+pub fn sample_mappings_on(sock: &UdpSocket, servers: &[(String, u16)]) -> Vec<MappingSample> {
+    let mut out: Vec<MappingSample> = Vec::new();
     if servers.is_empty() {
         warn!("[STUN] 服务器列表为空（服务端尚未下发配置），无法探测映射");
         return out;
     }
     info!("[STUN] 开始采样 {} 个服务器", servers.len());
+    let mut queried: std::collections::HashSet<SocketAddr> = std::collections::HashSet::new();
     for (host, port) in servers {
         let Some(addr) = resolve_stun_addr(host, *port) else {
             warn!("[STUN] 跳过 {}:{} (解析失败)", host, port);
             continue;
         };
+        if !queried.insert(addr) {
+            debug!(
+                "[STUN] 跳过 {}:{}（与已采样端点解析到同一地址 {}）",
+                host, port, addr
+            );
+            continue;
+        }
         match query_with_options(sock, addr, false, false) {
             Some(r) => {
                 info!(
                     "[STUN] ✅ {} → {}:{} ({}ms)",
                     host, r.mapping.ip, r.mapping.port, r.rtt_ms
                 );
-                out.push(r.mapping);
+                out.push(MappingSample {
+                    server: format!("{}:{}", host, port),
+                    target: addr,
+                    mapping: r.mapping,
+                    alt_server: r.other_address.or(r.changed_address),
+                });
             }
             None => warn!("[STUN] ❌ 查询失败: {} ({})", host, addr),
         }
     }
-    info!("[STUN] 采样完成，获得 {} 个映射", out.len());
+
+    // 配置的端点不足两个 IP 时，追加 OTHER-ADDRESS 发现的端点。
+    // 注意：每向一个新 IP 发包都会推进对称 NAT 的端口计数器，
+    // 所以凑齐两个 IP 就停，绝不为凑数多打。
+    let distinct_ips = |samples: &[MappingSample]| {
+        samples
+            .iter()
+            .map(|s| s.target.ip())
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    };
+    if distinct_ips(&out) == 1 {
+        let extras: Vec<(SocketAddr, String)> = out
+            .iter()
+            .filter_map(|s| s.alt_server.map(|a| (a, s.server.clone())))
+            .filter(|(a, _)| is_probeable_public_addr(a))
+            .filter(|(a, _)| out.iter().all(|s| s.target.ip() != a.ip()))
+            .collect();
+        for (addr, via) in extras {
+            if !queried.insert(addr) {
+                continue;
+            }
+            match query_with_options(sock, addr, false, false) {
+                Some(r) => {
+                    info!(
+                        "[STUN] ✅ OTHER-ADDRESS {} → {}:{} ({}ms, 经 {} 发现，RFC 5780)",
+                        addr, r.mapping.ip, r.mapping.port, r.rtt_ms, via
+                    );
+                    out.push(MappingSample {
+                        server: format!("other-address(via {})", via),
+                        target: addr,
+                        mapping: r.mapping,
+                        alt_server: r.other_address.or(r.changed_address),
+                    });
+                }
+                None => warn!(
+                    "[STUN] ❌ OTHER-ADDRESS 端点 {} 无响应（经 {} 发现）",
+                    addr, via
+                ),
+            }
+            if distinct_ips(&out) >= 2 {
+                break;
+            }
+        }
+    }
+
+    info!(
+        "[STUN] 采样完成，获得 {} 个映射，覆盖 {} 个不同目标 IP",
+        out.len(),
+        distinct_ips(&out)
+    );
     out
+}
+
+/// 打洞路径的过滤行为探测结果（RFC 5780 §4.4，Test II / Test III）
+#[derive(Debug, Clone)]
+pub struct PunchFilteringResult {
+    pub behavior: FilteringBehavior,
+    /// 是否有换 IP 的响应端点可用。没有第二个 IP 时 Test II 做不了，
+    /// EIF 与 ADF 无法区分，此时 behavior 给出的是**上界**（"不比这更严"）。
+    pub certain: bool,
+}
+
+/// 过滤行为探测的单次请求超时。
+///
+/// 被 NAT 过滤 = 必然等到超时才有结论，是这条路径的常态而非异常，
+/// 所以必须远短于常规查询的 3s，否则每次打洞前的探测要多花好几秒。
+const FILTERING_PROBE_TIMEOUT: Duration = Duration::from_millis(1200);
+
+/// 在打洞主 socket 上探测本端 NAT 的入向过滤行为（RFC 5780）。
+///
+/// 请求只发给**已经采样过的**主目标 `primary`——不会新增出网目标，
+/// 因此不会推进对称 NAT 的端口计数器（原则 A 安全）；
+/// 由服务器换端口 / 换 IP 回包来试探哪些入向包能穿过本端 NAT。
+///
+/// `alt_ip` 是响应中通告的**不同 IP** 的备用端点（没有则传 None，跳过 Test II）。
+pub fn probe_filtering_on(
+    sock: &UdpSocket,
+    primary: SocketAddr,
+    alt_ip: Option<SocketAddr>,
+) -> PunchFilteringResult {
+    // Test II：请求服务器换 IP+端口回包。收到 = 任何地址都能打进来（EIF / 全锥）。
+    if let Some(alt) = alt_ip {
+        if alt.ip() != primary.ip() {
+            let mut change_ip_honored = true;
+            if let Some(r) = query_with_timeout(sock, primary, true, true, FILTERING_PROBE_TIMEOUT)
+            {
+                if r.responder_addr.ip() != primary.ip() {
+                    return PunchFilteringResult {
+                        behavior: FilteringBehavior::EndpointIndependent,
+                        certain: true,
+                    };
+                }
+                // 响应源没换 IP：服务器不支持 change-ip，Test II 没有测到东西，
+                // 后面 Test III 的结论只能算上界
+                change_ip_honored = false;
+            }
+            // Test II 无响应 = 换 IP 的包被本端 NAT 过滤，继续 Test III 细分
+            let cp = query_with_timeout(sock, primary, false, true, FILTERING_PROBE_TIMEOUT);
+            let behavior = match cp {
+                Some(ref r) if r.responder_addr != primary => FilteringBehavior::AddressDependent,
+                Some(_) => FilteringBehavior::Unknown, // 服务器不支持 change-port
+                None => FilteringBehavior::AddressPortDependent,
+            };
+            return PunchFilteringResult {
+                behavior,
+                certain: change_ip_honored && behavior != FilteringBehavior::Unknown,
+            };
+        }
+    }
+
+    // 没有第二个 IP：只能做 Test III（换端口）。
+    // 通过 = 过滤不依赖端口（EIF 或 ADF，无法细分）；超时 = 端口相关过滤。
+    let cp = query_with_timeout(sock, primary, false, true, FILTERING_PROBE_TIMEOUT);
+    let behavior = match cp {
+        Some(ref r) if r.responder_addr != primary => FilteringBehavior::AddressDependent,
+        Some(_) => FilteringBehavior::Unknown,
+        None => FilteringBehavior::AddressPortDependent,
+    };
+    PunchFilteringResult {
+        behavior,
+        certain: false,
+    }
 }
 
 /// 在指定 socket 上取第一个成功的映射（用于新建 socket 的快速探测）。

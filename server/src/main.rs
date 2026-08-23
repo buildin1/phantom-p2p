@@ -699,38 +699,61 @@ async fn handle_auth(
     });
 }
 
+/// 解析 fallback STUN 条目。
+///
+/// 允许三种写法："host:port"、裸 "host"（默认 3478）、"[v6字面量]:port"。
+/// 曾经只认 "host:port" 且没写端口就**静默丢弃**——用户配了
+/// `stun.hot-chilli.net` 以为生效了，客户端实际一直只采样自建 STUN。
+fn parse_stun_endpoint(s: &str) -> Option<(String, u16)> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(rest) = s.strip_prefix('[') {
+        let (host, port) = rest.split_once("]:")?;
+        return Some((host.to_string(), port.parse().ok()?));
+    }
+    match s.rsplit_once(':') {
+        // host 里还有冒号 = 没加方括号的 v6 字面量，最后一段是地址的一部分
+        // 而不是端口，猜任何一种解释都可能打到错误目标——拒绝
+        Some((host, _)) if host.contains(':') => None,
+        Some((host, port)) => Some((host.to_string(), port.parse().ok()?)),
+        None => Some((s.to_string(), 3478)),
+    }
+}
+
 /// 组装下发给客户端的网络配置。
 ///
 /// 自建 STUN 排在最前——公共 STUN 不可用时客户端拿不到 srflx 候选，
 /// 会直接导致打洞不可能成功而落中继。
 fn build_network_config(cfg: &config::ServerConfig) -> phantom_protocol::NetworkConfig {
-    let mut stun_servers = Vec::new();
+    let mut stun_servers: Vec<phantom_protocol::StunServerInfo> = Vec::new();
+    let mut push_unique = |list: &mut Vec<phantom_protocol::StunServerInfo>,
+                           host: String,
+                           port: u16,
+                           is_self_hosted: bool| {
+        if !list.iter().any(|s| s.host == host && s.port == port) {
+            list.push(phantom_protocol::StunServerInfo {
+                host,
+                port,
+                is_self_hosted,
+            });
+        }
+    };
     if cfg.stun.enabled {
         let addr = cfg.stun.effective_addr(&cfg.relay.public_addr);
-        stun_servers.push(phantom_protocol::StunServerInfo {
-            host: addr.clone(),
-            port: cfg.stun.port,
-            is_self_hosted: true,
-        });
+        push_unique(&mut stun_servers, addr.clone(), cfg.stun.port, true);
         // 备用端口不是冗余：判定 NAT 映射行为需要至少两个不同的目标端点，
         // 客户端比较两次映射是否一致才能区分锥形与对称。
-        stun_servers.push(phantom_protocol::StunServerInfo {
-            host: addr,
-            port: cfg.stun.alt_port,
-            is_self_hosted: true,
-        });
+        push_unique(&mut stun_servers, addr, cfg.stun.alt_port, true);
     }
     for s in &cfg.stun.fallback_servers {
-        if let Some((host, port)) = s.rsplit_once(':') {
-            if let Ok(port) = port.parse::<u16>() {
-                stun_servers.push(phantom_protocol::StunServerInfo {
-                    host: host.to_string(),
-                    port,
-                    is_self_hosted: false,
-                });
-            } else {
-                warn!("[配置] 忽略无法解析的 fallback STUN: {}", s);
-            }
+        match parse_stun_endpoint(s) {
+            Some((host, port)) => push_unique(&mut stun_servers, host, port, false),
+            None => warn!(
+                "[配置] 忽略无法解析的 fallback STUN: {:?}（格式应为 \"host\" 或 \"host:port\"）",
+                s
+            ),
         }
     }
     phantom_protocol::NetworkConfig {
@@ -2262,12 +2285,61 @@ async fn main() {
 
     // 自建 STUN：打洞链路上不可绕过的一环，公共 STUN 失效就必然落中继
     if cfg.stun.enabled {
-        if let Err(e) = stun_server::start(&cfg.signal.bind, cfg.stun.port, cfg.stun.alt_port).await
+        // 公网 IP 用于 OTHER-ADDRESS 通告（RFC 5780）；解析失败只降级不阻塞启动
+        let stun_host = cfg.stun.effective_addr(&cfg.relay.public_addr);
+        let public_ip = tokio::net::lookup_host((stun_host.as_str(), 0))
+            .await
+            .ok()
+            .and_then(|mut addrs| addrs.find(|a| a.is_ipv4()))
+            .map(|a| a.ip());
+        if public_ip.is_none() {
+            warn!(
+                "[STUN] 解析公网地址 {} 失败，OTHER-ADDRESS 通告不可用",
+                stun_host
+            );
+        }
+        if let Err(e) = stun_server::start(
+            &cfg.signal.bind,
+            cfg.stun.port,
+            cfg.stun.alt_port,
+            public_ip,
+        )
+        .await
         {
             error!("[STUN] 启动失败: {}（客户端将只能使用兜底服务器）", e);
         }
     } else {
         warn!("[STUN] 自建 STUN 已禁用，客户端将依赖第三方公共服务器");
+    }
+
+    // 启动时就把最终下发的 STUN 列表打出来：fallback 条目写错格式时
+    // 上面的解析告警和这行清单是**唯一**能看出"配了但没生效"的地方
+    {
+        let netcfg = build_network_config(&cfg);
+        let list: Vec<String> = netcfg
+            .stun_servers
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}:{}{}",
+                    s.host,
+                    s.port,
+                    if s.is_self_hosted { "(自建)" } else { "" }
+                )
+            })
+            .collect();
+        info!("[配置] 下发 STUN 列表: {}", list.join(", "));
+        let distinct_hosts: std::collections::HashSet<&str> = netcfg
+            .stun_servers
+            .iter()
+            .map(|s| s.host.as_str())
+            .collect();
+        if distinct_hosts.len() < 2 {
+            warn!(
+                "[配置] STUN 列表只有一个主机——地址相关映射(ADM)型对称 NAT 会被误判为锥形，\
+                 建议在 [stun].fallback_servers 配置至少一台不同 IP 的第三方 STUN"
+            );
+        }
     }
 
     // 日志包接收服务：观测模型是集中式的，排障靠客户端上报
@@ -2319,6 +2391,50 @@ async fn main() {
                 warn!("[连接] accept 失败: {}", e);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod stun_endpoint_tests {
+    use super::parse_stun_endpoint;
+
+    /// 回归测试：用户配 `stun.hot-chilli.net`（无端口）曾被静默丢弃，
+    /// 表面上"加了第三方 STUN"，客户端实际一直只有自建单 IP 采样
+    #[test]
+    fn bare_hostname_defaults_to_3478() {
+        assert_eq!(
+            parse_stun_endpoint("stun.hot-chilli.net"),
+            Some(("stun.hot-chilli.net".to_string(), 3478))
+        );
+    }
+
+    #[test]
+    fn host_port_is_parsed() {
+        assert_eq!(
+            parse_stun_endpoint("stun.qq.com:3478"),
+            Some(("stun.qq.com".to_string(), 3478))
+        );
+        assert_eq!(
+            parse_stun_endpoint(" stun.miwifi.com:3478 "),
+            Some(("stun.miwifi.com".to_string(), 3478))
+        );
+    }
+
+    #[test]
+    fn ipv6_literal_needs_brackets() {
+        assert_eq!(
+            parse_stun_endpoint("[2001:db8::1]:3478"),
+            Some(("2001:db8::1".to_string(), 3478))
+        );
+        // 裸 v6 字面量会把最后一段误当端口，必须拒绝而不是猜
+        assert_eq!(parse_stun_endpoint("2001:db8::1"), None);
+    }
+
+    #[test]
+    fn garbage_is_rejected_not_silently_dropped() {
+        assert_eq!(parse_stun_endpoint("host:notaport"), None);
+        assert_eq!(parse_stun_endpoint(""), None);
+        assert_eq!(parse_stun_endpoint("   "), None);
     }
 }
 
