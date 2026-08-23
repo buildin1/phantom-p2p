@@ -257,7 +257,7 @@ pub fn probe(
             if f.certain {
                 ""
             } else {
-                "（无换 IP 端点，只能给上界）"
+                "（上界：未收到换 IP/换端口回包的正面证据，可能只是备用端点不可达）"
             }
         );
         Some(f)
@@ -683,15 +683,34 @@ pub async fn execute(
     let mut buf = [0u8; 256];
     // prflx 学到的对端真实地址（原则 C 的主路径）
     let mut prflx: HashSet<SocketAddr> = HashSet::new();
+    // 收发计数：cone↔cone 互打 12 秒零连通时，没有这些数字就无法区分
+    // 「对端的包根本进不了本端 NAT」和「进来了但我们的应答出不去」——
+    // 收到已知目标的探测包原本不留任何日志痕迹，失败后无从追溯。
+    let mut tx_packets: u64 = 0;
+    let mut rx_probe: u64 = 0;
+    let mut rx_ack: u64 = 0;
+    let mut rx_junk: u64 = 0;
+    let mut seen_sources: HashSet<SocketAddr> = HashSet::new();
 
     loop {
         if Instant::now() >= deadline {
             let alive = targets.iter().filter(|t| !t.dead).count();
+            let verdict = if rx_probe == 0 && rx_ack == 0 {
+                "；对端的包一个都没进来——对端未按预期发包、本端映射/候选通告有误，或本端 NAT/防火墙拦截了该来源"
+            } else {
+                "；对端探测能进来且本端已回应答，但对端的应答始终没回来——本端出向包到不了对端（对端 NAT 拦截，或本端出口映射与通告不符）"
+            };
             warn!(
-                "[打洞] 窗口 {}ms 结束仍未连通（存活目标 {}/{}）",
+                "[打洞] 窗口 {}ms 结束仍未连通（存活目标 {}/{}）：发 {} 包，收 探测={} 应答={} 杂包={}，来源 {} 个{}",
                 params.window_ms,
                 alive,
-                targets.len()
+                targets.len(),
+                tx_packets,
+                rx_probe,
+                rx_ack,
+                rx_junk,
+                seen_sources.len(),
+                verdict
             );
             return (None, waited as i32);
         }
@@ -705,7 +724,9 @@ pub async fn execute(
                         continue;
                     }
                     match sock.send_to(&packet, t.addr) {
-                        Ok(_) => {}
+                        Ok(_) => {
+                            tx_packets += 1;
+                        }
                         Err(e) if e.kind() == ErrorKind::WouldBlock => {}
                         Err(e) if is_permanent_failure(&e) => {
                             // 原则 D：永久失败首次即摘除，不再浪费后续每一轮
@@ -731,7 +752,24 @@ pub async fn execute(
                     Ok((n, from)) => {
                         got_any = true;
                         if n < 12 || &buf[..4] != PUNCH_MAGIC {
+                            rx_junk += 1;
                             continue;
+                        }
+                        let acked = is_ack(&buf[..n]);
+                        if acked {
+                            rx_ack += 1;
+                        } else {
+                            rx_probe += 1;
+                        }
+                        // 每个来源的首包必须留痕：这是事后判断「哪个方向通了」
+                        // 的唯一直接证据，来源数量有限，不会刷屏
+                        if seen_sources.insert(from) {
+                            info!(
+                                "[打洞] ⬅ 首次收到 {} 的{}包 (socket{})",
+                                from,
+                                if acked { "应答" } else { "探测" },
+                                si
+                            );
                         }
                         let sent_at = u64::from_be_bytes([
                             buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
@@ -769,14 +807,17 @@ pub async fn execute(
                         }
 
                         // 收到对方回显我们时间戳的包 = 双向确认完成
-                        if is_ack(&buf[..n]) {
+                        if acked {
                             let rtt = now_ms().saturating_sub(sent_at) as u32;
                             let ctype = targets
                                 .iter()
                                 .find(|t| t.addr == from)
                                 .map(|t| t.ctype)
                                 .unwrap_or(CandidateType::ServerReflexive);
-                            info!("[打洞] ✅ 双向连通 {} (socket{}, RTT {}ms)", from, si, rtt);
+                            info!(
+                                "[打洞] ✅ 双向连通 {} (socket{}, RTT {}ms, 发 {} 包/收 探测={} 应答={})",
+                                from, si, rtt, tx_packets, rx_probe, rx_ack
+                            );
                             return (
                                 Some(PunchSuccess {
                                     peer_addr: from,

@@ -508,7 +508,6 @@ pub fn probe_filtering_on(
     // Test II：请求服务器换 IP+端口回包。收到 = 任何地址都能打进来（EIF / 全锥）。
     if let Some(alt) = alt_ip {
         if alt.ip() != primary.ip() {
-            let mut change_ip_honored = true;
             if let Some(r) = query_with_timeout(sock, primary, true, true, FILTERING_PROBE_TIMEOUT)
             {
                 if r.responder_addr.ip() != primary.ip() {
@@ -517,11 +516,11 @@ pub fn probe_filtering_on(
                         certain: true,
                     };
                 }
-                // 响应源没换 IP：服务器不支持 change-ip，Test II 没有测到东西，
-                // 后面 Test III 的结论只能算上界
-                change_ip_honored = false;
             }
-            // Test II 无响应 = 换 IP 的包被本端 NAT 过滤，继续 Test III 细分
+            // Test II 静默有两种解释：换 IP 的包被本端 NAT 过滤，或服务器的备用 IP
+            // 本身就到不了（境外 STUN 的备用段在部分国内线路上是黑洞）。
+            // 「没收到」永远不是证据——凡由超时推出的分类一律只作上界，
+            // certain=true 只留给收到了换 IP 回包的正面证据。
             let cp = query_with_timeout(sock, primary, false, true, FILTERING_PROBE_TIMEOUT);
             let behavior = match cp {
                 Some(ref r) if r.responder_addr != primary => FilteringBehavior::AddressDependent,
@@ -530,7 +529,7 @@ pub fn probe_filtering_on(
             };
             return PunchFilteringResult {
                 behavior,
-                certain: change_ip_honored && behavior != FilteringBehavior::Unknown,
+                certain: false,
             };
         }
     }
