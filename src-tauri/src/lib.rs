@@ -1008,10 +1008,20 @@ async fn join_room(
     phantom_core::logging::begin_session(&room_code);
 
     reset_punch_runtime(&punch_state).await;
+    // 上一个房间的 subnet / virtual_ip 不能留：其余四个会改变房间归属的命令
+    // （create/leave/close/disconnect）都清了，唯独这里漏了。正常路径下
+    // JoinOk 会覆盖，但一旦 JoinRoom 被拒（永远等不到 JoinOk），后续任何
+    // 读到这些残值的逻辑都会拿着旧房间的虚拟 IP 去建网卡。
+    clear_virtual_network(&punch_state).await;
     // 标记为 Guest
     *punch_state.is_host.write().await = false;
     stats_state.manager.clear().await;
     stats_state.manager.set_host_mode(false);
+
+    // 直接换房间（不点"离开"）时，服务端 session 上还挂着旧房间——新版
+    // 服务端已改为隐式 leave-then-join，这里再显式发一次 LeaveRoom 是给
+    // 旧版服务端的兼容垫底。不在任何房间时服务端会静默忽略，无副作用。
+    let _ = signal_state.client.send(ClientMessage::LeaveRoom).await;
 
     signal_state
         .client

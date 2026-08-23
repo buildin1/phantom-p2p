@@ -178,6 +178,33 @@ pub fn probe(
     let samples = stun::query_all_on(sock, stun_servers);
     let (class, step, step_confidence) = classify(&samples);
 
+    // 判定质量自检——"日志说 cone_to_cone 却打洞失败"的两大来源都在采样环节，
+    // 必须在第一现场把话说清楚，不能等到失败之后无从追溯：
+    // 1) 只剩 1 个样本时 classify 乐观判锥形，但那是零置信度的猜测；
+    // 2) 所有 STUN 目标同一个 IP（默认下发的就是自建 STUN 的 3478/3479 两个
+    //    端口）时，地址相关映射(ADM)型对称 NAT 对同一目标 IP 复用同一映射，
+    //    两次采样端口必然相同，会被 100% 误判成锥形——区分它必须要有两个
+    //    **不同 IP** 的 STUN 端点。
+    if samples.len() == 1 {
+        warn!(
+            "[打洞] STUN 仅 1 个样本（{} 台里只有 1 台应答），无法判定映射行为，\
+             乐观按锥形处理；本次 NAT 分类不可信，打洞失败时优先怀疑这里",
+            stun_servers.len()
+        );
+    }
+    if class == NatClass::Cone && samples.len() >= 2 {
+        let distinct_hosts: std::collections::HashSet<&str> =
+            stun_servers.iter().map(|(h, _)| h.as_str()).collect();
+        if distinct_hosts.len() < 2 {
+            warn!(
+                "[打洞] 所有 STUN 目标都是同一个主机（{} 个端口），地址相关映射型\
+                 对称 NAT 会被误判为锥形；建议在服务端 [stun].fallback_servers \
+                 配置至少一台不同 IP 的 STUN",
+                stun_servers.len()
+            );
+        }
+    }
+
     let public_ip = samples.last().map(|m| m.ip.clone());
     let base_port = samples.last().map(|m| m.port).unwrap_or(0);
     let sample_ports: Vec<u16> = samples.iter().map(|m| m.port).collect();
@@ -376,10 +403,33 @@ pub fn build_targets(
     let mut out: Vec<SocketAddr> = Vec::new();
     let mut seen: HashSet<SocketAddr> = HashSet::new();
 
-    // 对端明确上报的候选永远要打——它们是最可靠的目标
+    // 策略指定的对端主公网地址（quiet 侧唯一允许打的公网 IPv4 目标）。
+    let base_public: Option<SocketAddr> = peer_profile
+        .public_ip
+        .as_ref()
+        .and_then(|s| s.parse::<IpAddr>().ok())
+        .map(|ip| SocketAddr::new(ip, peer_profile.base_port));
+
+    // 对端明确上报的候选永远要打——它们是最可靠的目标。
+    //
+    // 例外是 quiet 策略（原则 A 的落地点，此前 quiet 只被打印、从未被执行）：
+    // 本端是线性对称 NAT 时，每向一个**新的公网 IPv4 目标**发包，出口端口
+    // 计数器就前进一格，对端基于探测算出的端口预测立刻作废——候选越多，
+    // 自伤越彻底。所以 quiet 侧对公网 IPv4 只打策略指定的那一个固定目标；
+    // 内网候选（不经过本端 NAT，不消耗计数器）和 IPv6（无 NAT 端口映射）
+    // 不受限制。
     for c in peer_candidates {
         if let Ok(ip) = c.ip.parse::<IpAddr>() {
             let addr = SocketAddr::new(ip, c.port);
+            if params.quiet {
+                if let IpAddr::V4(v4) = ip {
+                    let is_local = v4.is_private() || v4.is_loopback() || v4.is_link_local();
+                    if !is_local && Some(addr) != base_public {
+                        debug!("[打洞] quiet：跳过计划外公网候选 {}", addr);
+                        continue;
+                    }
+                }
+            }
             if seen.insert(addr) {
                 out.push(addr);
             }
@@ -396,7 +446,15 @@ pub fn build_targets(
     };
 
     match params.target_port_mode {
-        TargetPortMode::Fixed => {}
+        TargetPortMode::Fixed => {
+            // 兜底：策略指定的主公网地址必须在目标表里。正常情况下它就在
+            // 对端上报的 srflx 候选中，但 quiet 过滤或候选缺失时不能漏掉它。
+            if let Some(addr) = base_public {
+                if seen.insert(addr) {
+                    out.push(addr);
+                }
+            }
+        }
         TargetPortMode::LinearPredict => {
             // 对端每向一个新目标发包端口就前进 step，
             // 向前预测若干格覆盖它打给我们时会用到的端口
@@ -614,12 +672,25 @@ pub async fn execute(
                             });
                         }
 
-                        // 立即密集回包，不等下一轮定时器
+                        // 立即回第一份，不等下一轮定时器；突发的后续几份丢给
+                        // 独立任务错峰发送。旧实现在接收循环里就地 sleep，每收
+                        // 一个包主循环就停摆 PRFLX_BURST×间隔 ≈ 50ms——期间既不
+                        // 发常规探测也不收包，撒网场景下回包越多、20ms 的发包
+                        // 节奏被打得越乱，"密集回包"反而成了拖垮打洞的一环。
                         let ack = make_ack(sent_at);
-                        for _ in 0..PRFLX_BURST {
-                            let _ = sock.send_to(&ack, from);
-                            tokio::time::sleep(Duration::from_millis(PRFLX_BURST_INTERVAL_MS))
-                                .await;
+                        let _ = sock.send_to(&ack, from);
+                        if PRFLX_BURST > 1 {
+                            let burst_sock = sock.clone();
+                            let burst_ack = ack.clone();
+                            tokio::spawn(async move {
+                                for _ in 1..PRFLX_BURST {
+                                    tokio::time::sleep(Duration::from_millis(
+                                        PRFLX_BURST_INTERVAL_MS,
+                                    ))
+                                    .await;
+                                    let _ = burst_sock.send_to(&burst_ack, from);
+                                }
+                            });
                         }
 
                         // 收到对方回显我们时间戳的包 = 双向确认完成
@@ -785,9 +856,27 @@ impl Session {
         stun_servers: &[(String, u16)],
         is_initiator: bool,
     ) -> Vec<IceCandidate> {
+        // 必须把双方的真实分类一并打出来：策略名会撒谎——任一侧探测失败
+        // （Unknown）时策略同样叫 cone_to_cone，只看策略名会得出"双方都是
+        // 锥形怎么还失败"的错误结论。detail 里带着 unknown/step 等第一手判定。
         info!(
-            "[打洞] 收到计划: 策略={} socket数={} 目标模式={:?} 宽度={} quiet={}",
+            "[打洞] 收到计划: 策略={} 本端NAT={}({}, 置信度{:.2}) 对端NAT={}({}, base_port={}) socket数={} 目标模式={:?} 宽度={} quiet={}",
             strategy.as_str(),
+            self.profile
+                .as_ref()
+                .map(|p| format!("{:?}", p.class))
+                .unwrap_or_else(|| "未探测".into()),
+            self.profile
+                .as_ref()
+                .map(|p| p.detail.clone())
+                .unwrap_or_default(),
+            self.profile
+                .as_ref()
+                .map(|p| p.step_confidence)
+                .unwrap_or(0.0),
+            format!("{:?}", peer_profile.class),
+            peer_profile.detail,
+            peer_profile.base_port,
             params.local_socket_count,
             params.target_port_mode,
             params.target_port_count,

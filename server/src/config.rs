@@ -75,7 +75,14 @@ pub struct StunConfig {
     pub public_addr: String,
     /// 备用的第三方公共 STUN 服务器，自建不可用时兜底。
     /// 格式 `"host:port"`。
-    #[serde(default)]
+    ///
+    /// 默认给两台国内可达的公共 STUN，除了兜底还有一个更重要的作用：
+    /// 自建 STUN 的主/备端口是**同一个 IP**，地址相关映射(ADM)型对称 NAT
+    /// （CGNAT 常见）对同一目标 IP 复用同一映射，两个端口探出来的端口必然
+    /// 相同，会被 100% 误判成锥形——区分它必须有至少两个**不同 IP** 的
+    /// STUN 端点。想彻底自主可控的话，用第二台自有服务器的 IP 替换即可，
+    /// 但不要清空成单 IP。
+    #[serde(default = "default_stun_fallback")]
     pub fallback_servers: Vec<String>,
 }
 
@@ -171,6 +178,14 @@ fn default_guest_port_end() -> u16 {
 fn default_token_ttl() -> u64 {
     120
 }
+fn default_stun_fallback() -> Vec<String> {
+    vec![
+        // 小米路由器全网默认 STUN，国内多线可达，长期稳定
+        "stun.miwifi.com:3478".to_string(),
+        // 腾讯公共 STUN
+        "stun.qq.com:3478".to_string(),
+    ]
+}
 fn default_true() -> bool {
     true
 }
@@ -248,7 +263,7 @@ impl Default for StunConfig {
             port: default_stun_port(),
             alt_port: default_stun_alt_port(),
             public_addr: String::new(),
-            fallback_servers: Vec::new(),
+            fallback_servers: default_stun_fallback(),
         }
     }
 }

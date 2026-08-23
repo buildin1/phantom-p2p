@@ -376,8 +376,18 @@ impl PlatformTun {
             event
         };
 
-        // 设置 IP 地址
-        set_ip_address_iphlp(name, address, netmask, mtu)?;
+        // 设置 IP 地址。失败必须走和上面几个分支一样的清理路径——这里曾经
+        // 直接 `?` 提前返回，已创建的 adapter/session/quit_event 全部泄漏：
+        // 适配器带着旧房间的虚拟 IP 一直挂在系统里，直到进程退出才消失，
+        // 和新房间的适配器抢路由。
+        if let Err(e) = set_ip_address_iphlp(name, address, netmask, mtu) {
+            unsafe {
+                (wintun.end_session)(session);
+                (wintun.close_adapter)(adapter);
+                CloseHandle(quit_event);
+            }
+            return Err(e);
+        }
 
         // 创建包通道
         let (packet_tx, packet_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
@@ -628,6 +638,8 @@ extern "system" {
     ) -> *mut c_void;
 
     fn SetEvent(hEvent: *mut c_void) -> i32;
+
+    fn CloseHandle(hObject: *mut c_void) -> i32;
 
     fn WaitForMultipleObjects(
         nCount: u32,
