@@ -9,7 +9,7 @@
 
 use serde::Deserialize;
 use std::path::PathBuf;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// 顶层配置
 #[derive(Debug, Clone, Deserialize)]
@@ -74,7 +74,7 @@ pub struct StunConfig {
     #[serde(default)]
     pub public_addr: String,
     /// 备用的第三方公共 STUN 服务器，自建不可用时兜底。
-    /// 格式 `"host:port"`。
+    /// 写法：`"host"`（默认端口 3478）或 `"host:port"`。
     ///
     /// 默认给两台国内可达的公共 STUN，除了兜底还有一个更重要的作用：
     /// 自建 STUN 的主/备端口是**同一个 IP**，地址相关映射(ADM)型对称 NAT
@@ -355,7 +355,16 @@ pub fn load_config() -> ServerConfig {
                         return cfg;
                     }
                     Err(e) => {
-                        warn!("[配置] 解析 {} 失败: {}，使用默认值", path.display(), e);
+                        // 拒绝启动而不是回退默认值：默认值的端口/地址与生产配置
+                        // 完全不同，带病启动等于把一次显眼的配置手误变成
+                        // "服务起来了但客户端全部连不上"的隐蔽故障（实测发生过：
+                        // fallback_servers 少了引号，服务端静默用默认配置跑了 3 分钟）
+                        error!(
+                            "[配置] 解析 {} 失败: {}\n配置文件有语法错误，拒绝启动；请修正后重启",
+                            path.display(),
+                            e
+                        );
+                        std::process::exit(1);
                     }
                 },
                 Err(e) => {
@@ -411,8 +420,11 @@ port = {}
 alt_port = {}
 # 对外公布的 STUN 地址，留空则复用 relay.public_addr
 public_addr = "{}"
-# 第三方公共 STUN 兜底（格式 "host:port"），自建不可用时使用
-fallback_servers = []
+# 第三方公共 STUN。写法："host"（默认端口 3478）或 "host:port"。
+# 除了自建不可用时兜底，还有个更重要的作用：判定地址相关映射(ADM)型
+# 对称 NAT（CGNAT 常见）必须有两个**不同 IP** 的采样端点，自建 STUN 的
+# 两个端口是同一个 IP，做不了这件事。别清空成单 IP。
+fallback_servers = [{}]
 
 [log_upload]
 # 是否启用日志包接收服务（关掉就无法远程排障）
@@ -449,6 +461,13 @@ bind = "{}"
         config.stun.port,
         config.stun.alt_port,
         config.stun.public_addr,
+        config
+            .stun
+            .fallback_servers
+            .iter()
+            .map(|s| format!("\"{}\"", s))
+            .collect::<Vec<_>>()
+            .join(", "),
         config.log_upload.enabled,
         config.log_upload.bind,
         config.log_upload.public_base,
