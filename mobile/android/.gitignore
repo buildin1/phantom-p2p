@@ -13,7 +13,9 @@ local.properties
 # cargo-ndk 的产物，构建时生成，不进仓库
 app/src/main/jniLibs/
 
-# 签名材料绝不入库
+# 签名材料绝不入库。这个 keystore 丢了就再也无法给已发布的应用推更新，
+# 请备份到仓库之外的安全位置。
 *.jks
 *.keystore
 keystore.properties
+*.base64.txt

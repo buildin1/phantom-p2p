@@ -1,3 +1,4 @@
+import java.io.File
 import java.util.Properties
 
 plugins {
@@ -57,38 +58,65 @@ android {
     // 签名
     //
     // 密钥材料的来源有两处，都不入库：
-    //   本地  keystore.properties（已在 .gitignore 里）
+    //   本地  keystore.properties（见 keystore.properties.example）
     //   CI    环境变量，由 Actions secrets 注入
     //
-    // 两处都没有时 releaseSigning 为 null，release 变体会退回**未签名**产物。
-    // 未签名的 APK 装不上，所以 CI 默认只构建 debug —— 见 android-dev.yml。
+    // 缺材料时**构建 release 会直接失败**，不产出未签名 APK ——
+    // 未签名的包装不上，安静地产出它只会让人下载完才发现白等一场。
     // ---------------------------------------------------------------------
     val keystoreProps = Properties().apply {
         val file = rootProject.file("keystore.properties")
         if (file.isFile) file.inputStream().use { load(it) }
     }
 
-    fun prop(key: String, env: String): String? =
-        keystoreProps.getProperty(key) ?: System.getenv(env)
+    fun signingValue(key: String, env: String): String? =
+        keystoreProps.getProperty(key)?.takeIf { it.isNotBlank() }
+            ?: System.getenv(env)?.takeIf { it.isNotBlank() }
 
-    val storeFilePath = prop("storeFile", "PHANTOM_KEYSTORE_PATH")
-    val hasSigningMaterial = storeFilePath != null && file(storeFilePath).isFile
+    val storeFilePath = signingValue("storeFile", "PHANTOM_KEYSTORE_PATH")
+    val resolvedStore = storeFilePath?.let { path ->
+        // 绝对路径（CI 注入的）直接用，相对路径按模块目录解析。
+        File(path).takeIf { it.isAbsolute } ?: rootProject.file(path)
+    }
+    val hasSigningMaterial = resolvedStore?.isFile == true
+
+    // 只在真的要构建 release 时才拦。改 UI 的人跑 assembleDebug 不该被签名挡住。
+    val buildingRelease = gradle.startParameter.taskNames.any {
+        it.contains("Release") || it.contains("bundle", ignoreCase = true)
+    }
+    if (buildingRelease && !hasSigningMaterial) {
+        throw GradleException(
+            """
+            缺少 release 签名材料，拒绝产出未签名 APK（未签名的包装不上）。
+
+            本地：复制 mobile/android/keystore.properties.example 为 keystore.properties 并填写，
+                  keystore 本身放在 mobile/android/ 下（已在 .gitignore 里）。
+            CI  ：配置 Actions secrets —— ANDROID_KEYSTORE_BASE64 / ANDROID_KEYSTORE_PASSWORD
+                  / ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD。
+
+            没有 keystore 就先生成一个：mobile/android/tools/new-keystore.ps1
+            """.trimIndent()
+        )
+    }
 
     signingConfigs {
         if (hasSigningMaterial) {
             create("release") {
-                storeFile = file(storeFilePath!!)
-                storePassword = prop("storePassword", "PHANTOM_KEYSTORE_PASSWORD")
-                keyAlias = prop("keyAlias", "PHANTOM_KEY_ALIAS")
-                keyPassword = prop("keyPassword", "PHANTOM_KEY_PASSWORD")
+                storeFile = resolvedStore
+                storePassword = signingValue("storePassword", "PHANTOM_KEYSTORE_PASSWORD")
+                keyAlias = signingValue("keyAlias", "PHANTOM_KEY_ALIAS")
+                keyPassword = signingValue("keyPassword", "PHANTOM_KEY_PASSWORD")
+                // v1 关掉：minSdk 26 起 v2/v3 就够了，v1 只是拖慢构建。
+                enableV1Signing = false
+                enableV2Signing = true
+                enableV3Signing = true
             }
         }
     }
 
     buildTypes {
         debug {
-            // debug 变体用 AGP 自动生成的 debug keystore 签名，
-            // 任何设备直接侧载即可安装 —— 这是 CI 产物的默认形态。
+            // 只为本地开发保留，CI 不构建它。加后缀是为了能和正式版并存装在同一台机器上。
             applicationIdSuffix = ".debug"
             versionNameSuffix = "-debug"
         }
@@ -100,12 +128,6 @@ android {
                 "proguard-rules.pro",
             )
             signingConfig = signingConfigs.findByName("release")
-            if (!hasSigningMaterial) {
-                logger.warn(
-                    "[phantom] 未找到签名材料，release 变体将产出未签名 APK（装不上）。" +
-                        "本地请建 mobile/android/keystore.properties，CI 请配 Actions secrets。"
-                )
-            }
         }
     }
 

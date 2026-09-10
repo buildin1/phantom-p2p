@@ -72,29 +72,31 @@ jobs:
           sdkmanager "ndk;27.2.12479018"
           cargo install cargo-ndk --locked
 
-      # debug 变体用 AGP 自动生成的 debug keystore 签名，产物可直接侧载安装。
-      # release 未配签名时产出的是 unsigned APK，装不上，所以不在默认路径里构建。
-      - name: 编译 debug
-        working-directory: mobile/android
+      # 缺 secrets 就当场停，别让人跑完十分钟才发现产物装不上。
+      - name: 检查签名 secrets
+        if: env.HAS_SIGNING != 'true'
         run: |
-          gradle --no-daemon \
-            assembleDevDebug assembleStandardDebug \
-            -Pphantom.buildRustNative=${{ env.BUILD_RUST_NATIVE }} \
-            --stacktrace
+          echo "::error::缺少 ANDROID_KEYSTORE_BASE64，无法产出可安装的 APK。"
+          echo "::error::请在仓库 Settings → Secrets and variables → Actions 配置："
+          echo "::error::  ANDROID_KEYSTORE_BASE64 / ANDROID_KEYSTORE_PASSWORD"
+          echo "::error::  ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD"
+          echo "::error::没有 keystore 就先跑 mobile/android/tools/new-keystore.ps1 生成一个。"
+          exit 1
 
-      - name: 单元测试
-        working-directory: mobile/android
-        run: gradle --no-daemon testDevDebugUnitTest --stacktrace
-
-      # 只有配齐了 secrets 才构建 release。没配就跳过，不产出装不上的未签名包。
       - name: 还原签名密钥
-        if: env.HAS_SIGNING == 'true'
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         run: echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/phantom-release.jks"
 
+      - name: 单元测试
+        working-directory: mobile/android
+        run: gradle --no-daemon testStandardReleaseUnitTest --stacktrace
+
+      # 两个 flavor 都出正式签名包：
+      #   dev      —— 自己人测试用，开发者选项可见，applicationId 带 .dev 后缀，
+      #                可以和正式版并存装在同一台机器上
+      #   standard —— 对外的正式版
       - name: 编译签名 release
-        if: env.HAS_SIGNING == 'true'
         working-directory: mobile/android
         env:
           PHANTOM_KEYSTORE_PATH: ${{ runner.temp }}/phantom-release.jks
@@ -102,13 +104,24 @@ jobs:
           PHANTOM_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           PHANTOM_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
-          gradle --no-daemon assembleStandardRelease \
+          gradle --no-daemon \
+            assembleDevRelease assembleStandardRelease \
             -Pphantom.buildRustNative=${{ env.BUILD_RUST_NATIVE }} \
             --stacktrace
 
       - name: 清理签名密钥
-        if: always() && env.HAS_SIGNING == 'true'
+        if: always()
         run: rm -f "$RUNNER_TEMP/phantom-release.jks"
+
+      # 证明产物真的签上了。签名坏掉时 apksigner 会在这里失败，
+      # 而不是等你传到手机上才看到「应用未安装」。
+      - name: 校验签名
+        run: |
+          APKSIGNER=$(find "$ANDROID_SDK_ROOT/build-tools" -name apksigner | sort | tail -1)
+          for apk in $(find mobile/android/app/build/outputs/apk -name '*.apk'); do
+            echo "── $apk"
+            "$APKSIGNER" verify --print-certs "$apk"
+          done
 
       - name: 收集产物
         run: |
