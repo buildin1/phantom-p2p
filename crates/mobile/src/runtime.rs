@@ -98,10 +98,7 @@ impl SessionRuntime {
 
         let config = ClientConfig::load();
         let identity = Arc::new(Identity::load_or_generate(&host.data_dir())?);
-        let signal = Arc::new(signal::client::SignalClient::new(
-            identity,
-            config.dev_mode,
-        ));
+        let signal = Arc::new(signal::client::SignalClient::new(identity, config.dev_mode));
         let stats = Arc::new(stats::StatsManager::new(false));
         stats.clone().start_sampling_task();
 
@@ -821,8 +818,8 @@ impl SessionRuntime {
                     peer_session_id.clone(),
                 )])));
                 tokio::spawn(async move {
-                    let _ =
-                        tunnel::start_host_tunnel(task_endpoint, stats, peer_map, tun, crypto).await;
+                    let _ = tunnel::start_host_tunnel(task_endpoint, stats, peer_map, tun, crypto)
+                        .await;
                 });
                 if let Some(peer) = state.host_peers.get_mut(&peer_session_id) {
                     peer.endpoint = Some(endpoint);
@@ -913,7 +910,9 @@ impl SessionRuntime {
             .first_connection_id()
             .await
             .unwrap_or_else(|| "peer".into());
-        self.stats.add_connection(user.clone(), "relay".into()).await;
+        self.stats
+            .add_connection(user.clone(), "relay".into())
+            .await;
 
         if is_host {
             // 同 token 且连接仍存活就不重连 —— 多 guest 房间里每次 RelayReady

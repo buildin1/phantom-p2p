@@ -233,7 +233,9 @@ pub extern "system" fn Java_com_buildin1_phantom_1p2p_engine_PhantomEngine_nativ
     phantom_core::socket_guard::set_protector(move |fd| guard_host.protect_socket(fd));
 
     match SessionRuntime::new(host) {
-        Ok(rt) => {
+        Ok(    engine()
+        .map(|rt| rt.is_tunnel_live() as jboolean)
+        .unwrap_or(0)) => {
             *ENGINE.lock() = Some(rt);
             tracing::info!("[引擎] 初始化完成");
             1
@@ -360,7 +362,9 @@ pub extern "system" fn Java_com_buildin1_phantom_1p2p_engine_PhantomEngine_nativ
     _env: JNIEnv,
     _class: JObject,
 ) {
-    let Some(rt) = ENGINE.lock().take() else { return };
+    let Some(rt) = ENGINE.lock().take() else {
+        return;
+    };
     TOKIO.block_on(async move {
         rt.disconnect().await;
     });
