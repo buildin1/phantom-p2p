@@ -2,7 +2,7 @@
 <resources>
     <!--
         全部界面由 Compose 绘制，这个主题只负责 Activity 启动到首帧之间的窗口底色。
-        底色写死成设计令牌里的 --bg（浅色 #F2F0EE），深色版本在 values-night 覆盖，
+        底色写死成设计令牌里的 bg（浅色 #F2F0EE），深色版本在 values-night 覆盖，
         否则冷启动会闪一下系统默认白。
     -->
     <style name="Theme.Phantom" parent="android:Theme.Material.Light.NoActionBar">
