@@ -97,6 +97,8 @@ pub async fn start_host_udp_tunnel(
             let relay_sock = TokioUdpSocket::bind("0.0.0.0:0")
                 .await
                 .map_err(|e| format!("绑定中继 UDP 失败: {}", e))?;
+            // 中继连接若走进自己的隧道，就是把中继流量再塞回中继，直接自锁
+            crate::socket_guard::protect(&relay_sock);
 
             // 发送 token 首包用于配对
             let token_frame = build_token_frame(&token);
@@ -197,6 +199,8 @@ pub async fn start_guest_udp_tunnel(
             let relay_sock = TokioUdpSocket::bind("0.0.0.0:0")
                 .await
                 .map_err(|e| format!("绑定中继 UDP 失败: {}", e))?;
+            // 中继连接若走进自己的隧道，就是把中继流量再塞回中继，直接自锁
+            crate::socket_guard::protect(&relay_sock);
 
             // 发送 token 首包
             let token_frame = build_token_frame(&token);

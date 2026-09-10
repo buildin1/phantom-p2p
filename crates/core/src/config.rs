@@ -2,6 +2,31 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
+use std::sync::OnceLock;
+
+/// 宿主注入的配置根目录。只在移动端使用。
+static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// 指定配置与数据的存放根目录。
+///
+/// 移动端必须在引擎启动前调用一次：Android 上传 `context.filesDir`。
+/// 桌面端不要调用，让它走 `dirs::config_dir()` 的默认位置 —— 改了会让
+/// 老用户的配置和身份密钥集体搬家，等于换了个身份。
+pub fn set_config_dir(dir: PathBuf) {
+    if CONFIG_DIR.set(dir).is_err() {
+        tracing::warn!("[配置] 配置目录已设置过，忽略重复设置");
+    }
+}
+
+/// 配置与数据的根目录。
+fn config_dir() -> PathBuf {
+    if let Some(dir) = CONFIG_DIR.get() {
+        return dir.clone();
+    }
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("phantom-p2p")
+}
 
 /// 用户模式固定信令地址（不允许被普通用户修改）
 pub const USER_MODE_SIGNAL_SERVER: &str = env!("OFFICIAL_SIGNAL_SERVER");
@@ -63,11 +88,12 @@ impl ClientConfig {
     }
 
     /// 获取配置文件路径
+    ///
+    /// 桌面端走 `dirs::config_dir()`。移动端那里没有对应概念，必须由宿主
+    /// 用 [`set_config_dir`] 显式注入（Android 是 `filesDir`），否则会落到
+    /// 进程当前目录 —— 在 Android 上那是 `/`，不可写。
     pub fn config_path() -> PathBuf {
-        let config_dir = dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("phantom-p2p");
-
+        let config_dir = config_dir();
         fs::create_dir_all(&config_dir).ok();
         config_dir.join("config.toml")
     }

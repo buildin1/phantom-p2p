@@ -668,6 +668,7 @@ pub async fn detect_filtering_behavior_async() -> FilteringProbeResult {
                 }
             }
         };
+        crate::socket_guard::protect(&sock);
 
         for &(host, port) in STUN_SERVERS {
             let Some(addr) = resolve_stun_addr(host, port) else {

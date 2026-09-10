@@ -339,6 +339,7 @@ fn probe_ipv6() -> (bool, Vec<String>) {
     let reachable = std::net::UdpSocket::bind("[::]:0")
         .ok()
         .and_then(|s| {
+            crate::socket_guard::protect(&s);
             s.connect("[2400:3200::1]:53")
                 .or_else(|_| s.connect("[2001:4860:4860::8888]:53"))
                 .ok()?;
