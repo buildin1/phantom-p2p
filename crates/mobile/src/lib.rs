@@ -233,9 +233,7 @@ pub extern "system" fn Java_com_buildin1_phantom_1p2p_engine_PhantomEngine_nativ
     phantom_core::socket_guard::set_protector(move |fd| guard_host.protect_socket(fd));
 
     match SessionRuntime::new(host) {
-        Ok(    engine()
-        .map(|rt| rt.is_tunnel_live() as jboolean)
-        .unwrap_or(0)) => {
+        Ok(rt) => {
             *ENGINE.lock() = Some(rt);
             tracing::info!("[引擎] 初始化完成");
             1
@@ -353,7 +351,9 @@ pub extern "system" fn Java_com_buildin1_phantom_1p2p_engine_PhantomEngine_nativ
     _env: JNIEnv,
     _class: JObject,
 ) -> jboolean {
-    engine().map(|rt| rt.is_tunnel_live() as jboolean).unwrap_or(0)
+    engine()
+        .map(|rt| rt.is_tunnel_live() as jboolean)
+        .unwrap_or(0)
 }
 
 /// 关停引擎。VpnService.onDestroy / onRevoke 时调用。
