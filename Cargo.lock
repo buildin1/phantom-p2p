@@ -3074,8 +3074,12 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "phantom-core",
+ "phantom-protocol",
  "quinn",
+ "serde",
+ "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
