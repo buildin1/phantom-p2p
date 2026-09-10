@@ -115,6 +115,14 @@ mod platform;
 #[cfg(target_os = "macos")]
 pub use platform::{provision as macos_provision_tun, ProvisionedTun as MacosProvisionedTun};
 
+/// Android 的 fd 交接入口，理由与上面的 macOS provision 同源：虚拟网卡不由
+/// core 创建（只有系统的 `VpnService` 有这个权限），宿主建好之后把裸 fd
+/// 交进来，`PlatformTun::create` 再认领它。见 `tun_android.rs` 的模块注释。
+#[cfg(target_os = "android")]
+pub use platform::{
+    discard_pending_fd as android_discard_tun_fd, provide_fd as android_provide_tun_fd,
+};
+
 /// TUN 设备
 pub struct TunDevice {
     inner: Arc<platform::PlatformTun>,

@@ -1,656 +1,387 @@
-use jni::objects::{GlobalRef, JByteArray, JObject, JString, JValue};
-use jni::sys::{jboolean, jint, jlong};
-use jni::{JNIEnv, JavaVM};
-use once_cell::sync::Lazy;
-use parking_lot::Mutex;
-use phantom_core::tunnel::{
-    build_relay_client_config, create_guest_connection, create_host_endpoint,
-};
-use std::collections::HashMap;
-use std::net::{SocketAddr, UdpSocket};
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
-use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::runtime::{Builder, Runtime};
-use tokio::sync::mpsc;
+//! Android JNI 导出面。
+//!
+//! # 边界在哪
+//!
+//! 这一层只做三件事：把 Java 类型翻成 Rust 类型、把 Rust 事件推回 Java、
+//! 管住 `SessionRuntime` 的生命周期。**任何编排逻辑都不该出现在这里** ——
+//! 那些在 [`runtime`] 里，引擎在 `phantom-core` 里。
+//!
+//! # 数据面不走这里
+//!
+//! 这里只有控制面：建房、入房、状态事件、统计、日志。IP 包**完全不经过 JNI**
+//! —— `VpnService` 交出的 fd 直接由 `phantom-core` 的 `tun_android` 用
+//! `AsyncFd` 读写。旧版本每个包都回调进 Kotlin 再送回 Rust，1160 字节 MTU
+//! 下满速是每秒几万次往返，那是自己给自己造的性能坑。
+//!
+//! # 为什么手写 JNI 而不是 UniFFI
+//!
+//! iOS 暂时挂起，"一份接口生成双端绑定"这个理由不成立。手写少一个构建步骤、
+//! CI 不用多装工具。等 iOS 回来再评估。
 
-static NEXT_HANDLE: AtomicI64 = AtomicI64::new(1);
-static NEXT_STREAM: AtomicI64 = AtomicI64::new(1);
-static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
-    // 2 个 worker 线程在 relay 场景下容易被同步 JNI 回调（见 ip_packet）和
-    // block_on 调用叠加占满，导致整个 Runtime 上所有连接一起卡死。
-    // 提升到 4 个线程：在典型 Android 设备（4核以上）上开销可接受，
-    // 同时显著降低"两个线程都被阻塞"的概率。
+mod host;
+mod runtime;
+
+use host::{RuntimeHost, TunRequest};
+use jni::objects::{GlobalRef, JObject, JString, JValue};
+use jni::sys::{jboolean, jint, JNI_TRUE};
+use jni::{JNIEnv, JavaVM};
+use once_cell::sync::{Lazy, OnceCell};
+use parking_lot::Mutex;
+use runtime::SessionRuntime;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::runtime::{Builder, Runtime};
+
+/// Tokio 运行时。
+///
+/// 4 个 worker：打洞阶段会有几十个 socket 并发收发，同时信令心跳、
+/// 统计采样、QUIC 都在跑。线程太少的话一个阻塞点就能把整个运行时卡住 ——
+/// 旧版本用 2 个线程，在中继场景下出现过整体卡死。
+static TOKIO: Lazy<Runtime> = Lazy::new(|| {
     Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
-        .thread_name("phantom-mobile")
+        .thread_name("phantom-engine")
         .build()
-        .expect("create phantom mobile tokio runtime")
+        .expect("创建 tokio 运行时失败")
 });
-static BRIDGES: Lazy<Mutex<HashMap<i64, BridgeState>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
-struct BridgeState {
-    _endpoint: Option<quinn::Endpoint>,
-    connection: quinn::Connection,
-    callback: Arc<NativeCallback>,
-    streams: HashMap<i64, StreamState>,
-    // One writer per QUIC PIP1 stream. A Host may have several Guest
-    // streams, so packets must be broadcast to every live peer.
-    packet_writers: Vec<mpsc::UnboundedSender<Vec<u8>>>,
+/// 全局引擎。移动端同一时刻只可能有一条隧道（系统只允许一个活跃 VPN），
+/// 所以不需要句柄表。
+static ENGINE: Lazy<Mutex<Option<Arc<SessionRuntime>>>> = Lazy::new(|| Mutex::new(None));
+
+/// JavaVM 只能取一次，之后任意线程都能靠它 attach 回 JVM。
+static JVM: OnceCell<JavaVM> = OnceCell::new();
+
+// ---------------------------------------------------------------------------
+// 宿主实现：所有回调都打到 Kotlin 侧的 PhantomEngine 对象上
+// ---------------------------------------------------------------------------
+
+struct AndroidHost {
+    callback: GlobalRef,
+    log_dir: PathBuf,
+    data_dir: PathBuf,
 }
 
-struct StreamState {
-    writer: mpsc::UnboundedSender<Vec<u8>>,
-}
-
-struct NativeCallback {
-    vm: JavaVM,
-    object: GlobalRef,
-}
-
-impl NativeCallback {
-    fn ip_packet(&self, data: &[u8]) {
-        let Ok(mut env) = self.vm.attach_current_thread() else {
-            return;
-        };
-        let Ok(array) = env.byte_array_from_slice(data) else {
-            return;
-        };
-        let array_obj = JObject::from(array);
-        let _ = env.call_method(
-            self.object.as_obj(),
-            "onNativeIpPacket",
-            "([B)V",
-            &[JValue::Object(&array_obj)],
-        );
-    }
-}
-impl NativeCallback {
-    fn tcp_data(&self, stream_id: i64, data: &[u8]) {
-        let Ok(mut env) = self.vm.attach_current_thread() else {
-            return;
-        };
-        let Ok(array) = env.byte_array_from_slice(data) else {
-            return;
-        };
-        let array_obj = JObject::from(array);
-        let _ = env.call_method(
-            self.object.as_obj(),
-            "onNativeTcpData",
-            "(J[B)V",
-            &[JValue::Long(stream_id), JValue::Object(&array_obj)],
-        );
-    }
-
-    fn tcp_closed(&self, stream_id: i64) {
-        let Ok(mut env) = self.vm.attach_current_thread() else {
-            return;
-        };
-        let _ = env.call_method(
-            self.object.as_obj(),
-            "onNativeTcpClosed",
-            "(J)V",
-            &[JValue::Long(stream_id)],
-        );
-    }
-
-    fn inbound_tcp_stream(&self, stream_id: i64, target_port: u16) {
-        let Ok(mut env) = self.vm.attach_current_thread() else {
-            return;
-        };
-        let _ = env.call_method(
-            self.object.as_obj(),
-            "onNativeInboundTcpStream",
-            "(JI)V",
-            &[JValue::Long(stream_id), JValue::Int(target_port as i32)],
-        );
+impl AndroidHost {
+    /// 附着到当前线程并执行一段 JNI 操作。
+    ///
+    /// 引擎的回调来自 tokio 的 worker 线程，那些线程 JVM 并不认识，
+    /// 必须先 attach。用 `attach_current_thread` 而不是 permanently 版本：
+    /// worker 线程是长期存活的，permanently 会让它们永远挂在 JVM 上，
+    /// 阻止 JVM 正常退出。
+    fn with_env<T>(&self, f: impl FnOnce(&mut JNIEnv, &JObject) -> Option<T>) -> Option<T> {
+        let vm = JVM.get()?;
+        let mut env = vm.attach_current_thread().ok()?;
+        let obj = self.callback.as_obj();
+        f(&mut env, obj)
     }
 }
 
-#[no_mangle]
-pub extern "system" fn Java_com_buildin1_phantom_1p2p_data_NativeQuicStreamBridge_nativeCreateBridge(
-    env: JNIEnv,
-    this: JObject,
-    mode: JString,
-    endpoint: JString,
-    relay_token: JString,
-    local_port: jint,
-    is_guest: jboolean,
-) -> jlong {
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        native_create_bridge_inner(env, this, mode, endpoint, relay_token, local_port, is_guest)
-    }));
-    result.unwrap_or(0)
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_buildin1_phantom_1p2p_data_NativePacketBridge_nativeCreateBridge(
-    env: JNIEnv,
-    this: JObject,
-    mode: JString,
-    endpoint: JString,
-    relay_token: JString,
-    local_port: jint,
-    is_guest: jboolean,
-) -> jlong {
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        native_create_bridge_inner(env, this, mode, endpoint, relay_token, local_port, is_guest)
-    }));
-    result.unwrap_or(0)
-}
-
-fn native_create_bridge_inner(
-    mut env: JNIEnv,
-    this: JObject,
-    mode: JString,
-    endpoint: JString,
-    relay_token: JString,
-    local_port: jint,
-    is_guest: jboolean,
-) -> jlong {
-    let mode = match env.get_string(&mode) {
-        Ok(value) => value.to_string_lossy().into_owned(),
-        Err(_) => return 0,
-    };
-    let endpoint = match env.get_string(&endpoint) {
-        Ok(value) => value.to_string_lossy().into_owned(),
-        Err(_) => return 0,
-    };
-    let relay_token = match env.get_string(&relay_token) {
-        Ok(value) => value.to_string_lossy().into_owned(),
-        Err(_) => return 0,
-    };
-    if mode != "p2p" && mode != "relay" {
-        throw_illegal_state(env, "unsupported native QUIC bridge mode");
-        return 0;
-    }
-
-    let Ok(peer_addr) = endpoint.parse::<SocketAddr>() else {
-        return 0;
-    };
-    let Ok(socket) = bind_udp_socket(local_port) else {
-        return 0;
-    };
-    if !protect_socket(&mut env, &this, &socket) {
-        return 0;
-    }
-    let Ok(vm) = env.get_java_vm() else {
-        return 0;
-    };
-    let Ok(object) = env.new_global_ref(this) else {
-        return 0;
-    };
-
-    let (endpoint_keepalive, connection) = if mode == "p2p" && is_guest != 0 {
-        match RUNTIME.block_on(async {
-            tokio::time::timeout(
-                Duration::from_secs(12),
-                create_guest_connection(socket, peer_addr),
+impl RuntimeHost for AndroidHost {
+    fn emit(&self, event: &str, payload: serde_json::Value) {
+        let payload = payload.to_string();
+        self.with_env(|env, obj| {
+            let event = env.new_string(event).ok()?;
+            let payload = env.new_string(payload).ok()?;
+            env.call_method(
+                obj,
+                "onEngineEvent",
+                "(Ljava/lang/String;Ljava/lang/String;)V",
+                &[JValue::Object(&event), JValue::Object(&payload)],
             )
-            .await
-        }) {
-            Ok(Ok(connection)) => (None, connection),
-            _ => return 0,
-        }
-    } else if mode == "p2p" {
-        match create_host_endpoint(socket) {
-            Ok(endpoint) => {
-                let accepted = RUNTIME.block_on(async {
-                    tokio::time::timeout(Duration::from_secs(90), async {
-                        let incoming = endpoint.accept().await.ok_or("accept failed")?;
-                        incoming.await.map_err(|_| "handshake failed")
-                    })
-                    .await
-                });
-                match accepted {
-                    Ok(Ok(connection)) => (Some(endpoint), connection),
-                    _ => return 0,
-                }
-            }
-            Err(_) => return 0,
-        }
-    } else {
-        match RUNTIME.block_on(connect_relay(socket, peer_addr, relay_token, is_guest != 0)) {
-            Ok(connection) => (None, connection),
-            Err(_) => return 0,
-        }
-    };
-
-    let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-    BRIDGES.lock().insert(
-        handle,
-        BridgeState {
-            _endpoint: endpoint_keepalive,
-            connection,
-            callback: Arc::new(NativeCallback { vm, object }),
-            streams: HashMap::new(),
-            packet_writers: Vec::new(),
-        },
-    );
-    let callback = BRIDGES
-        .lock()
-        .get(&handle)
-        .map(|bridge| bridge.callback.clone());
-    let connection = BRIDGES
-        .lock()
-        .get(&handle)
-        .map(|bridge| bridge.connection.clone());
-    if let (Some(callback), Some(connection)) = (callback, connection) {
-        RUNTIME.spawn(accept_inbound_streams(handle, connection, callback.clone()));
-        if mode == "p2p" && is_guest == 0 {
-            let endpoint = BRIDGES
-                .lock()
-                .get(&handle)
-                .and_then(|bridge| bridge._endpoint.clone());
-            if let Some(endpoint) = endpoint {
-                RUNTIME.spawn(accept_additional_connections(handle, endpoint, callback));
-            }
-        }
+            .ok()?;
+            Some(())
+        });
     }
-    handle as jlong
+
+    fn establish_tun(&self, request: &TunRequest) -> Result<i32, String> {
+        // 路由编码成 "10.66.0.0/24,10.66.0.1/32"：JNI 传字符串数组要建
+        // ObjectArray、逐个塞，为几条路由不值得。解析在 Kotlin 侧一行搞定。
+        let routes = request
+            .routes
+            .iter()
+            .map(|(addr, len)| format!("{}/{}", addr, len))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        self.with_env(|env, obj| {
+            let address = env.new_string(&request.address).ok()?;
+            let routes = env.new_string(&routes).ok()?;
+            let fd = env
+                .call_method(
+                    obj,
+                    "onEstablishTun",
+                    "(Ljava/lang/String;ILjava/lang/String;I)I",
+                    &[
+                        JValue::Object(&address),
+                        JValue::Int(request.prefix_len as jint),
+                        JValue::Object(&routes),
+                        JValue::Int(request.mtu as jint),
+                    ],
+                )
+                .ok()?
+                .i()
+                .ok()?;
+            Some(fd)
+        })
+        .ok_or_else(|| "JNI 调用 onEstablishTun 失败".to_string())
+        .and_then(|fd| {
+            if fd < 0 {
+                Err("VpnService 建立虚拟网卡失败（用户可能拒绝了权限）".into())
+            } else {
+                Ok(fd)
+            }
+        })
+    }
+
+    fn protect_socket(&self, fd: i32) -> bool {
+        self.with_env(|env, obj| {
+            env.call_method(obj, "onProtectSocket", "(I)Z", &[JValue::Int(fd)])
+                .ok()?
+                .z()
+                .ok()
+        })
+        .unwrap_or(false)
+    }
+
+    fn log_dir(&self) -> PathBuf {
+        self.log_dir.clone()
+    }
+
+    fn data_dir(&self) -> PathBuf {
+        self.data_dir.clone()
+    }
 }
 
+// ---------------------------------------------------------------------------
+// 工具
+// ---------------------------------------------------------------------------
+
+fn jstring_to_string(env: &mut JNIEnv, s: &JString) -> String {
+    env.get_string(s)
+        .map(|v| v.into())
+        .unwrap_or_else(|_| String::new())
+}
+
+/// 取当前引擎。没有就返回 None —— 所有导出函数都必须容忍这个，
+/// Kotlin 侧的调用时机不完全受我们控制（比如 Service 被系统重启）。
+fn engine() -> Option<Arc<SessionRuntime>> {
+    ENGINE.lock().clone()
+}
+
+// ---------------------------------------------------------------------------
+// 导出函数
+//
+// 命名必须与 Kotlin 侧 `com.buildin1.phantom_p2p.engine.PhantomEngine` 的
+// external 声明逐字对应。改名要两边一起改，且 proguard-rules.pro 里有 keep。
+// ---------------------------------------------------------------------------
+
+/// 初始化引擎。返回 true 表示成功。
+///
+/// `callback` 是 Kotlin 侧的 PhantomEngine 实例，引擎会在它上面回调
+/// `onEngineEvent` / `onEstablishTun` / `onProtectSocket`。
 #[no_mangle]
-pub extern "system" fn Java_com_buildin1_phantom_1p2p_data_NativePacketBridge_nativeStartPacketStream(
-    env: JNIEnv,
-    _this: JObject,
-    handle: jlong,
+pub extern "system" fn Java_com_buildin1_phantom_1p2p_engine_PhantomEngine_nativeInit(
+    mut env: JNIEnv,
+    _class: JObject,
+    callback: JObject,
+    log_dir: JString,
+    data_dir: JString,
+    dev_mode: jboolean,
 ) -> jboolean {
-    let (connection, callback) = {
-        let bridges = BRIDGES.lock();
-        let Some(bridge) = bridges.get(&(handle as i64)) else {
+    let log_dir = PathBuf::from(jstring_to_string(&mut env, &log_dir));
+    let data_dir = PathBuf::from(jstring_to_string(&mut env, &data_dir));
+
+    if JVM.get().is_none() {
+        match env.get_java_vm() {
+            Ok(vm) => {
+                let _ = JVM.set(vm);
+            }
+            Err(e) => {
+                eprintln!("[phantom] 取 JavaVM 失败: {e}");
+                return 0;
+            }
+        }
+    }
+
+    let callback = match env.new_global_ref(callback) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[phantom] 创建全局引用失败: {e}");
             return 0;
-        };
-        (bridge.connection.clone(), bridge.callback.clone())
+        }
     };
-    let opened = RUNTIME.block_on(async {
-        tokio::time::timeout(Duration::from_secs(12), connection.open_bi()).await
-    });
-    let (mut send, mut recv) = match opened {
-        Ok(Ok(streams)) => streams,
-        _ => return 0,
-    };
-    if RUNTIME.block_on(send.write_all(b"PIP1")).is_err() {
-        return 0;
+
+    // 日志必须最先起来：后面任何一步失败，唯一的线索就在日志里。
+    // 目录走 getExternalFilesDir()，否则没 root 看不到。
+    let _ = std::fs::create_dir_all(&log_dir);
+    if let Err(e) = phantom_core::logging::init(&log_dir, dev_mode == JNI_TRUE) {
+        eprintln!("[phantom] 日志初始化失败: {e}");
     }
-    let (writer, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    RUNTIME.spawn(async move {
-        while let Some(packet) = rx.recv().await {
-            if packet.len() < 20 || packet.len() > 65535 {
-                continue;
-            }
-            if send
-                .write_all(&(packet.len() as u16).to_be_bytes())
-                .await
-                .is_err()
-                || send.write_all(&packet).await.is_err()
-            {
-                break;
-            }
-        }
-        let _ = send.finish();
+    phantom_core::DEV_MODE.store(dev_mode == JNI_TRUE, std::sync::atomic::Ordering::Relaxed);
+
+    let host = Arc::new(AndroidHost {
+        callback,
+        log_dir,
+        data_dir,
     });
-    let read_callback = callback.clone();
-    RUNTIME.spawn(async move {
-        let mut len = [0u8; 2];
-        loop {
-            if recv.read_exact(&mut len).await.is_err() {
-                break;
-            }
-            let size = u16::from_be_bytes(len) as usize;
-            if !(20..=65535).contains(&size) {
-                break;
-            }
-            let mut packet = vec![0u8; size];
-            if recv.read_exact(&mut packet).await.is_err() {
-                break;
-            }
-            // ip_packet() 内部是同步阻塞的 JNI 调用（attach_current_thread + call_method），
-            // 直接在 async worker 线程上执行会占用 RUNTIME 的宝贵线程；
-            // 用 spawn_blocking 移到专用阻塞线程池执行，await 该 JoinHandle 不会阻塞 worker。
-            let cb = read_callback.clone();
-            let _ = tokio::task::spawn_blocking(move || cb.ip_packet(&packet)).await;
+
+    // socket 保护钩子必须在任何 bind 之前注册 —— core 里十几处 bind
+    // 分布在六个模块，漏一个那条路径的流量就会被自己的隧道吞掉。
+    let guard_host = host.clone();
+    phantom_core::socket_guard::set_protector(move |fd| guard_host.protect_socket(fd));
+
+    match SessionRuntime::new(host) {
+        Ok(rt) => {
+            *ENGINE.lock() = Some(rt);
+            tracing::info!("[引擎] 初始化完成");
+            1
         }
-    });
-    if let Some(bridge) = BRIDGES.lock().get_mut(&(handle as i64)) {
-        bridge.packet_writers.push(writer);
-        1
-    } else {
-        0
+        Err(e) => {
+            tracing::error!("[引擎] 初始化失败: {}", e);
+            0
+        }
     }
 }
 
+/// 连接信令服务器。
 #[no_mangle]
-pub extern "system" fn Java_com_buildin1_phantom_1p2p_data_NativePacketBridge_nativeWritePacket(
+pub extern "system" fn Java_com_buildin1_phantom_1p2p_engine_PhantomEngine_nativeConnectSignal(
     mut env: JNIEnv,
-    _this: JObject,
-    handle: jlong,
-    data: JByteArray,
+    _class: JObject,
+    url: JString,
 ) {
-    let Some(data) = byte_array_to_vec(&mut env, data) else {
-        return;
-    };
-    if let Some(bridge) = BRIDGES.lock().get_mut(&(handle as i64)) {
-        bridge.packet_writers.retain(|writer| !writer.is_closed());
-        for writer in &bridge.packet_writers {
-            let _ = writer.send(data.clone());
+    let url = jstring_to_string(&mut env, &url);
+    let Some(rt) = engine() else { return };
+    TOKIO.spawn(async move {
+        rt.connect_signal(url).await;
+    });
+}
+
+/// 建房。房间码由服务端分配，通过 `signal:room_created` 事件回来。
+#[no_mangle]
+pub extern "system" fn Java_com_buildin1_phantom_1p2p_engine_PhantomEngine_nativeCreateRoom(
+    _env: JNIEnv,
+    _class: JObject,
+) {
+    let Some(rt) = engine() else { return };
+    TOKIO.spawn(async move {
+        if let Err(e) = rt.create_room().await {
+            tracing::error!("[引擎] 建房失败: {}", e);
         }
-    }
+    });
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_buildin1_phantom_1p2p_data_NativeQuicStreamBridge_nativeOpenTcpStream(
-    env: JNIEnv,
-    _this: JObject,
-    handle: jlong,
-    target_port: jint,
-) -> jlong {
-    if target_port <= 0 || target_port > 65535 {
-        throw_illegal_state(env, "invalid target port");
-        return 0;
-    }
-
-    let (connection, callback) = {
-        let bridges = BRIDGES.lock();
-        let Some(bridge) = bridges.get(&(handle as i64)) else {
-            return 0;
-        };
-        (bridge.connection.clone(), bridge.callback.clone())
-    };
-
-    let opened = RUNTIME.block_on(async {
-        tokio::time::timeout(Duration::from_secs(8), connection.open_bi()).await
-    });
-    let (mut send, mut recv) = match opened {
-        Ok(Ok(streams)) => streams,
-        _ => return 0,
-    };
-
-    let port_header = (target_port as u16).to_be_bytes();
-    if RUNTIME.block_on(send.write_all(&port_header)).is_err() {
-        let _ = send.finish();
-        return 0;
-    }
-
-    let stream_id = NEXT_STREAM.fetch_add(1, Ordering::Relaxed);
-    let (writer, mut receiver) = mpsc::unbounded_channel::<Vec<u8>>();
-    RUNTIME.spawn(async move {
-        while let Some(data) = receiver.recv().await {
-            if send.write_all(&data).await.is_err() {
-                break;
-            }
-        }
-        let _ = send.finish();
-    });
-
-    let read_callback = callback.clone();
-    RUNTIME.spawn(async move {
-        let mut buffer = vec![0u8; 64 * 1024];
-        loop {
-            match recv.read(&mut buffer).await {
-                Ok(Some(n)) if n > 0 => read_callback.tcp_data(stream_id, &buffer[..n]),
-                Ok(Some(_)) => continue,
-                Ok(None) => break,
-                Err(_) => break,
-            }
-        }
-        read_callback.tcp_closed(stream_id);
-    });
-
-    let mut bridges = BRIDGES.lock();
-    let Some(bridge) = bridges.get_mut(&(handle as i64)) else {
-        return 0;
-    };
-    bridge.streams.insert(stream_id, StreamState { writer });
-    stream_id as jlong
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_buildin1_phantom_1p2p_data_NativeQuicStreamBridge_nativeWriteTcpStream(
+pub extern "system" fn Java_com_buildin1_phantom_1p2p_engine_PhantomEngine_nativeJoinRoom(
     mut env: JNIEnv,
-    _this: JObject,
-    handle: jlong,
-    stream_id: jlong,
-    data: JByteArray,
+    _class: JObject,
+    room_code: JString,
 ) {
-    let Some(data) = byte_array_to_vec(&mut env, data) else {
-        throw_illegal_state(env, "invalid byte array");
-        return;
-    };
-    let bridges = BRIDGES.lock();
-    let Some(bridge) = bridges.get(&(handle as i64)) else {
-        throw_illegal_state(env, "native bridge handle not found");
-        return;
-    };
-    let Some(stream) = bridge.streams.get(&(stream_id as i64)) else {
-        throw_illegal_state(env, "native TCP stream not found");
-        return;
-    };
-    if stream.writer.send(data).is_err() {
-        throw_illegal_state(env, "native TCP stream is closed");
-    }
+    let code = jstring_to_string(&mut env, &room_code);
+    let Some(rt) = engine() else { return };
+    TOKIO.spawn(async move {
+        if let Err(e) = rt.join_room(code).await {
+            tracing::error!("[引擎] 入房失败: {}", e);
+        }
+    });
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_buildin1_phantom_1p2p_data_NativeQuicStreamBridge_nativeCloseTcpStream(
+pub extern "system" fn Java_com_buildin1_phantom_1p2p_engine_PhantomEngine_nativeLeaveRoom(
     _env: JNIEnv,
-    _this: JObject,
-    handle: jlong,
-    stream_id: jlong,
+    _class: JObject,
 ) {
-    if let Some(bridge) = BRIDGES.lock().get_mut(&(handle as i64)) {
-        bridge.streams.remove(&(stream_id as i64));
-    }
+    let Some(rt) = engine() else { return };
+    TOKIO.spawn(async move {
+        let _ = rt.leave_room().await;
+    });
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_buildin1_phantom_1p2p_data_NativeQuicStreamBridge_nativeCloseBridge(
+pub extern "system" fn Java_com_buildin1_phantom_1p2p_engine_PhantomEngine_nativeDisconnect(
     _env: JNIEnv,
-    _this: JObject,
-    handle: jlong,
+    _class: JObject,
 ) {
-    if let Some(bridge) = BRIDGES.lock().remove(&(handle as i64)) {
-        bridge.connection.close(0u32.into(), b"closed");
-    }
+    let Some(rt) = engine() else { return };
+    TOKIO.spawn(async move {
+        rt.disconnect().await;
+    });
 }
 
+/// 请求上传日志（用户点「反馈问题」）。
 #[no_mangle]
-pub extern "system" fn Java_com_buildin1_phantom_1p2p_data_NativePacketBridge_nativeCloseBridge(
+pub extern "system" fn Java_com_buildin1_phantom_1p2p_engine_PhantomEngine_nativeUploadLogs(
+    mut env: JNIEnv,
+    _class: JObject,
+    reason: JString,
+) {
+    let reason = jstring_to_string(&mut env, &reason);
+    let Some(rt) = engine() else { return };
+    TOKIO.spawn(async move {
+        if let Err(e) = rt.request_log_upload(reason).await {
+            tracing::warn!("[引擎] 请求日志上传失败: {}", e);
+        }
+    });
+}
+
+/// 取一次统计快照，返回 JSON 字符串。
+///
+/// 用轮询而不是推送：统计本来就是秒级刷新的，推送要多维护一条事件通道，
+/// 而界面只在可见时才需要它。
+#[no_mangle]
+pub extern "system" fn Java_com_buildin1_phantom_1p2p_engine_PhantomEngine_nativeStatsJson<'a>(
+    env: JNIEnv<'a>,
+    _class: JObject<'a>,
+) -> JString<'a> {
+    let empty = || env.new_string("{}").expect("创建空 JSON 字符串失败");
+
+    let Some(rt) = engine() else { return empty() };
+    let snapshot = TOKIO.block_on(async move { rt.stats_snapshot().await });
+    match serde_json::to_string(&snapshot) {
+        Ok(json) => env.new_string(json).unwrap_or_else(|_| empty()),
+        Err(_) => empty(),
+    }
+}
+
+/// 隧道是否在跑。VpnService 用它决定前台通知的状态。
+#[no_mangle]
+pub extern "system" fn Java_com_buildin1_phantom_1p2p_engine_PhantomEngine_nativeIsTunnelLive(
     _env: JNIEnv,
-    _this: JObject,
-    handle: jlong,
+    _class: JObject,
+) -> jboolean {
+    engine().map(|rt| rt.is_tunnel_live() as jboolean).unwrap_or(0)
+}
+
+/// 关停引擎。VpnService.onDestroy / onRevoke 时调用。
+#[no_mangle]
+pub extern "system" fn Java_com_buildin1_phantom_1p2p_engine_PhantomEngine_nativeShutdown(
+    _env: JNIEnv,
+    _class: JObject,
 ) {
-    if let Some(bridge) = BRIDGES.lock().remove(&(handle as i64)) {
-        bridge.connection.close(0u32.into(), b"closed");
-    }
+    let Some(rt) = ENGINE.lock().take() else { return };
+    TOKIO.block_on(async move {
+        rt.disconnect().await;
+    });
+    tracing::info!("[引擎] 已关停");
 }
 
-fn bind_udp_socket(local_port: i32) -> std::io::Result<UdpSocket> {
-    let bind_addr = if local_port > 0 && local_port <= 65535 {
-        format!("0.0.0.0:{}", local_port)
-    } else {
-        "0.0.0.0:0".to_string()
-    };
-    let socket = UdpSocket::bind(bind_addr)?;
-    socket.set_nonblocking(true)?;
-    Ok(socket)
+/// 引擎是否已初始化。进程被系统重建后 Kotlin 侧用它判断要不要重新 init。
+#[no_mangle]
+pub extern "system" fn Java_com_buildin1_phantom_1p2p_engine_PhantomEngine_nativeIsReady(
+    _env: JNIEnv,
+    _class: JObject,
+) -> jboolean {
+    ENGINE.lock().is_some() as jboolean
 }
 
-async fn connect_relay(
-    socket: UdpSocket,
-    relay_addr: SocketAddr,
-    token: String,
-    is_guest: bool,
-) -> Result<quinn::Connection, String> {
-    let runtime = quinn::default_runtime().ok_or("quinn runtime unavailable")?;
-    let mut endpoint =
-        quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)
-            .map_err(|e| e.to_string())?;
-    endpoint.set_default_client_config(build_relay_client_config()?);
-    let connection = tokio::time::timeout(
-        Duration::from_secs(30),
-        endpoint
-            .connect(relay_addr, "phantom-relay")
-            .map_err(|e| e.to_string())?,
-    )
-    .await
-    .map_err(|_| "relay connect timeout".to_string())?
-    .map_err(|e| e.to_string())?;
-    let (mut send, mut recv) = connection.open_bi().await.map_err(|e| e.to_string())?;
-    let role = if is_guest { "guest" } else { "host" };
-    send.write_all(format!("{}|{}", role, token).as_bytes())
-        .await
-        .map_err(|e| e.to_string())?;
-    send.finish().map_err(|e| e.to_string())?;
-    let mut response = [0u8; 16];
-    let n = tokio::time::timeout(Duration::from_secs(90), recv.read(&mut response))
-        .await
-        .map_err(|_| "relay pair timeout".to_string())?
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "relay closed".to_string())?;
-    if &response[..n] != b"OK" {
-        return Err(String::from_utf8_lossy(&response[..n]).to_string());
-    }
-    Ok(connection)
-}
-
-async fn accept_inbound_streams(
-    handle: i64,
-    connection: quinn::Connection,
-    callback: Arc<NativeCallback>,
+/// 保留：让 Kotlin 侧能显式丢弃一个已建但未被认领的 TUN fd。
+/// 建隧道中途被取消时用，避免 fd 泄漏。
+#[no_mangle]
+pub extern "system" fn Java_com_buildin1_phantom_1p2p_engine_PhantomEngine_nativeDiscardTunFd(
+    _env: JNIEnv,
+    _class: JObject,
 ) {
-    loop {
-        let Ok((mut send, mut recv)) = connection.accept_bi().await else {
-            break;
-        };
-        let mut header = [0u8; 4];
-        if recv.read_exact(&mut header).await.is_err() {
-            let _ = send.finish();
-            continue;
-        }
-        if &header == b"PIP1" {
-            let (writer, mut packets) = mpsc::unbounded_channel::<Vec<u8>>();
-            if let Some(bridge) = BRIDGES.lock().get_mut(&handle) {
-                bridge.packet_writers.push(writer);
-            }
-            RUNTIME.spawn(async move {
-                while let Some(packet) = packets.recv().await {
-                    if packet.len() < 20 || packet.len() > 65535 {
-                        continue;
-                    }
-                    if send
-                        .write_all(&(packet.len() as u16).to_be_bytes())
-                        .await
-                        .is_err()
-                        || send.write_all(&packet).await.is_err()
-                    {
-                        break;
-                    }
-                }
-                let _ = send.finish();
-            });
-            let read_callback = callback.clone();
-            RUNTIME.spawn(async move {
-                let mut len = [0u8; 2];
-                loop {
-                    if recv.read_exact(&mut len).await.is_err() {
-                        break;
-                    }
-                    let size = u16::from_be_bytes(len) as usize;
-                    if !(20..=65535).contains(&size) {
-                        break;
-                    }
-                    let mut packet = vec![0u8; size];
-                    if recv.read_exact(&mut packet).await.is_err() {
-                        break;
-                    }
-                    // 同上：避免同步 JNI 回调阻塞 async worker 线程。
-                    let cb = read_callback.clone();
-                    let _ = tokio::task::spawn_blocking(move || cb.ip_packet(&packet)).await;
-                }
-            });
-            continue;
-        }
-        let target_port = u16::from_be_bytes([header[0], header[1]]);
-        let stream_id = NEXT_STREAM.fetch_add(1, Ordering::Relaxed);
-        let (writer, mut receiver) = mpsc::unbounded_channel::<Vec<u8>>();
-        if let Some(bridge) = BRIDGES.lock().get_mut(&handle) {
-            bridge.streams.insert(stream_id, StreamState { writer });
-        }
-        callback.inbound_tcp_stream(stream_id, target_port);
-
-        let mut send_stream = send;
-        RUNTIME.spawn(async move {
-            while let Some(data) = receiver.recv().await {
-                if send_stream.write_all(&data).await.is_err() {
-                    break;
-                }
-            }
-            let _ = send_stream.finish();
-        });
-
-        let read_callback = callback.clone();
-        RUNTIME.spawn(async move {
-            let mut buffer = vec![0u8; 64 * 1024];
-            loop {
-                match recv.read(&mut buffer).await {
-                    Ok(Some(n)) if n > 0 => read_callback.tcp_data(stream_id, &buffer[..n]),
-                    Ok(Some(_)) => continue,
-                    Ok(None) => break,
-                    Err(_) => break,
-                }
-            }
-            BRIDGES
-                .lock()
-                .get_mut(&handle)
-                .map(|bridge| bridge.streams.remove(&stream_id));
-            read_callback.tcp_closed(stream_id);
-        });
-    }
-}
-
-async fn accept_additional_connections(
-    handle: i64,
-    endpoint: quinn::Endpoint,
-    callback: Arc<NativeCallback>,
-) {
-    while let Some(incoming) = endpoint.accept().await {
-        let Ok(connection) = incoming.await else {
-            continue;
-        };
-        RUNTIME.spawn(accept_inbound_streams(handle, connection, callback.clone()));
-    }
-}
-
-#[cfg(unix)]
-fn protect_socket(env: &mut JNIEnv, object: &JObject, socket: &UdpSocket) -> bool {
-    match env.call_method(
-        object,
-        "onProtectSocket",
-        "(I)Z",
-        &[JValue::Int(socket.as_raw_fd())],
-    ) {
-        Ok(value) => value.z().unwrap_or(false),
-        Err(_) => false,
-    }
-}
-
-#[cfg(not(unix))]
-fn protect_socket(_env: &mut JNIEnv, _object: &JObject, _socket: &UdpSocket) -> bool {
-    true
-}
-
-fn byte_array_to_vec(env: &mut JNIEnv, data: JByteArray) -> Option<Vec<u8>> {
-    let len = env.get_array_length(&data).ok()?;
-    let mut out = vec![0; len as usize];
-    env.get_byte_array_region(data, 0, &mut out).ok()?;
-    Some(out.into_iter().map(|value| value as u8).collect())
-}
-
-fn throw_illegal_state(mut env: JNIEnv, message: &str) {
-    let _ = env.throw_new("java/lang/IllegalStateException", message);
+    phantom_core::tun::android_discard_tun_fd();
 }
