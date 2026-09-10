@@ -34,6 +34,10 @@ jobs:
   build:
     name: 编译 APK
     runs-on: ubuntu-24.04
+    env:
+      # secrets 上下文在 step 的 if: 里读不到，必须先在 job 级映射成 env。
+      # 没配签名 secrets 时这里是 'false'，release 相关步骤整段跳过。
+      HAS_SIGNING: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -68,17 +72,43 @@ jobs:
           sdkmanager "ndk;27.2.12479018"
           cargo install cargo-ndk --locked
 
-      - name: 编译
+      # debug 变体用 AGP 自动生成的 debug keystore 签名，产物可直接侧载安装。
+      # release 未配签名时产出的是 unsigned APK，装不上，所以不在默认路径里构建。
+      - name: 编译 debug
         working-directory: mobile/android
         run: |
           gradle --no-daemon \
-            assembleDevDebug assembleStandardRelease \
+            assembleDevDebug assembleStandardDebug \
             -Pphantom.buildRustNative=${{ env.BUILD_RUST_NATIVE }} \
             --stacktrace
 
       - name: 单元测试
         working-directory: mobile/android
         run: gradle --no-daemon testDevDebugUnitTest --stacktrace
+
+      # 只有配齐了 secrets 才构建 release。没配就跳过，不产出装不上的未签名包。
+      - name: 还原签名密钥
+        if: env.HAS_SIGNING == 'true'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/phantom-release.jks"
+
+      - name: 编译签名 release
+        if: env.HAS_SIGNING == 'true'
+        working-directory: mobile/android
+        env:
+          PHANTOM_KEYSTORE_PATH: ${{ runner.temp }}/phantom-release.jks
+          PHANTOM_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          PHANTOM_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          PHANTOM_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          gradle --no-daemon assembleStandardRelease \
+            -Pphantom.buildRustNative=${{ env.BUILD_RUST_NATIVE }} \
+            --stacktrace
+
+      - name: 清理签名密钥
+        if: always() && env.HAS_SIGNING == 'true'
+        run: rm -f "$RUNNER_TEMP/phantom-release.jks"
 
       - name: 收集产物
         run: |

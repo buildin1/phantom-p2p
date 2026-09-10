@@ -53,8 +53,42 @@ android {
         buildConfigField("int", "TUN_MTU", "1160")
     }
 
+    // ---------------------------------------------------------------------
+    // 签名
+    //
+    // 密钥材料的来源有两处，都不入库：
+    //   本地  keystore.properties（已在 .gitignore 里）
+    //   CI    环境变量，由 Actions secrets 注入
+    //
+    // 两处都没有时 releaseSigning 为 null，release 变体会退回**未签名**产物。
+    // 未签名的 APK 装不上，所以 CI 默认只构建 debug —— 见 android-dev.yml。
+    // ---------------------------------------------------------------------
+    val keystoreProps = Properties().apply {
+        val file = rootProject.file("keystore.properties")
+        if (file.isFile) file.inputStream().use { load(it) }
+    }
+
+    fun prop(key: String, env: String): String? =
+        keystoreProps.getProperty(key) ?: System.getenv(env)
+
+    val storeFilePath = prop("storeFile", "PHANTOM_KEYSTORE_PATH")
+    val hasSigningMaterial = storeFilePath != null && file(storeFilePath).isFile
+
+    signingConfigs {
+        if (hasSigningMaterial) {
+            create("release") {
+                storeFile = file(storeFilePath!!)
+                storePassword = prop("storePassword", "PHANTOM_KEYSTORE_PASSWORD")
+                keyAlias = prop("keyAlias", "PHANTOM_KEY_ALIAS")
+                keyPassword = prop("keyPassword", "PHANTOM_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         debug {
+            // debug 变体用 AGP 自动生成的 debug keystore 签名，
+            // 任何设备直接侧载即可安装 —— 这是 CI 产物的默认形态。
             applicationIdSuffix = ".debug"
             versionNameSuffix = "-debug"
         }
@@ -65,6 +99,13 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
+            signingConfig = signingConfigs.findByName("release")
+            if (!hasSigningMaterial) {
+                logger.warn(
+                    "[phantom] 未找到签名材料，release 变体将产出未签名 APK（装不上）。" +
+                        "本地请建 mobile/android/keystore.properties，CI 请配 Actions secrets。"
+                )
+            }
         }
     }
 
