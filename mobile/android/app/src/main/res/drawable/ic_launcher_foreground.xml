@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    图标取接线台的母题：两个插口 + 一条接通的线。
+    108dp 画布，安全区是居中的 72dp，所有笔画都收在里面。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 接线 -->
+    <path
+        android:pathData="M36,54 L72,54"
+        android:strokeColor="#C2481A"
+        android:strokeWidth="5"
+        android:strokeLineCap="round" />
+
+    <!-- 左插口 -->
+    <path
+        android:pathData="M36,54m-14,0a14,14 0 1,0 28,0a14,14 0 1,0 -28,0"
+        android:strokeColor="#C2481A"
+        android:strokeWidth="5"
+        android:fillColor="#00000000" />
+    <path
+        android:pathData="M36,54m-5,0a5,5 0 1,0 10,0a5,5 0 1,0 -10,0"
+        android:fillColor="#C2481A" />
+
+    <!-- 右插口 -->
+    <path
+        android:pathData="M72,54m-14,0a14,14 0 1,0 28,0a14,14 0 1,0 -28,0"
+        android:strokeColor="#C2481A"
+        android:strokeWidth="5"
+        android:fillColor="#00000000" />
+    <path
+        android:pathData="M72,54m-5,0a5,5 0 1,0 10,0a5,5 0 1,0 -10,0"
+        android:fillColor="#C2481A" />
+</vector>

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        这里只放 Compose 之前需要的颜色（启动窗口底、自适应图标背景）。
+        真正的设计令牌全部在 ui/theme/Color.kt，不要在这里再抄一份 —— 两处会漂移。
+    -->
+    <color name="window_background">#F2F0EE</color>
+    <color name="ic_launcher_background">#191716</color>
+</resources>

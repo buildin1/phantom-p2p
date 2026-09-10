@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<data-extraction-rules>
+    <!--
+        身份私钥（identity.key）绝不参与备份或设备迁移：
+        它是这台设备的身份，跟着备份跑会让两台设备顶着同一个 user_id。
+    -->
+    <cloud-backup>
+        <exclude domain="file" path="." />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="file" path="." />
+    </device-transfer>
+</data-extraction-rules>

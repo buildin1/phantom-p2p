@@ -1,0 +1,19 @@
+*.iml
+.gradle/
+.kotlin/
+/local.properties
+/.idea/
+.DS_Store
+build/
+captures/
+.externalNativeBuild/
+.cxx/
+local.properties
+
+# cargo-ndk 的产物，构建时生成，不进仓库
+app/src/main/jniLibs/
+
+# 签名材料绝不入库
+*.jks
+*.keystore
+keystore.properties

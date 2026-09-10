@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Phantom</string>
+
+    <!-- 通知渠道：前台服务常驻通知 -->
+    <string name="channel_tunnel_name">连接状态</string>
+    <string name="channel_tunnel_desc">显示当前连接状态，并提供断开与重连的快捷操作</string>
+
+    <string name="notif_connected_title">已接通</string>
+    <string name="notif_connecting_title">正在连接…</string>
+    <string name="notif_idle_title">线路空闲</string>
+    <string name="notif_action_disconnect">断开</string>
+    <string name="notif_action_reconnect">重连</string>
+</resources>

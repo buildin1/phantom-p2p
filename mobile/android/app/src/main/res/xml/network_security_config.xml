@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!--
+        信令目前是 ws://（明文）。等服务端切到 wss:// 后删掉整个 domain-config，
+        让默认的「禁止明文」生效。域名与端口的唯一来源是仓库根 official.env,
+        这里改了那边不改就会连不上。
+    -->
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">qx.coreyuan.cn</domain>
+    </domain-config>
+</network-security-config>
