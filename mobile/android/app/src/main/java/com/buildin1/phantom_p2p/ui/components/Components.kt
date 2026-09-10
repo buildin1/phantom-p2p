@@ -225,7 +225,7 @@ fun LatencySparkline(
 fun RoomCodeInput(
     code: String,
     modifier: Modifier = Modifier,
-    onClick: () -> Unit = {},
+    onClick: () -> Unit,
 ) {
     val colors = PhantomTheme.colors
     Row(
@@ -495,9 +495,19 @@ fun RowDivider() {
     )
 }
 
-/** 房间码历史芯片。 */
+/**
+ * 房间码历史芯片。
+ *
+ * 参数顺序按 Compose 惯例：必填在前、`modifier` 作为第一个可选参数、
+ * 回调放最后 —— 这样尾随 lambda 才会绑到 [onClick] 而不是 `modifier`。
+ */
 @Composable
-fun RoomChip(code: String, hint: String, onClick: () -> Unit, modifier: Modifier = Modifier) {
+fun RoomChip(
+    code: String,
+    hint: String,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
     val colors = PhantomTheme.colors
     Row(
         modifier = modifier
@@ -545,7 +555,7 @@ private fun ComponentsPreview() = PhantomPreview {
         MetricsRow(
             LinkStats(12, 0.3, 1.2, 3.4, listOf(14, 12, 15, 11, 13, 10, 12)),
         )
-        RoomCodeInput("7K2M")
+        RoomCodeInput("7K2M") {}
         PhantomCard {
             CardLabel("推进")
             PhaseList(PunchPhase.Punching)
