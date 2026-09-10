@@ -95,6 +95,8 @@ fn get_all_local_ipv4s() -> Vec<String> {
     // 尝试通过连接外网地址的方式探测所有本地 IP（多网卡）
     for target in &["1.1.1.1:80", "8.8.8.8:80", "223.5.5.5:80"] {
         if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
+            // 同 network::get_local_ip：不保护会枚举出虚拟网卡地址
+            crate::socket_guard::protect(&sock);
             if sock.connect(target).is_ok() {
                 if let Ok(local) = sock.local_addr() {
                     let ip_str = local.ip().to_string();

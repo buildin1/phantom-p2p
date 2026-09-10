@@ -12,6 +12,9 @@ pub fn bind_dual_stack_udp(port: u16) -> std::io::Result<UdpSocket> {
     socket.set_reuse_address(true)?;
     socket.bind(&SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port).into())?;
     let socket: UdpSocket = socket.into();
+    // 打洞 socket 必须绕开本机 VPN 隧道，否则探测包会被自己的隧道吞掉，
+    // 而隧道又要等打洞成功才建得起来。桌面端此处是空操作。
+    crate::socket_guard::protect(&socket);
     Ok(socket)
 }
 
@@ -30,6 +33,10 @@ pub fn bind_dual_stack_udp(port: u16) -> std::io::Result<UdpSocket> {
 /// 收到 ICMP Port Unreachable 后，**后续的 `recv_from` 会返回 `WSAECONNRESET`**
 /// 而不是正常数据，把接收路径彻底堵死。撒网场景下这几乎必然发生。
 pub fn tune_udp_socket(sock: &UdpSocket) {
+    // 数据面 socket 同样要绕开隧道：中继连接如果走进自己的隧道，
+    // 就是把中继流量再塞回中继，直接自锁。
+    crate::socket_guard::protect(sock);
+
     const RECV_BUF: usize = 8 * 1024 * 1024;
     let s = socket2::SockRef::from(sock);
     if let Err(e) = s.set_recv_buffer_size(RECV_BUF) {
@@ -202,6 +209,9 @@ pub fn compatible_socket_addr(socket: &UdpSocket, addr: SocketAddr) -> SocketAdd
 pub fn get_local_ip() -> String {
     // 尝试通过 UDP connect 获取
     if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
+        // 必须保护：不然隧道起来之后这里读到的是虚拟网卡地址，
+        // 而不是真实的局域网地址，本地候选会全部失效。
+        crate::socket_guard::protect(&sock);
         // 连接到 Google DNS，不会真正发送数据
         if sock.connect("8.8.8.8:53").is_ok() {
             if let Ok(addr) = sock.local_addr() {
@@ -229,6 +239,7 @@ pub fn detect_ipv6() -> (bool, String) {
 
     match UdpSocket::bind(bind_addr) {
         Ok(sock) => {
+            crate::socket_guard::protect(&sock);
             if sock.connect(addr).is_ok() {
                 if let Ok(local) = sock.local_addr() {
                     let ip_str = local.ip().to_string();

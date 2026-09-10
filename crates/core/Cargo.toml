@@ -42,6 +42,10 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
+# Android 的 TUN 直接在 VpnService 交来的 fd 上做非阻塞读写，需要 fcntl/read/write
+[target.'cfg(target_os = "android")'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
 passfd = "0.1"

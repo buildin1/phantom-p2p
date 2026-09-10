@@ -41,6 +41,7 @@ pub mod punch;
 pub mod puncher;
 pub mod repair;
 pub mod signal;
+pub mod socket_guard;
 pub mod stats;
 pub mod stun;
 pub mod tun;
