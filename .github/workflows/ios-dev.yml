@@ -1,0 +1,68 @@
+name: iOS (dev)
+
+# 只跑 ios-dev 分支。macOS runner 比 Linux 贵得多，不要挂在 main 的每次推送上。
+on:
+  workflow_dispatch:
+  push:
+    branches: [ios-dev]
+    paths:
+      - mobile/ios/**
+      - crates/core/**
+      - crates/mobile/**
+      - crates/protocol/**
+      - version.json
+      - .github/workflows/ios-dev.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - mobile/ios/**
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: 编译（未签名）
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 选择 Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.app
+
+      - name: 生成 Xcode 工程
+        run: |
+          brew install xcodegen
+          cd mobile/ios
+          xcodegen generate
+
+      # 不做签名：Network Extension 权限需要付费账号与真机，CI 上拿不到，
+      # 也不该把签名材料放进 Actions。这里只证明「能编译」。
+      #
+      # 注意：模拟器不支持 Network Extension，所以扩展 target 在模拟器上
+      # 编得过但跑不起来——这是预期的，真机验证只能在本地做。
+      - name: 编译主 App 与扩展
+        working-directory: mobile/ios
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project Phantom.xcodeproj \
+            -scheme Phantom \
+            -destination 'generic/platform=iOS Simulator' \
+            -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            | xcbeautify || xcodebuild build \
+            -project Phantom.xcodeproj \
+            -scheme Phantom \
+            -destination 'generic/platform=iOS Simulator' \
+            -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO
+
+      - name: 检查 Swift 并发告警
+        working-directory: mobile/ios
+        run: |
+          # SWIFT_STRICT_CONCURRENCY=complete 已在 project.yml 里打开。
+          # 这一步只是把结果显式化，方便在 CI 日志里一眼看到。
+          echo "严格并发检查已在编译阶段执行，见上一步输出。"
