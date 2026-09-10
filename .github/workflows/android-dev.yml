@@ -31,8 +31,49 @@ env:
   BUILD_RUST_NATIVE: "false"
 
 jobs:
+  # Rust 侧独立成 job：core 的改动会影响桌面端，必须先证明 workspace 没被
+  # 改坏，再证明 Android target 编得过。两件事任何一件红了，APK 编出来也没意义。
+  rust:
+    name: Rust 校验
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 格式
+        run: cargo fmt --all --check
+
+      # 桌面端回归防线：core 里那些钩子在未注册时必须是空操作，
+      # 三端行为不能有任何变化。
+      - name: workspace 编译（排除 Tauri，它需要 GUI 依赖）
+        run: cargo check --locked --workspace --exclude phantom-p2p --all-targets
+
+      - name: 单元测试
+        run: cargo test --locked --workspace --exclude phantom-p2p
+
+      - uses: android-actions/setup-android@v3
+
+      - name: 安装 NDK 与 cargo-ndk
+        run: |
+          sdkmanager "ndk;27.2.12479018"
+          cargo install cargo-ndk --locked
+
+      # Android target 单独验：tun_android 与 socket_guard 的 unix 分支只在
+      # 这个 target 下才会被编译，上面的 workspace check 覆盖不到。
+      - name: Android target 编译
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/27.2.12479018
+        run: cargo ndk -t arm64-v8a -t armeabi-v7a check -p phantom-core --locked
+
   build:
     name: 编译 APK
+    needs: rust
     runs-on: ubuntu-24.04
     env:
       # secrets 上下文在 step 的 if: 里读不到，必须先在 job 级映射成 env。
