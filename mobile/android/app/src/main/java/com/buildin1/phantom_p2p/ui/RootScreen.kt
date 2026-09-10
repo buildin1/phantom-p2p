@@ -45,7 +45,7 @@ import com.buildin1.phantom_p2p.ui.components.StatusPill
 import com.buildin1.phantom_p2p.ui.icons.PhantomIcons
 import com.buildin1.phantom_p2p.ui.theme.PhantomTheme
 import com.buildin1.phantom_p2p.util.rememberReduceMotion
-import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.rememberHazeState
 import dev.chrisbanes.haze.hazeEffect
 import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.materials.HazeMaterials
@@ -92,7 +92,7 @@ fun RootScreen(
 ) {
     val colors = PhantomTheme.colors
     val reduceMotion = rememberReduceMotion()
-    val hazeState = remember { HazeState() }
+    val hazeState = rememberHazeState()
 
     Box(
         Modifier

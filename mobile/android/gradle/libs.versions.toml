@@ -16,7 +16,9 @@ composeBom = "2024.10.01"
 coroutines = "1.9.0"
 # 背景模糊（毛玻璃）。Android 12 以下没有 RenderEffect，haze 会自动退回
 # 半透明着色，所以 minSdk 26 上不会崩，只是没有真模糊。
-haze = "1.7.3"
+# 钉在 1.6.10：1.7.3 起要求 compileSdk 37，而 AGP 8.13.2 最高支持 36。
+# 两者 API 相同（hazeSource / hazeEffect），升级要连 AGP 一起动。
+haze = "1.6.10"
 
 junit = "4.13.2"
 androidxJunit = "1.2.1"
