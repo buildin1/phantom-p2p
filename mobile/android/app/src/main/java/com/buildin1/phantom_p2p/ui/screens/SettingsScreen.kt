@@ -2,8 +2,10 @@ package com.buildin1.phantom_p2p.ui.screens
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -47,6 +49,7 @@ fun SettingsScreen(
     onOpenAlwaysOnSettings: () -> Unit,
     onRequestIgnoreBatteryOptimization: () -> Unit,
     modifier: Modifier = Modifier,
+    contentPadding: PaddingValues = PaddingValues(0.dp),
 ) {
     Column(
         modifier = modifier
@@ -55,6 +58,7 @@ fun SettingsScreen(
             .padding(horizontal = 16.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
+        Spacer(Modifier.height(contentPadding.calculateTopPadding()))
         GroupLabel("身份")
         PhantomCard {
             SettingRow(
@@ -143,7 +147,7 @@ fun SettingsScreen(
             }
         }
 
-        Spacer(Modifier.padding(bottom = 8.dp))
+        Spacer(Modifier.height(contentPadding.calculateBottomPadding() + 8.dp))
     }
 }
 

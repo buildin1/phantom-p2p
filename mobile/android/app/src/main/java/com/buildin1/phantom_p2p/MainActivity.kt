@@ -17,7 +17,6 @@ import androidx.compose.runtime.remember
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
-import com.buildin1.phantom_p2p.engine.ConnectionState
 import com.buildin1.phantom_p2p.engine.FakeEngineClient
 import com.buildin1.phantom_p2p.ui.RootScreen
 import com.buildin1.phantom_p2p.vpn.PhantomVpnService
@@ -89,9 +88,14 @@ class MainActivity : ComponentActivity() {
                     onSelectTab = viewModel::selectTab,
                     connectionState = state,
                     onOpenAppSettings = { viewModel.selectTab(Tab.Settings) },
-                ) { current ->
+                ) { current, insets ->
+                    // insets 是顶栏与底栏（含系统留白）占掉的高度。各页面把它
+                    // 加在滚动容器**内部** —— 加在外面会把内容裁在两条栏杆之间，
+                    // 毛玻璃后面就没东西可模糊了。
+
                     when (current) {
                         Tab.Connect -> ConnectScreen(
+                            contentPadding = insets,
                             state = state,
                             stats = stats,
                             members = members,
@@ -109,21 +113,23 @@ class MainActivity : ComponentActivity() {
                             onRetry = viewModel::retry,
                         )
 
-                        Tab.Room -> {
-                            val connected = state as? ConnectionState.Connected
-                            RoomScreen(
-                                roomCode = connected?.roomCode,
-                                subnet = "10.66.0.0/24",
-                                mtu = BuildConfig.TUN_MTU,
-                                members = members,
-                                isHost = members.firstOrNull { it.isSelf }?.isHost == true,
-                                onCopyCode = viewModel::copyRoomCode,
-                                onShowQr = { /* TODO: 二维码弹层 */ },
-                                onLeave = viewModel::disconnect,
-                            )
-                        }
+                        Tab.Room -> RoomScreen(
+                            contentPadding = insets,
+                            // 传整个 state，不是只传 Connected 时的房间码：
+                            // 建房后隧道还没建好那一两秒，房间码已经有了，
+                            // 必须显示出来并配上进行中动效，否则用户以为创建失败了。
+                            state = state,
+                            subnet = "10.66.0.0/24",
+                            mtu = BuildConfig.TUN_MTU,
+                            members = members,
+                            isHost = members.firstOrNull { it.isSelf }?.isHost == true,
+                            onCopyCode = viewModel::copyRoomCode,
+                            onShowQr = { /* TODO: 二维码弹层 */ },
+                            onLeave = viewModel::disconnect,
+                        )
 
                         Tab.Diagnostics -> DiagnosticsScreen(
+                            contentPadding = insets,
                             stats = stats,
                             profile = profile,
                             logSizeText = "尚未产生日志",
@@ -133,6 +139,7 @@ class MainActivity : ComponentActivity() {
                         )
 
                         Tab.Settings -> SettingsScreen(
+                            contentPadding = insets,
                             state = settings,
                             onEditNickname = { /* TODO: 昵称编辑弹层 */ },
                             onToggleRememberRoom = viewModel::setRememberRoomCode,

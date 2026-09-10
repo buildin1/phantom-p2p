@@ -150,6 +150,21 @@ val ConnectionState.displayTitle: String
         is ConnectionState.Failed -> reason.displayTitle
     }
 
+/**
+ * 当前房间码。
+ *
+ * **注意这里覆盖了 Connecting 状态。** 建房时房间码在服务端应答的那一刻就有了，
+ * 但隧道要再过一两秒才建好。只认 Connected 的话，用户点完「创建房间」跳到房间页
+ * 会看到「还没有加入房间」的空态 —— 看起来就像创建失败了。
+ */
+val ConnectionState.roomCode: String?
+    get() = when (this) {
+        is ConnectionState.Idle -> null
+        is ConnectionState.Connecting -> roomCode
+        is ConnectionState.Connected -> roomCode
+        is ConnectionState.Failed -> roomCode
+    }
+
 /** 顶栏那颗状态药丸的文案。 */
 val ConnectionState.pillLabel: String
     get() = when (this) {

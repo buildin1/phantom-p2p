@@ -2,10 +2,12 @@ package com.buildin1.phantom_p2p.ui.screens
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -61,6 +63,7 @@ fun ConnectScreen(
     onDisconnect: () -> Unit,
     onRetry: () -> Unit,
     modifier: Modifier = Modifier,
+    contentPadding: PaddingValues = PaddingValues(0.dp),
 ) {
     Column(
         modifier = modifier
@@ -69,6 +72,9 @@ fun ConnectScreen(
             .padding(horizontal = 16.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
+        // 顶/底留白加在滚动容器内部，内容才能从毛玻璃栏杆后面划过去
+        Spacer(Modifier.height(contentPadding.calculateTopPadding()))
+
         PhantomCard {
             Patchbay(
                 state = state,
@@ -110,7 +116,7 @@ fun ConnectScreen(
             )
         }
 
-        Spacer(Modifier.padding(bottom = 8.dp))
+        Spacer(Modifier.height(contentPadding.calculateBottomPadding() + 8.dp))
     }
 }
 

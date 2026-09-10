@@ -3,10 +3,12 @@ package com.buildin1.phantom_p2p.ui.screens
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -49,6 +51,7 @@ fun DiagnosticsScreen(
     onOpenLogs: () -> Unit,
     onReportProblem: () -> Unit,
     modifier: Modifier = Modifier,
+    contentPadding: PaddingValues = PaddingValues(0.dp),
 ) {
     val colors = PhantomTheme.colors
 
@@ -60,6 +63,8 @@ fun DiagnosticsScreen(
                 .padding(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
+            Spacer(Modifier.height(contentPadding.calculateTopPadding()))
+
             PhantomCard {
                 Row(
                     Modifier.fillMaxWidth(),
@@ -128,8 +133,8 @@ fun DiagnosticsScreen(
                 )
             }
 
-            // 给 FAB 让出位置，否则最后一行会被压在底下点不到
-            Spacer(Modifier.padding(bottom = 76.dp))
+            // 给 FAB 与底栏让出位置，否则最后一行会被压在底下点不到
+            Spacer(Modifier.height(contentPadding.calculateBottomPadding() + 76.dp))
         }
 
         ExtendedFloatingActionButton(
@@ -138,7 +143,11 @@ fun DiagnosticsScreen(
             contentColor = colors.onEmber,
             modifier = Modifier
                 .align(Alignment.BottomEnd)
-                .padding(end = 18.dp, bottom = 18.dp),
+                // FAB 浮在底栏之上，不能被毛玻璃导航栏压住
+                .padding(
+                    end = 18.dp,
+                    bottom = contentPadding.calculateBottomPadding() + 18.dp,
+                ),
         ) {
             Text("重新检测", style = MaterialTheme.typography.titleMedium)
         }
