@@ -813,7 +813,9 @@ impl SessionRuntime {
                 let stats = self.stats.clone();
                 let tun = state.tun_bridge.clone();
                 let crypto = state.peer_crypto.clone();
-                let peer_map = Arc::new(std::sync::Mutex::new(HashMap::from([(
+                // 必须是 tokio 的 Mutex —— start_host_tunnel 在 await 点两侧
+                // 持有它，std 的 Mutex 会把整个 worker 线程堵死。
+                let peer_map = Arc::new(Mutex::new(HashMap::from([(
                     peer_addr,
                     peer_session_id.clone(),
                 )])));
