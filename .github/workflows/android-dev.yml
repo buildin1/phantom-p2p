@@ -46,6 +46,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # src-web 用 include_str!("../../dist/index.html") 把前端打进二进制，
+      # 那是 vite 的产物、不入库。不先构建前端，cargo check 会直接失败。
+      # 与 build.yml 的 checks job 保持一致。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+
       - name: 格式
         run: cargo fmt --all --check
 
