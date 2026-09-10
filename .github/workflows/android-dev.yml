@@ -36,8 +36,19 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       # secrets 上下文在 step 的 if: 里读不到，必须先在 job 级映射成 env。
-      # 没配签名 secrets 时这里是 'false'，release 相关步骤整段跳过。
       HAS_SIGNING: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+
+      # 签名参数放 job 级，让所有 gradle 调用都看得到 —— 单元测试任务名
+      # （testStandardReleaseUnitTest）里也带 Release，同样会触发签名守卫，
+      # 只给「编译」那一步配环境变量是不够的。
+      #
+      # 路径用相对的：runner.temp 在 job 级 env 里不可用（runner 上下文
+      # 只在 step 级可用），而 build.gradle.kts 会用 rootProject.file()
+      # 把相对路径解析到 mobile/android/ 下。
+      PHANTOM_KEYSTORE_PATH: phantom-release.jks
+      PHANTOM_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      PHANTOM_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      PHANTOM_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
 
@@ -83,10 +94,12 @@ jobs:
           echo "::error::没有 keystore 就先跑 mobile/android/tools/new-keystore.ps1 生成一个。"
           exit 1
 
+      # 落到 mobile/android/ 下，与 PHANTOM_KEYSTORE_PATH 的相对路径对应。
+      # 该文件已被 .gitignore 覆盖，不会被误提交。
       - name: 还原签名密钥
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-        run: echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/phantom-release.jks"
+        run: echo "$KEYSTORE_BASE64" | base64 -d > mobile/android/phantom-release.jks
 
       - name: 单元测试
         working-directory: mobile/android
@@ -98,11 +111,6 @@ jobs:
       #   standard —— 对外的正式版
       - name: 编译签名 release
         working-directory: mobile/android
-        env:
-          PHANTOM_KEYSTORE_PATH: ${{ runner.temp }}/phantom-release.jks
-          PHANTOM_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          PHANTOM_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          PHANTOM_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           gradle --no-daemon \
             assembleDevRelease assembleStandardRelease \
@@ -111,7 +119,7 @@ jobs:
 
       - name: 清理签名密钥
         if: always()
-        run: rm -f "$RUNNER_TEMP/phantom-release.jks"
+        run: rm -f mobile/android/phantom-release.jks
 
       # 证明产物真的签上了。签名坏掉时 apksigner 会在这里失败，
       # 而不是等你传到手机上才看到「应用未安装」。
