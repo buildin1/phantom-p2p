@@ -896,6 +896,18 @@
       font-size: 13px;
     }
 
+    .update-manual {
+      font-size: 13px;
+      opacity: 0.86;
+      line-height: 1.7;
+    }
+
+    .update-manual a {
+      color: var(--accent, #d2601a);
+      /* 下载地址可能很长，必须能在窄窗口里断行，否则会把弹层撑破 */
+      word-break: break-all;
+    }
+
     .confirm-dialog .risk-ack {
       display: flex;
       align-items: flex-start;
@@ -2171,6 +2183,11 @@
         <h3 id="appUpdateTitle">有新版本可用</h3>
         <p id="appUpdateMessage"></p>
         <p id="appUpdateNotes" class="update-notes"></p>
+        <!-- Linux / 非 Tauri 运行时只给下载地址，不做应用内下载安装 -->
+        <p id="appUpdateManualRow" class="update-manual" hidden>
+          Linux 不提供应用内自动更新，请手动下载安装：<br />
+          <a id="appUpdateLink" href="#" target="_blank" rel="noreferrer noopener"></a>
+        </p>
         <div class="update-progress" id="appUpdateProgressRow" hidden>
           <div class="update-bar"><div class="update-bar-fill" id="appUpdateBarFill"></div></div>
           <span id="appUpdateProgressText">正在下载…</span>

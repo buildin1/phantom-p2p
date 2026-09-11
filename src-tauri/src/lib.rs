@@ -100,11 +100,31 @@ async fn download_app_update(
     sha256: String,
     version: String,
 ) -> Result<String, String> {
+    // Linux 不走自动升级。
+    //
+    // 这不是"还没做"，是刻意的：Linux 端产出的是 headless 的
+    // phantom-p2p-web，跑在各种发行版上，替换正在运行的二进制、
+    // 处理 systemd 单元、包管理器的所有权 —— 每一条都因发行版而异。
+    // 稳定性优先于省一次手动下载。Linux 只弹通知，给下载地址。
+    //
+    // 实际上 Tauri 客户端根本不为 Linux 构建（见 .github/workflows/build.yml：
+    // Linux 那个 job 编的是 phantom-p2p-web），所以这条分支只是把约定写死在
+    // 代码里，防止以后有人给 Linux 加了 Tauri 构建后它悄悄生效。
+    //
+    // 用 cfg! 而不是 #[cfg]：后者要把整个函数体包进块里，缩进全变。
+    if cfg!(target_os = "linux") {
+        return Err("Linux 不提供应用内自动更新，请手动下载安装".to_string());
+    }
+
     let dir = std::env::temp_dir().join("phantom-update");
     // 文件名带上版本号：同时留着两个版本的包时不会互相覆盖，
     // 排障时也一眼看得出装的是哪个。
+    // 后缀必须对：Windows 要 .exe 才能直接执行，macOS 要 .dmg 才会被
+    // Finder 当作磁盘映像挂载。
     let name = if cfg!(windows) {
         format!("phantom-p2p-{}-setup.exe", version)
+    } else if cfg!(target_os = "macos") {
+        format!("phantom-p2p-{}.dmg", version)
     } else {
         format!("phantom-p2p-{}", version)
     };
@@ -137,17 +157,30 @@ async fn download_app_update(
     let path_string = path.to_string_lossy().to_string();
     tracing::info!("[更新] 安装包就绪: {}", path_string);
 
-    // 只在 Windows 上自动唤起：那里产出的是 NSIS 安装器，双击即可完成替换。
-    //
-    // macOS 的 .dmg 与 Linux 的 .AppImage/.deb 没有统一的"静默安装"入口，
-    // 各发行版差异也大。与其猜一个多半会失败的命令，不如把路径给出来让
-    // 用户自己装 —— 装不上却假装装了是更糟的结果。
+    // 正在运行的可执行文件不能被自己覆盖，所以这里一律是"把安装器交出去"，
+    // 而不是自己动手替换文件。
     #[cfg(windows)]
     {
+        // NSIS 安装器，双击即可完成替换并重启应用。
         match std::process::Command::new(&path).spawn() {
             Ok(_) => tracing::info!("[更新] 已唤起安装器"),
             Err(e) => {
                 return Err(format!("唤起安装器失败: {}，包在 {}", e, path_string));
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // 挂载 .dmg 并让 Finder 弹出那个"拖进 Applications"的窗口。
+        //
+        // 没有做全静默替换：那要绕开 Gatekeeper 的隔离属性、处理正在运行的
+        // .app 被替换、还要重新签名校验。做砸了的后果是应用起不来，
+        // 而这台机器上没有 macOS 可以验证。多一次拖拽换确定性，值得。
+        match std::process::Command::new("open").arg(&path).spawn() {
+            Ok(_) => tracing::info!("[更新] 已挂载安装镜像"),
+            Err(e) => {
+                return Err(format!("打开安装镜像失败: {}，包在 {}", e, path_string));
             }
         }
     }

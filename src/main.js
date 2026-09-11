@@ -1457,8 +1457,11 @@ function bindActions() {
 
   $("appUpdateNowBtn")?.addEventListener("click", startAppUpdate);
   $("appUpdateLaterBtn")?.addEventListener("click", () => {
-    // 强制更新不可忽略。按钮本来就被隐藏了，这里是第二道闸。
-    if (pendingUpdate?.mandatory || updateBusy) return;
+    if (updateBusy) return;
+    // 强制更新不可忽略 —— 但**只在应用内能更新时**才拦。
+    // Linux / web 模式下没有「立即更新」按钮，再把这个也拦掉，弹层就关不掉，
+    // 应用等于被锁死。那里的强制更新只能是"强烈提示"，不能是"堵死"。
+    if (pendingUpdate?.mandatory && canAutoUpdate(pendingUpdate)) return;
     pendingUpdate = null;
     closeAppUpdateModal();
   });
@@ -1625,6 +1628,21 @@ function bindActions() {
 let pendingUpdate = null;
 let updateBusy = false;
 
+/**
+ * 这个客户端能不能做应用内自动更新。
+ *
+ * 两条都要满足：
+ * - **不是 Linux**。Linux 端产出的是 headless 的 phantom-p2p-web，跑在各种
+ *   发行版上，替换正在运行的二进制、systemd 单元、包管理器的所有权，每一条
+ *   都因发行版而异。稳定性优先于省一次手动下载 —— 只弹通知，给下载地址。
+ * - **跑在 Tauri 里**。download_app_update 是 Tauri 命令；web 模式下这个
+ *   请求会打到 /api/invoke/ 然后 404。与其让用户点了看见报错，不如一开始
+ *   就给下载链接。
+ */
+function canAutoUpdate(info) {
+  return isTauriMode && info.platform !== "linux";
+}
+
 function closeAppUpdateModal() {
   const modal = $("appUpdateModal");
   if (!modal || modal.hidden) return;
@@ -1662,6 +1680,26 @@ function showAppUpdate(info) {
   if (errorEl) errorEl.hidden = true;
   const progressRow = $("appUpdateProgressRow");
   if (progressRow) progressRow.hidden = true;
+
+  // 不能自动更新的（Linux / web 模式）：把下载地址摆出来，并把主按钮收掉。
+  // 留一个点了会报错的「立即更新」比没有按钮更糟。
+  const auto = canAutoUpdate(info);
+  const manualRow = $("appUpdateManualRow");
+  if (manualRow) manualRow.hidden = auto;
+  const link = $("appUpdateLink");
+  if (link && !auto) {
+    link.href = info.download_url;
+    link.textContent = info.download_url;
+  }
+  const now = $("appUpdateNowBtn");
+  if (now) {
+    now.hidden = !auto;
+    now.textContent = "立即更新";
+    now.disabled = false;
+  }
+  // 主按钮没了的话，「以后再说」就是唯一出口，强制更新也得留着 ——
+  // 否则弹层关不掉，应用等于被锁死。
+  if (later && !auto) later.hidden = false;
 
   modal.hidden = false;
   requestAnimationFrame(() => modal.classList.add("open"));

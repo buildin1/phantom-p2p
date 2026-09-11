@@ -124,6 +124,7 @@ fun QrCode(
 @Composable
 fun InviteCard(
     token: InviteToken?,
+    error: String?,
     onRefresh: () -> Unit,
     onCopy: () -> Unit,
     modifier: Modifier = Modifier,
@@ -148,9 +149,13 @@ fun InviteCard(
                     contentAlignment = Alignment.Center,
                 ) {
                     Text(
-                        text = "正在生成邀请…",
+                        // 等不到令牌最常见的原因是信令服务端还没更新 ——
+                        // 一直转「正在生成」和卡死没区别，必须说清楚并给出路。
+                        text = error ?: "正在生成邀请…",
                         style = MaterialTheme.typography.bodySmall,
-                        color = colors.ink3,
+                        color = if (error != null) colors.ink2 else colors.ink3,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(horizontal = 16.dp),
                     )
                 }
             } else {
@@ -224,9 +229,16 @@ private fun InviteCardPreview() = PhantomPreview {
     Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         InviteCard(
             token = InviteToken(token = "7QFK3M2XJ9WD4NBV6RTZ", roomCode = "AB3K9M"),
+            error = null,
             onRefresh = {},
             onCopy = {},
         )
-        InviteCard(token = null, onRefresh = {}, onCopy = {})
+        InviteCard(token = null, error = null, onRefresh = {}, onCopy = {})
+        InviteCard(
+            token = null,
+            error = "服务器暂不支持二维码邀请，请用房间码",
+            onRefresh = {},
+            onCopy = {},
+        )
     }
 }

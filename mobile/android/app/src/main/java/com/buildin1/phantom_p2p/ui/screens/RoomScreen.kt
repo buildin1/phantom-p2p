@@ -71,6 +71,7 @@ fun RoomScreen(
     members: List<RoomMember>,
     isHost: Boolean,
     inviteToken: InviteToken?,
+    inviteError: String?,
     onCopyCode: () -> Unit,
     onShowQr: () -> Unit,
     onCopyInvite: () -> Unit,
@@ -151,6 +152,7 @@ fun RoomScreen(
         ) {
             InviteCard(
                 token = inviteToken,
+                error = inviteError,
                 onRefresh = onRefreshInvite,
                 onCopy = onCopyInvite,
             )
@@ -276,6 +278,7 @@ private fun RoomPreparingPreview() = PhantomPreview {
         members = emptyList(),
         isHost = true,
         inviteToken = InviteToken("7QFK3M2XJ9WD4NBV6RTZ", "7K2M9Q"),
+        inviteError = null,
         onCopyCode = {}, onShowQr = {}, onCopyInvite = {}, onRefreshInvite = {}, onLeave = {},
     )
 }
@@ -290,6 +293,7 @@ private fun RoomLivePreview() = PhantomPreview {
         members = previewMembers,
         isHost = false,
         inviteToken = InviteToken("7QFK3M2XJ9WD4NBV6RTZ", "7K2M9Q"),
+        inviteError = null,
         onCopyCode = {}, onShowQr = {}, onCopyInvite = {}, onRefreshInvite = {}, onLeave = {},
     )
 }
@@ -301,6 +305,7 @@ private fun RoomEmptyPreview() = PhantomPreview(dark = true) {
         state = ConnectionState.Idle,
         subnet = "", mtu = 1160, members = emptyList(), isHost = false,
         inviteToken = InviteToken("7QFK3M2XJ9WD4NBV6RTZ", "7K2M9Q"),
+        inviteError = null,
         onCopyCode = {}, onShowQr = {}, onCopyInvite = {}, onRefreshInvite = {}, onLeave = {},
     )
 }

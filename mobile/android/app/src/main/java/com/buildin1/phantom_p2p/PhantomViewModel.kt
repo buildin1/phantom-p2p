@@ -32,6 +32,7 @@ class PhantomViewModel(
     val linkStats = engine.linkStats
     val networkProfile = engine.networkProfile
     val inviteToken = engine.inviteToken
+    val inviteError = engine.inviteError
     val diagnostics = engine.diagnostics
     val diagnosticsProgress = engine.diagnosticsProgress
     val diagnosticsError = engine.diagnosticsError

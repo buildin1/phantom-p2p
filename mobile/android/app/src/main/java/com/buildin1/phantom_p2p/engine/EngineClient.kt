@@ -62,6 +62,16 @@ interface EngineClient {
     val inviteToken: StateFlow<InviteToken?>
 
     /**
+     * 索要邀请失败的原因；成功或未索要过为 null。
+     *
+     * 主要覆盖一个具体场景：**新客户端连到了没更新的信令服务端**。
+     * 老服务端不认识 `RequestInviteToken`，只会在自己日志里 warn 一行、
+     * 连接照常 —— 于是客户端永远等不到应答，二维码卡在「正在生成」。
+     * 超时后把它翻成一句人话，让用户改用房间码。
+     */
+    val inviteError: StateFlow<String?>
+
+    /**
      * 建房。返回房间码。
      *
      * Host 的虚拟网卡在这一步就要建起来——`TunBridge` 是先建 TUN 再接对端，

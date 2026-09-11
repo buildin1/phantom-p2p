@@ -117,6 +117,7 @@ class MainActivity : ComponentActivity() {
                 val settings by viewModel.settings.collectAsStateWithLifecycle()
                 val toast by viewModel.toast.collectAsStateWithLifecycle()
                 val invite by viewModel.inviteToken.collectAsStateWithLifecycle()
+                val inviteErr by viewModel.inviteError.collectAsStateWithLifecycle()
                 val diagnostics by viewModel.diagnostics.collectAsStateWithLifecycle()
                 val diagProgress by viewModel.diagnosticsProgress.collectAsStateWithLifecycle()
                 val diagError by viewModel.diagnosticsError.collectAsStateWithLifecycle()
@@ -177,6 +178,7 @@ class MainActivity : ComponentActivity() {
                             members = members,
                             isHost = members.firstOrNull { it.isSelf }?.isHost == true,
                             inviteToken = invite,
+                            inviteError = inviteErr,
                             onCopyCode = viewModel::copyRoomCode,
                             onShowQr = viewModel::requestInvite,
                             onCopyInvite = viewModel::copyInviteLink,

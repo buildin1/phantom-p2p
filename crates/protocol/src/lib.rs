@@ -1294,6 +1294,10 @@ mod tests {
     #[test]
     fn test_peer_joined_forward_backward_compat() {
         /// 老客户端眼里的 PeerJoined —— 没有 virtual_ip。
+        ///
+        /// 这个替身与线上 3.2.2（`origin/main` 的 `crates/protocol/src/lib.rs`）
+        /// 逐字段核对过：字段名、类型、`#[serde(tag)]`、`rename` 全一致，
+        /// 且整个文件没有 `deny_unknown_fields`，序列化同为 `to_vec_named`。
         #[derive(Serialize, Deserialize)]
         #[serde(tag = "cmd")]
         enum LegacyServerMessage {

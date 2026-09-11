@@ -49,6 +49,12 @@ class JniEngineClient(
     private val _inviteToken = MutableStateFlow<InviteToken?>(null)
     override val inviteToken: StateFlow<InviteToken?> = _inviteToken.asStateFlow()
 
+    private val _inviteError = MutableStateFlow<String?>(null)
+    override val inviteError: StateFlow<String?> = _inviteError.asStateFlow()
+
+    /** 邀请令牌的等待超时任务。见 [requestInviteToken]。 */
+    private var inviteTimeoutJob: Job? = null
+
     private val _diagnostics = MutableStateFlow<NetworkDiagnostics?>(null)
     override val diagnostics: StateFlow<NetworkDiagnostics?> = _diagnostics.asStateFlow()
 
@@ -214,7 +220,19 @@ class JniEngineClient(
     override suspend fun requestInviteToken(refresh: Boolean) {
         if (!authenticated.value) return
         if (refresh) _inviteToken.value = null
+        _inviteError.value = null
         PhantomEngine.nativeRequestInviteToken(refresh)
+
+        // 没更新的信令服务端不认识 RequestInviteToken —— 它只会在自己那边
+        // warn 一行、连接照常，客户端这边永远等不到应答。没有这个超时，
+        // 二维码就一直停在「正在生成」，看起来和卡死没区别。
+        inviteTimeoutJob?.cancel()
+        inviteTimeoutJob = scope.launch {
+            delay(INVITE_TIMEOUT_MS)
+            if (_inviteToken.value == null) {
+                _inviteError.value = "服务器暂不支持二维码邀请，请用房间码"
+            }
+        }
     }
 
     override suspend fun leaveRoom() {
@@ -336,11 +354,14 @@ class JniEngineClient(
                 val token = json?.optString("token").orEmpty()
                 val code = json?.optString("room_code").orEmpty()
                 if (token.isNotEmpty()) {
+                    inviteTimeoutJob?.cancel()
+                    _inviteError.value = null
                     _inviteToken.value = InviteToken(token = token, roomCode = code)
                 }
             }
 
             "signal:invite_token_invalid" -> {
+                inviteTimeoutJob?.cancel()
                 _inviteToken.value = null
                 _state.value = ConnectionState.Failed(roomCode, FailureReason.RoomGone)
             }
@@ -675,7 +696,9 @@ class JniEngineClient(
         knownPeers.clear()
         peerVirtualIps.clear()
         // 令牌跟随房间：房间没了，手上这张邀请也就作废了。
+        inviteTimeoutJob?.cancel()
         _inviteToken.value = null
+        _inviteError.value = null
         selfVirtualIp = ""
         hostVirtualIp = ""
         latencyHistory.clear()
@@ -713,6 +736,15 @@ class JniEngineClient(
     private companion object {
         const val TAG = "JniEngineClient"
         const val SIGNAL_TIMEOUT_MS = 15_000L
+
+        /**
+         * 等邀请令牌的上限。
+         *
+         * 比信令超时短：这只是一个往返，等 15 秒毫无意义。真正要靠它兜的
+         * 是"服务端根本不会回应"（老服务端不认识这条消息），那种情况等多久
+         * 都不会有结果，早点说清楚比较好。
+         */
+        const val INVITE_TIMEOUT_MS = 6_000L
 
         /** 与 core 的 tun_bridge::TUN_MTU 同源，见 BuildConfig.TUN_MTU。 */
         const val TUN_MTU = 1160
