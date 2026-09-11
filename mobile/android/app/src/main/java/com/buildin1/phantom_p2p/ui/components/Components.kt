@@ -6,6 +6,9 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -25,14 +28,24 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
@@ -224,37 +237,72 @@ fun LatencySparkline(
 @Composable
 fun RoomCodeInput(
     code: String,
+    onCodeChange: (String) -> Unit,
     modifier: Modifier = Modifier,
-    onClick: () -> Unit,
 ) {
     val colors = PhantomTheme.colors
-    Row(
-        modifier = modifier.fillMaxWidth().clickable(onClick = onClick),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        repeat(6) { index ->
-            val ch = code.getOrNull(index)
-            val isCaret = index == code.length.coerceAtMost(5) && code.length < 6
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .height(58.dp)
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(if (ch == null) colors.surface2 else colors.surface)
-                    .then(
-                        when {
-                            isCaret -> Modifier.border(2.dp, colors.ember, RoundedCornerShape(12.dp))
-                            ch != null -> Modifier.border(1.dp, colors.line, RoundedCornerShape(12.dp))
-                            else -> Modifier
-                        }
-                    ),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    text = ch?.toString() ?: "·",
-                    style = MonoNumber.copy(fontSize = 24.sp),
-                    color = if (ch == null) colors.ink3 else colors.ink,
-                )
+    val focusRequester = remember { FocusRequester() }
+    var focused by remember { mutableStateOf(false) }
+
+    Box(modifier.fillMaxWidth()) {
+        // 真正接键盘的输入框藏在后面。六个格子只是它的显示层 ——
+        // 这样粘贴、逐位删改、系统的验证码自动填充全部落在同一个控件上。
+        BasicTextField(
+            value = code,
+            onValueChange = { raw ->
+                // 房间码只有大写字母与数字，长度封顶 6。
+                onCodeChange(raw.uppercase().filter(Char::isLetterOrDigit).take(6))
+            },
+            keyboardOptions = KeyboardOptions(
+                capitalization = KeyboardCapitalization.Characters,
+                autoCorrectEnabled = false,
+                keyboardType = KeyboardType.Ascii,
+                imeAction = ImeAction.Done,
+            ),
+            singleLine = true,
+            modifier = Modifier
+                .matchParentSize()
+                .focusRequester(focusRequester)
+                .onFocusChanged { focused = it.isFocused }
+                // 完全透明但仍然可交互；不能用 size(0) —— 那样 IME 不会弹。
+                .alpha(0f),
+            decorationBox = { /* 显示层在下面自己画 */ },
+        )
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                ) { focusRequester.requestFocus() },
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            repeat(6) { index ->
+                val ch = code.getOrNull(index)
+                // 光标只在获得焦点时显示，否则空框上那圈橙边会让人以为正在输入
+                val isCaret = focused && index == code.length.coerceAtMost(5) && code.length < 6
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(58.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(if (ch == null) colors.surface2 else colors.surface)
+                        .then(
+                            when {
+                                isCaret -> Modifier.border(2.dp, colors.ember, RoundedCornerShape(12.dp))
+                                ch != null -> Modifier.border(1.dp, colors.line, RoundedCornerShape(12.dp))
+                                else -> Modifier
+                            }
+                        ),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = ch?.toString() ?: "·",
+                        style = MonoNumber.copy(fontSize = 24.sp),
+                        color = if (ch == null) colors.ink3 else colors.ink,
+                    )
+                }
             }
         }
     }
@@ -555,7 +603,7 @@ private fun ComponentsPreview() = PhantomPreview {
         MetricsRow(
             LinkStats(12, 0.3, 1.2, 3.4, listOf(14, 12, 15, 11, 13, 10, 12)),
         )
-        RoomCodeInput("7K2M") {}
+        RoomCodeInput("7K2M", onCodeChange = {})
         PhantomCard {
             CardLabel("推进")
             PhaseList(PunchPhase.Punching)

@@ -170,6 +170,43 @@ fn engine() -> Option<Arc<SessionRuntime>> {
     ENGINE.lock().clone()
 }
 
+/// 把一次 JNI 调用包在 `catch_unwind` 里。
+///
+/// **Rust 的 panic 跨过 FFI 边界就是 abort** —— 整个应用直接闪退，用户
+/// 看到的是「应用已停止」，什么线索都没有。这一层把 panic 变成一条日志
+/// 加一个兜底返回值，至少让人能从日志里看出发生了什么。
+///
+/// 不是用它来掩盖 bug：panic 仍然会被完整记录，只是不再连坐整个进程。
+fn guard<T>(what: &str, fallback: T, f: impl FnOnce() -> T + std::panic::UnwindSafe) -> T {
+    match std::panic::catch_unwind(f) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = e
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| e.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "未知 panic".to_string());
+            tracing::error!("[引擎] {} 发生 panic: {}", what, msg);
+            fallback
+        }
+    }
+}
+
+/// 安装 panic 钩子，把 panic 写进日志文件。
+///
+/// 默认钩子只往 stderr 写，而 Android 上 stderr 是丢掉的 —— 界面按约定
+/// 隐藏了链路的真实性质，日志是唯一的诊断入口，panic 必须落到那里。
+fn install_panic_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            tracing::error!("[引擎] panic: {}", info);
+            previous(info);
+        }));
+    });
+}
+
 // ---------------------------------------------------------------------------
 // 导出函数
 //
@@ -220,6 +257,7 @@ pub extern "system" fn Java_com_buildin1_phantom_1p2p_engine_PhantomEngine_nativ
         eprintln!("[phantom] 日志初始化失败: {e}");
     }
     phantom_core::DEV_MODE.store(dev_mode == JNI_TRUE, std::sync::atomic::Ordering::Relaxed);
+    install_panic_hook();
 
     let host = Arc::new(AndroidHost {
         callback,
@@ -231,6 +269,14 @@ pub extern "system" fn Java_com_buildin1_phantom_1p2p_engine_PhantomEngine_nativ
     // 分布在六个模块，漏一个那条路径的流量就会被自己的隧道吞掉。
     let guard_host = host.clone();
     phantom_core::socket_guard::set_protector(move |fd| guard_host.protect_socket(fd));
+
+    // 必须先进 tokio 运行时上下文再构造。
+    //
+    // SessionRuntime::new 里会调 StatsManager::start_sampling_task()，
+    // 那里面是 tokio::spawn —— 不在运行时上下文里调用会直接 panic，
+    // 而 Rust 的 panic 跨过 FFI 边界就是 abort，表现为点「创建房间」
+    // 应用闪退。这是生产测试里第一个暴露出来的问题。
+    let _guard = TOKIO.enter();
 
     match SessionRuntime::new(host) {
         Ok(rt) => {
@@ -310,6 +356,20 @@ pub extern "system" fn Java_com_buildin1_phantom_1p2p_engine_PhantomEngine_nativ
     });
 }
 
+/// 跑一次网络环境探测。结果通过 `net:profile` 事件回来。
+#[no_mangle]
+pub extern "system" fn Java_com_buildin1_phantom_1p2p_engine_PhantomEngine_nativeProbeNetwork(
+    _env: JNIEnv,
+    _class: JObject,
+) {
+    let Some(rt) = engine() else { return };
+    TOKIO.spawn(async move {
+        if let Err(e) = rt.probe_network().await {
+            tracing::warn!("[诊断] 网络探测失败: {}", e);
+        }
+    });
+}
+
 /// 请求上传日志（用户点「反馈问题」）。
 #[no_mangle]
 pub extern "system" fn Java_com_buildin1_phantom_1p2p_engine_PhantomEngine_nativeUploadLogs(
@@ -335,14 +395,20 @@ pub extern "system" fn Java_com_buildin1_phantom_1p2p_engine_PhantomEngine_nativ
     env: JNIEnv<'a>,
     _class: JObject<'a>,
 ) -> JString<'a> {
-    let empty = || env.new_string("{}").expect("创建空 JSON 字符串失败");
+    // 统计取不到时返回空对象而不是抛异常：这是每秒轮询一次的路径，
+    // 偶发失败不该让界面崩掉，显示成「—」就够了。
+    let json = guard("nativeStatsJson", String::from("{}"), || {
+        let Some(rt) = engine() else {
+            return String::from("{}");
+        };
+        // block_on 在这里是安全的：调用方是 Kotlin 的轮询协程，
+        // 不是 tokio worker——在 worker 上 block_on 会死锁。
+        let snapshot = TOKIO.block_on(async move { rt.stats_snapshot().await });
+        serde_json::to_string(&snapshot).unwrap_or_else(|_| String::from("{}"))
+    });
 
-    let Some(rt) = engine() else { return empty() };
-    let snapshot = TOKIO.block_on(async move { rt.stats_snapshot().await });
-    match serde_json::to_string(&snapshot) {
-        Ok(json) => env.new_string(json).unwrap_or_else(|_| empty()),
-        Err(_) => empty(),
-    }
+    env.new_string(json)
+        .unwrap_or_else(|_| env.new_string("{}").expect("创建空 JSON 字符串失败"))
 }
 
 /// 隧道是否在跑。VpnService 用它决定前台通知的状态。

@@ -131,6 +131,7 @@ object PhantomEngine {
     external fun nativeJoinRoom(roomCode: String)
     external fun nativeLeaveRoom()
     external fun nativeDisconnect()
+    external fun nativeProbeNetwork()
     external fun nativeUploadLogs(reason: String)
     external fun nativeStatsJson(): String
     external fun nativeIsTunnelLive(): Boolean

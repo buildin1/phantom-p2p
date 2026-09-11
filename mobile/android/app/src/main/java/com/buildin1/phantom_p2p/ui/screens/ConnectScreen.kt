@@ -55,7 +55,7 @@ fun ConnectScreen(
     members: List<RoomMember>,
     draftCode: String,
     recentRooms: List<RecentRoom>,
-    onDraftClick: () -> Unit,
+    onDraftChange: (String) -> Unit,
     onJoin: () -> Unit,
     onCreateRoom: () -> Unit,
     onPickRecent: (String) -> Unit,
@@ -92,7 +92,7 @@ fun ConnectScreen(
             is ConnectionState.Idle -> IdleBody(
                 draftCode = draftCode,
                 recentRooms = recentRooms,
-                onDraftClick = onDraftClick,
+                onDraftChange = onDraftChange,
                 onJoin = onJoin,
                 onCreateRoom = onCreateRoom,
                 onPickRecent = onPickRecent,
@@ -126,14 +126,14 @@ fun ConnectScreen(
 private fun IdleBody(
     draftCode: String,
     recentRooms: List<RecentRoom>,
-    onDraftClick: () -> Unit,
+    onDraftChange: (String) -> Unit,
     onJoin: () -> Unit,
     onCreateRoom: () -> Unit,
     onPickRecent: (String) -> Unit,
 ) {
     PhantomCard {
         CardLabel("房间码")
-        RoomCodeInput(draftCode, onClick = onDraftClick)
+        RoomCodeInput(draftCode, onCodeChange = onDraftChange)
         PrimaryButton(
             text = "加入房间",
             enabled = draftCode.length == 6,
@@ -308,7 +308,7 @@ private fun ConnectIdlePreview() = PhantomPreview {
         members = emptyList(),
         draftCode = "7K2M",
         recentRooms = previewRecent,
-        onDraftClick = {}, onJoin = {}, onCreateRoom = {}, onPickRecent = {},
+        onDraftChange = {}, onJoin = {}, onCreateRoom = {}, onPickRecent = {},
         onCancel = {}, onDisconnect = {}, onRetry = {},
     )
 }
@@ -322,7 +322,7 @@ private fun ConnectBusyPreview() = PhantomPreview {
         members = emptyList(),
         draftCode = "7K2M9Q",
         recentRooms = previewRecent,
-        onDraftClick = {}, onJoin = {}, onCreateRoom = {}, onPickRecent = {},
+        onDraftChange = {}, onJoin = {}, onCreateRoom = {}, onPickRecent = {},
         onCancel = {}, onDisconnect = {}, onRetry = {},
     )
 }
@@ -339,7 +339,7 @@ private fun ConnectLivePreview() = PhantomPreview(dark = true) {
             RoomMember("qi", "阿祈", "10.66.0.3", false, false, 28, Transport.Quic),
         ),
         draftCode = "", recentRooms = emptyList(),
-        onDraftClick = {}, onJoin = {}, onCreateRoom = {}, onPickRecent = {},
+        onDraftChange = {}, onJoin = {}, onCreateRoom = {}, onPickRecent = {},
         onCancel = {}, onDisconnect = {}, onRetry = {},
     )
 }

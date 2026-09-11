@@ -129,16 +129,10 @@ class JniEngineClient(
     }
 
     override suspend fun probeNetwork() {
-        // NAT 画像在打洞的阶段一自然产生，没有独立的探测入口。
-        // 已经有画像就保留，否则等下一次连接。
-        if (_networkProfile.value == null) {
-            _networkProfile.value = NetworkProfile(
-                natClass = NatClass.Unknown,
-                mappingStable = false,
-                ipv6Available = false,
-                mtu = TUN_MTU,
-            )
-        }
+        if (!start()) return
+        // 真跑一次 STUN 探测，结果通过 net:profile 事件回来。
+        // 需要信令已连接：STUN 地址由服务端下发，客户端不内置任何地址。
+        PhantomEngine.nativeProbeNetwork()
     }
 
     override suspend fun uploadLogs(reason: String): Result<Long> {
@@ -244,6 +238,23 @@ class JniEngineClient(
                 ) {
                     _state.value =
                         ConnectionState.Failed(roomCode, FailureReason.SignalUnavailable)
+                }
+            }
+
+            "net:profile" -> {
+                if (json != null) {
+                    _networkProfile.value = NetworkProfile(
+                        // class 是策略用的三分类（Cone / LinearSymmetric /
+                        // RandomSymmetric），detail 才是给人看的细分类名。
+                        // 诊断页显示 detail，读不到时退回三分类。
+                        natClass = parseNatClass(
+                            json.optString("nat_detail"),
+                            json.optString("nat_class"),
+                        ),
+                        mappingStable = json.optBoolean("mapping_stable", false),
+                        ipv6Available = json.optBoolean("has_ipv6", false),
+                        mtu = json.optInt("mtu", TUN_MTU),
+                    )
                 }
             }
 
@@ -395,6 +406,23 @@ class JniEngineClient(
         _state.value = ConnectionState.Idle
         _members.value = emptyList()
         _linkStats.value = LinkStats.EMPTY
+    }
+
+    /**
+     * 把 Rust 的 NAT 分类翻成界面用的枚举。
+     *
+     * 优先用 detail（细分类，如 `port_restricted_cone`），它才是用户看得懂的；
+     * detail 缺失时退回 class 那个三分类。
+     */
+    private fun parseNatClass(detail: String?, klass: String?): NatClass = when {
+        detail?.contains("port_restricted", ignoreCase = true) == true ->
+            NatClass.PortRestrictedCone
+        detail?.contains("restricted", ignoreCase = true) == true -> NatClass.RestrictedCone
+        detail?.contains("full", ignoreCase = true) == true -> NatClass.FullCone
+        detail?.contains("symmetric", ignoreCase = true) == true -> NatClass.Symmetric
+        klass.equals("Cone", ignoreCase = true) -> NatClass.FullCone
+        klass?.contains("Symmetric", ignoreCase = true) == true -> NatClass.Symmetric
+        else -> NatClass.Unknown
     }
 
     private fun elapsed() = System.currentTimeMillis() - connectingSince

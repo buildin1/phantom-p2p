@@ -562,6 +562,11 @@ impl SessionRuntime {
                 .insert(key, std::mem::take(&mut session));
         }
 
+        // 画像推给界面：诊断页要显示 NAT 类型、公网映射是否稳定、IPv6 可用性。
+        // 这些信息打洞阶段一本来就算出来了，白白丢掉可惜——而界面按约定隐藏
+        // 了链路的真实性质，诊断页是用户能看到的唯一技术入口。
+        self.emit_profile(&profile);
+
         self.signal
             .send(ClientMessage::NatProfileReport {
                 target_peer_session_id: target_peer,
@@ -570,6 +575,49 @@ impl SessionRuntime {
             })
             .await?;
         self.emit("punch:phase", puncher::PunchPhase::WaitingPeer);
+        Ok(())
+    }
+
+    fn emit_profile(&self, profile: &NatProfile) {
+        self.emit(
+            "net:profile",
+            json!({
+                // class 是策略用的三分类，detail 才是给人看的细分类名
+                "nat_class": format!("{:?}", profile.class),
+                "nat_detail": profile.detail,
+                // 采样端口全一致 = 端点无关映射 = 打洞好打。
+                // 这正是诊断页那个「稳定 / 不稳定」药丸要表达的东西。
+                "mapping_stable": profile.sample_ports.windows(2).all(|w| w[0] == w[1]),
+                "public_ip": profile.public_ip,
+                "has_ipv6": profile.has_ipv6,
+                "base_port": profile.base_port,
+                "step": profile.step,
+                "step_confidence": profile.step_confidence,
+                "mtu": tun_bridge::TUN_MTU,
+            }),
+        );
+    }
+
+    /// 独立跑一次网络环境探测，供诊断页的「重新检测」用。
+    ///
+    /// 需要信令已连接：STUN 地址由服务端下发，客户端不内置任何地址——
+    /// 拿空列表探测只会得到 class=Unknown，等于什么都没测。
+    pub async fn probe_network(&self) -> Result<(), String> {
+        let stun = self.stun_servers().await;
+        if stun.is_empty() {
+            return Err("尚未取到 STUN 配置，先连上服务器再检测".into());
+        }
+        let identity = self.signal.identity();
+        let rtt = self.signal.signal_rtt_ms();
+
+        let profile = tokio::task::spawn_blocking(move || {
+            let mut session = punch::Session::new();
+            session.probe(&stun, rtt, &identity).map(|(p, _)| p)
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+
+        self.emit_profile(&profile);
         Ok(())
     }
 

@@ -107,7 +107,7 @@ class MainActivity : ComponentActivity() {
                             members = members,
                             draftCode = draft,
                             recentRooms = recents,
-                            onDraftClick = { /* 交给系统输入法，见下方 TODO */ },
+                            onDraftChange = viewModel::setDraftCode,
                             onJoin = { requestVpnThen { viewModel.join() } },
                             onCreateRoom = { requestVpnThen { viewModel.createRoom() } },
                             onPickRecent = { code ->
