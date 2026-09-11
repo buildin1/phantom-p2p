@@ -137,7 +137,17 @@ function desiredFiles(version) {
   );
   files.set("index.html", html);
 
-  let gradle = fs.readFileSync(path.join(root, "android/app/build.gradle.kts"), "utf8");
+  // 安卓工程的位置在两个分支上不一样：main 还在根目录 android/，
+  // 移动端分支已经搬到 mobile/android/。两边都要认，否则 build.yml 在
+  // 移动端分支上会在这一步 ENOENT 直接挂掉 —— PC 端因此一次都没构建过。
+  const gradlePath = ["mobile/android/app/build.gradle.kts", "android/app/build.gradle.kts"].find(
+    (candidate) => fs.existsSync(path.join(root, candidate)),
+  );
+  if (!gradlePath) {
+    throw new Error("找不到 Android 的 build.gradle.kts（既不在 mobile/android/ 也不在 android/）");
+  }
+
+  let gradle = fs.readFileSync(path.join(root, gradlePath), "utf8");
   // Android reads both values from version.json at configuration time. Keep
   // that dynamic form intact; older projects may still contain literals.
   if (!/versionCode\s*=\s*\(phantomVersion\["buildNumber"\]/.test(gradle)) {
@@ -156,7 +166,7 @@ function desiredFiles(version) {
       "Android versionName",
     );
   }
-  files.set("android/app/build.gradle.kts", gradle);
+  files.set(gradlePath, gradle);
 
   let installer = fs.readFileSync(path.join(root, "build/windows-installer.nsi"), "utf8");
   installer = replaceRequired(
