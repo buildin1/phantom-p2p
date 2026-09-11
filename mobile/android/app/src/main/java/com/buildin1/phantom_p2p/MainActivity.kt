@@ -162,6 +162,7 @@ class MainActivity : ComponentActivity() {
                                 requestVpnThen { viewModel.join(code) }
                             },
                             onScan = { showScanner = true },
+                            onPasteInvite = { requestVpnThen { viewModel.pasteInvite() } },
                             onCancel = viewModel::cancel,
                             onDisconnect = viewModel::disconnect,
                             onRetry = viewModel::retry,

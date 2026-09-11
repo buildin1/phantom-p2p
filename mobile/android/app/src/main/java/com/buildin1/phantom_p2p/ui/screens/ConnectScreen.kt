@@ -60,6 +60,7 @@ fun ConnectScreen(
     onCreateRoom: () -> Unit,
     onPickRecent: (String) -> Unit,
     onScan: () -> Unit,
+    onPasteInvite: () -> Unit,
     onCancel: () -> Unit,
     onDisconnect: () -> Unit,
     onRetry: () -> Unit,
@@ -98,6 +99,7 @@ fun ConnectScreen(
                 onCreateRoom = onCreateRoom,
                 onPickRecent = onPickRecent,
                 onScan = onScan,
+                onPasteInvite = onPasteInvite,
             )
 
             is ConnectionState.Connecting -> ConnectingBody(
@@ -133,6 +135,7 @@ private fun IdleBody(
     onCreateRoom: () -> Unit,
     onPickRecent: (String) -> Unit,
     onScan: () -> Unit,
+    onPasteInvite: () -> Unit,
 ) {
     PhantomCard {
         CardLabel("房间码")
@@ -142,10 +145,23 @@ private fun IdleBody(
             enabled = draftCode.length == 6,
             onClick = onJoin,
         )
-        // 扫码放在房间码下面而不是单独一张卡：它是"不用敲房间码"的同一件事的
-        // 另一条路径，分开会让人以为是另一种加入方式。
-        TextButton(onClick = onScan, modifier = Modifier.fillMaxWidth()) {
-            Text("扫描二维码加入", color = PhantomTheme.colors.ember)
+        // 扫码与粘贴链接都放在房间码下面，而不是各开一张卡：
+        // 它们是"不用敲房间码"的同一件事的两条路径，分开会让人以为是
+        // 三种互不相干的加入方式。
+        //
+        // 粘贴这条是必须有的：房主分享出去的是一条 phantom:// 链接，
+        // 但链接只在装了本应用的设备上点得开。从微信/QQ 复制过来的那串文本
+        // 之前没有任何地方能输入 —— 有分享却无处可用。
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            TextButton(onClick = onScan, modifier = Modifier.weight(1f)) {
+                Text("扫描二维码", color = PhantomTheme.colors.ember)
+            }
+            TextButton(onClick = onPasteInvite, modifier = Modifier.weight(1f)) {
+                Text("粘贴邀请链接", color = PhantomTheme.colors.ember)
+            }
         }
     }
 
@@ -316,7 +332,7 @@ private fun ConnectIdlePreview() = PhantomPreview {
         members = emptyList(),
         draftCode = "7K2M",
         recentRooms = previewRecent,
-        onDraftChange = {}, onJoin = {}, onCreateRoom = {}, onPickRecent = {}, onScan = {},
+        onDraftChange = {}, onJoin = {}, onCreateRoom = {}, onPickRecent = {}, onScan = {}, onPasteInvite = {},
         onCancel = {}, onDisconnect = {}, onRetry = {},
     )
 }
@@ -330,7 +346,7 @@ private fun ConnectBusyPreview() = PhantomPreview {
         members = emptyList(),
         draftCode = "7K2M9Q",
         recentRooms = previewRecent,
-        onDraftChange = {}, onJoin = {}, onCreateRoom = {}, onPickRecent = {}, onScan = {},
+        onDraftChange = {}, onJoin = {}, onCreateRoom = {}, onPickRecent = {}, onScan = {}, onPasteInvite = {},
         onCancel = {}, onDisconnect = {}, onRetry = {},
     )
 }
@@ -347,7 +363,7 @@ private fun ConnectLivePreview() = PhantomPreview(dark = true) {
             RoomMember("qi", "阿祈", "10.66.0.3", false, false, 28, Transport.Quic),
         ),
         draftCode = "", recentRooms = emptyList(),
-        onDraftChange = {}, onJoin = {}, onCreateRoom = {}, onPickRecent = {}, onScan = {},
+        onDraftChange = {}, onJoin = {}, onCreateRoom = {}, onPickRecent = {}, onScan = {}, onPasteInvite = {},
         onCancel = {}, onDisconnect = {}, onRetry = {},
     )
 }

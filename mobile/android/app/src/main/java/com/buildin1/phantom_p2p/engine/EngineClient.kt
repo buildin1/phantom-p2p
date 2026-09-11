@@ -129,17 +129,41 @@ data class InviteToken(
     companion object {
         const val SCHEME_PREFIX = "phantom://j/"
 
-        /** 从扫码/深链拿到的文本里抽出令牌；不是本应用的邀请则返回 null。 */
+        /**
+         * 从任意文本里抽出邀请令牌；不含有效令牌则返回 null。
+         *
+         * 要认三种来源，它们的形状都不一样：
+         * - **扫码 / 深链接**：整条 `phantom://j/<令牌>`，前后没有别的东西
+         * - **从聊天软件复制**：链接被裹在一句话里（"快来 phantom://j/XXX 等你"），
+         *   所以不能只判 `startsWith`，要在整段文本里找
+         * - **裸令牌**：用户只复制了那一串
+         */
         fun parse(raw: String): String? {
             val text = raw.trim()
-            val token = when {
-                text.startsWith(SCHEME_PREFIX, ignoreCase = true) ->
-                    text.removePrefix(SCHEME_PREFIX).removePrefix("/")
-                // 裸令牌：用户从别处复制了一串过来，也认。
-                else -> text
-            }.uppercase().filter(Char::isLetterOrDigit)
-            return token.takeIf { it.length == TOKEN_LENGTH }
+
+            val at = text.indexOf(SCHEME_PREFIX, ignoreCase = true)
+            if (at >= 0) {
+                // 取 scheme 后面那段连续的字母数字，遇到空格/标点就停 ——
+                // 后面很可能还跟着别的话。
+                val token = text.substring(at + SCHEME_PREFIX.length)
+                    .takeWhile { it.isTokenChar() }
+                    .uppercase()
+                return token.takeIf { it.length == TOKEN_LENGTH }
+            }
+
+            // 裸令牌。这里必须整段都是令牌本身，不能从一段话里"捞"出 20 个
+            // 字符来 —— 那样几乎任何文本都会被误判成邀请。
+            val bare = text.uppercase().filter { it.isTokenChar() }
+            return bare.takeIf { it.length == TOKEN_LENGTH && it.length == text.length }
         }
+
+        /**
+         * 令牌与房间码的合法字符：**只有 ASCII 字母和数字**。
+         *
+         * 不能用 `Char.isLetterOrDigit()` —— 那个判定下中文也是字母，
+         * 于是"房间码 AB3K9M"这样的粘贴会被当成有效输入。
+         */
+        fun Char.isTokenChar(): Boolean = this in 'A'..'Z' || this in 'a'..'z' || this in '0'..'9'
 
         /** 与服务端 `issue_invite_token` 的长度一致，改一处必须改两处。 */
         const val TOKEN_LENGTH = 20

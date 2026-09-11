@@ -36,6 +36,21 @@ class PhantomPreferences(private val context: Context) {
         clipboard?.setPrimaryClip(ClipData.newPlainText(label, text))
     }
 
+    /**
+     * 读系统剪贴板里的纯文本；没有或读不到返回 null。
+     *
+     * Android 10 起只有获得焦点的前台应用才读得到剪贴板 —— 这正是我们的场景
+     * （用户刚点了「粘贴邀请链接」），但读不到时必须给得出提示，不能静默失败。
+     */
+    fun readClipboardText(): String? {
+        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+        val clip = clipboard?.primaryClip ?: return null
+        if (clip.itemCount == 0) return null
+        return clip.getItemAt(0)?.coerceToText(context)?.toString()?.trim()?.takeIf {
+            it.isNotEmpty()
+        }
+    }
+
     /** 系统是否会自己给出复制成功的视觉反馈（Android 13 起会）。 */
     val systemShowsCopyFeedback: Boolean
         get() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU

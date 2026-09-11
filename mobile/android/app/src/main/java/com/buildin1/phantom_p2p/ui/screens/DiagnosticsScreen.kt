@@ -126,40 +126,12 @@ fun DiagnosticsScreen(
 
             MetricsRow(stats)
 
-            PhantomCard {
-                CardLabel("网络环境")
-                if (profile == null) {
-                    SettingRow(title = "正在探测…", subtitle = "读取 NAT 画像与公网映射")
-                } else {
-                    SettingRow(
-                        title = "NAT 类型",
-                        trailing = { RowValue(profile.natClass.displayLabel) },
-                    )
-                    RowDivider()
-                    SettingRow(
-                        title = "公网映射",
-                        subtitle = if (profile.mappingStable) "多次探测结果一致" else "每次探测都不同",
-                        trailing = {
-                            StatusPill(
-                                text = if (profile.mappingStable) "稳定" else "不稳定",
-                                tone = if (profile.mappingStable) PillTone.Ok else PillTone.Warn,
-                            )
-                        },
-                    )
-                    RowDivider()
-                    SettingRow(
-                        title = "IPv6",
-                        trailing = { RowValue(if (profile.ipv6Available) "可用" else "不可用") },
-                    )
-                    RowDivider()
-                    SettingRow(
-                        title = "虚拟网卡 MTU",
-                        trailing = { RowValue(profile.mtu.toString(), mono = true) },
-                    )
-                }
-            }
-
-            if (diagnostics != null) {
+            // 「网络环境」是连接过程中顺带得到的**轻量画像**，跑过完整诊断之后
+            // 它说的每一件事下面的报告都说了，而且更细。两张卡同时在，用户看到的
+            // 是两套互相打架的说法 —— 完整报告一到，这张就让位。
+            if (diagnostics == null) {
+                NetworkProfileCard(profile)
+            } else {
                 DiagnosticsReport(diagnostics)
             }
 
@@ -273,6 +245,48 @@ private fun ProbeProgressCard(progress: DiagnosticsProgress?) {
                 )
             }
         }
+    }
+}
+
+/**
+ * 连接过程中顺带得到的轻量网络画像。
+ *
+ * 跑过完整诊断之后**不再显示**：它说的每一件事 [DiagnosticsReport] 都说了，
+ * 而且更细。两张卡同时在，用户看到的是两套互相打架的说法。
+ */
+@Composable
+private fun NetworkProfileCard(profile: NetworkProfile?) {
+    PhantomCard {
+        CardLabel("网络环境")
+        if (profile == null) {
+            SettingRow(title = "尚未探测", subtitle = "点右下角「重新检测」跑一次完整诊断")
+            return@PhantomCard
+        }
+        SettingRow(
+            title = "NAT 类型",
+            trailing = { RowValue(profile.natClass.displayLabel) },
+        )
+        RowDivider()
+        SettingRow(
+            title = "公网映射",
+            subtitle = if (profile.mappingStable) "多次探测结果一致" else "每次探测都不同",
+            trailing = {
+                StatusPill(
+                    text = if (profile.mappingStable) "稳定" else "不稳定",
+                    tone = if (profile.mappingStable) PillTone.Ok else PillTone.Warn,
+                )
+            },
+        )
+        RowDivider()
+        SettingRow(
+            title = "IPv6",
+            trailing = { RowValue(if (profile.ipv6Available) "可用" else "不可用") },
+        )
+        RowDivider()
+        SettingRow(
+            title = "虚拟网卡 MTU",
+            trailing = { RowValue(profile.mtu.toString(), mono = true) },
+        )
     }
 }
 

@@ -266,7 +266,11 @@ fun RoomCodeInput(
             value = field,
             onValueChange = { raw ->
                 // 房间码只有大写字母与数字，长度封顶 6。
-                val sanitized = raw.text.uppercase().filter(Char::isLetterOrDigit).take(6)
+                // 只认 ASCII：Char.isLetterOrDigit() 下中文也算字母，
+                // 中文输入法直接上屏时会漏进来。
+                val sanitized = raw.text.uppercase()
+                    .filter { it in 'A'..'Z' || it in '0'..'9' }
+                    .take(6)
                 field = TextFieldValue(sanitized, TextRange(sanitized.length))
                 if (sanitized != code) onCodeChange(sanitized)
             },

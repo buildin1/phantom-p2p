@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.buildin1.phantom_p2p.engine.ConnectionState
 import com.buildin1.phantom_p2p.engine.EngineClient
+import com.buildin1.phantom_p2p.engine.InviteToken
 import com.buildin1.phantom_p2p.engine.RecentRoom
 import com.buildin1.phantom_p2p.engine.roomCode
 import com.buildin1.phantom_p2p.ui.Tab
@@ -85,7 +86,10 @@ class PhantomViewModel(
     fun setDraftCode(code: String) {
         // 房间码只有大写字母与数字，长度封顶 6。在这里归一化而不是在输入控件里，
         // 是因为扫码与深链接也会走这条路。
-        _draftCode.value = code.uppercase().filter { it.isLetterOrDigit() }.take(6)
+        // 只认 ASCII：isLetterOrDigit() 下中文也算字母，输入法可能塞进来。
+        _draftCode.value = with(InviteToken.Companion) {
+            code.uppercase().filter { it.isTokenChar() }.take(6)
+        }
     }
 
     fun join(code: String = _draftCode.value) {
@@ -147,6 +151,45 @@ class PhantomViewModel(
     fun refreshInvite() = viewModelScope.launch {
         engine.requestInviteToken(refresh = true)
         _toast.value = "旧邀请已失效，正在生成新的"
+    }
+
+    /**
+     * 从剪贴板取邀请并加入。
+     *
+     * 房主分享出去的是一条 `phantom://j/<令牌>` 链接，但链接只在装了本应用的
+     * 设备上点得开；从聊天软件复制过来的那串文本此前**没有任何地方能输入** ——
+     * 有分享却无处可用。
+     *
+     * 三种形态都认：整条链接、裸令牌、以及 6 位房间码（用户很可能顺手复制的
+     * 就是房间码，直接当房间码用比报错好）。
+     *
+     * @return 是否成功识别。识别不出时由调用方决定怎么提示。
+     */
+    fun pasteInvite() {
+        val raw = prefs.readClipboardText()
+        if (raw.isNullOrEmpty()) {
+            _toast.value = "剪贴板是空的"
+            return
+        }
+
+        InviteToken.parse(raw)?.let { token ->
+            joinByToken(token)
+            return
+        }
+
+        // 退一步：是不是一个 6 位房间码？
+        // 只认 ASCII 字母数字 —— isLetterOrDigit() 下中文也算字母，
+        // "房间码 AB3K9M" 会被当成有效输入。
+        val code = with(InviteToken.Companion) {
+            raw.uppercase().filter { it.isTokenChar() }
+        }
+        if (code.length == 6) {
+            setDraftCode(code)
+            join(code)
+            return
+        }
+
+        _toast.value = "剪贴板里不是邀请链接或房间码"
     }
 
     /**

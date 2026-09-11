@@ -1,6 +1,7 @@
 package com.buildin1.phantom_p2p.ui.components
 
-import androidx.compose.foundation.Canvas
+import android.graphics.Bitmap
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -18,9 +19,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.FilterQuality
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
@@ -31,7 +33,6 @@ import com.buildin1.phantom_p2p.ui.theme.PhantomPreview
 import com.buildin1.phantom_p2p.ui.theme.PhantomTheme
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.EncodeHintType
-import com.google.zxing.common.BitMatrix
 import com.google.zxing.qrcode.QRCodeWriter
 import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
 
@@ -55,25 +56,8 @@ fun QrCode(
     content: String,
     modifier: Modifier = Modifier,
 ) {
-    // 编码是纯计算，内容不变就不重算。
-    val matrix = remember(content) {
-        runCatching {
-            QRCodeWriter().encode(
-                content,
-                BarcodeFormat.QR_CODE,
-                // 这两个尺寸只决定 ZXing 内部的输出网格。我们只关心模块的
-                // 通断，实际像素尺寸由 Canvas 决定，所以给个够用的值即可。
-                QR_RENDER_SIZE,
-                QR_RENDER_SIZE,
-                mapOf(
-                    EncodeHintType.ERROR_CORRECTION to ErrorCorrectionLevel.M,
-                    // 留白交给外层的 padding 统一控制，这里不要 ZXing 再加一圈。
-                    EncodeHintType.MARGIN to 0,
-                    EncodeHintType.CHARACTER_SET to "UTF-8",
-                ),
-            )
-        }.getOrNull()
-    }
+    // 编码 + 转位图都是纯计算，内容不变就不重做。
+    val bitmap = remember(content) { encodeQrBitmap(content) }
 
     Box(
         modifier = modifier
@@ -85,7 +69,7 @@ fun QrCode(
             .padding(12.dp),
         contentAlignment = Alignment.Center,
     ) {
-        if (matrix == null) {
+        if (bitmap == null) {
             Text(
                 text = "二维码生成失败",
                 style = MaterialTheme.typography.bodySmall,
@@ -95,23 +79,15 @@ fun QrCode(
             return@Box
         }
 
-        Canvas(Modifier.fillMaxWidth().aspectRatio(1f)) {
-            val modules = matrix.width
-            if (modules <= 0) return@Canvas
-            // 用浮点步长而不是整数像素：整除会在右下角累积出一条空白缝。
-            val step = size.minDimension / modules
-            for (y in 0 until modules) {
-                for (x in 0 until modules) {
-                    if (!matrix.get(x, y)) continue
-                    drawRect(
-                        color = QrForeground,
-                        topLeft = Offset(x * step, y * step),
-                        // 每格画满一个 step，相邻方块自然拼成连续区块。
-                        size = Size(step, step),
-                    )
-                }
-            }
-        }
+        Image(
+            bitmap = bitmap,
+            contentDescription = "邀请二维码",
+            modifier = Modifier.fillMaxWidth().aspectRatio(1f),
+            // 位图只有模块那么大（约 41×41 像素），放大到屏幕尺寸靠这里。
+            // FilterQuality.None = 最近邻，方块边缘保持锐利；
+            // 用默认的双线性会把边缘糊掉，扫码器就不容易认了。
+            filterQuality = FilterQuality.None,
+        )
     }
 }
 
@@ -217,11 +193,49 @@ private fun InviteAction(
     }
 }
 
-/** ZXing 的内部输出网格尺寸。实际显示尺寸由 Canvas 决定，与它无关。 */
-private const val QR_RENDER_SIZE = 512
+/**
+ * 把内容编码成**模块分辨率**的位图（约 41×41 像素），失败返回 null。
+ *
+ * ## 这里踩过一个很贵的坑
+ *
+ * `QRCodeWriter.encode(content, QR_CODE, 512, 512, hints)` 返回的 BitMatrix
+ * 是 **512×512**，不是模块网格 —— ZXing 会把码放大到你要求的尺寸。
+ * 之前这里按 `matrix.width` 逐格 `drawRect`，等于**每帧 26 万次绘制调用**，
+ * 而且它还在一个滚动容器里：展开二维码后整个页面几乎滑不动。
+ *
+ * 现在传 `0, 0`，拿到的就是自然的模块网格（`outputWidth = max(0, inputWidth)`，
+ * 缩放倍数为 1）；一次性转成位图，之后每帧只有一次绘制。
+ */
+private fun encodeQrBitmap(content: String): ImageBitmap? = runCatching {
+    val matrix = QRCodeWriter().encode(
+        content,
+        BarcodeFormat.QR_CODE,
+        // 0 = 不放大，直接给模块网格。放大交给显示层做。
+        0,
+        0,
+        mapOf(
+            EncodeHintType.ERROR_CORRECTION to ErrorCorrectionLevel.M,
+            // 留白交给外层的白底 padding，不要 ZXing 再加一圈。
+            EncodeHintType.MARGIN to 0,
+            EncodeHintType.CHARACTER_SET to "UTF-8",
+        ),
+    )
 
-/** 二维码的暗模块颜色。固定纯黑，不跟随主题 —— 见 [QrCode] 的说明。 */
-private val QrForeground = Color(0xFF000000)
+    val width = matrix.width
+    val height = matrix.height
+    val pixels = IntArray(width * height)
+    for (y in 0 until height) {
+        val row = y * width
+        for (x in 0 until width) {
+            pixels[row + x] = if (matrix.get(x, y)) QR_DARK else QR_LIGHT
+        }
+    }
+    Bitmap.createBitmap(pixels, width, height, Bitmap.Config.ARGB_8888).asImageBitmap()
+}.getOrNull()
+
+/** 二维码的暗/亮模块颜色。固定黑白，不跟随主题 —— 见 [QrCode] 的说明。 */
+private const val QR_DARK = 0xFF000000.toInt()
+private const val QR_LIGHT = 0xFFFFFFFF.toInt()
 
 @Preview
 @Composable
