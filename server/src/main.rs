@@ -2100,12 +2100,14 @@ async fn handle_request_invite_token(session_id: &str, revoke_first: bool, state
         if let Some(old) = st.revoke_invite_token(&room_code) {
             // 只记前 4 位。日志会被上传上来排障，完整令牌等于房间钥匙。
             // 切片用 get 不用索引：令牌恒为 20 位，但服务端不该为一条日志崩。
-            info!("[邀请] 房间 {} 作废旧令牌 {}…", room_code, prefix4(&old));
+            let short = prefix4(&old);
+            info!("[邀请] 房间 {} 作废旧令牌 {}…", room_code, short);
         }
     }
 
     let token = st.issue_invite_token(&room_code);
-    info!("[邀请] 房间 {} 已签发令牌 {}…", room_code, prefix4(&token));
+    let short = prefix4(&token);
+    info!("[邀请] 房间 {} 已签发令牌 {}…", room_code, short);
     let _ = sender.send(ServerMessage::InviteToken { token, room_code });
 }
 

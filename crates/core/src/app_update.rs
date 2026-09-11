@@ -106,7 +106,11 @@ pub fn download_and_verify(
         return Err("安装包校验失败，已丢弃".to_string());
     }
 
-    info!("[更新] 安装包校验通过：{} ({} 字节)", dest.display(), written);
+    info!(
+        "[更新] 安装包校验通过：{} ({} 字节)",
+        dest.display(),
+        written
+    );
     Ok(dest.to_path_buf())
 }
 
