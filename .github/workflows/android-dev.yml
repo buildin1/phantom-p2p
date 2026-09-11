@@ -26,9 +26,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # 目前 crates/mobile 的导出面还没重做，先不构建原生库，
-  # 让 UI 层的编译错误能独立暴露出来。等 FFI 落地后改成 true。
-  BUILD_RUST_NATIVE: "false"
+  # 引擎已接入：必须编 .so 并打进 APK，否则装上去是个空壳
+  # （PhantomEngine.ensureLibraryLoaded 会失败，引擎整个不可用）。
+  BUILD_RUST_NATIVE: "true"
 
 jobs:
   # Rust 侧独立成 job：core 的改动会影响桌面端，必须先证明 workspace 没被

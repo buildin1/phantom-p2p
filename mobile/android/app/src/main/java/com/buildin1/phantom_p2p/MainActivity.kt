@@ -17,7 +17,7 @@ import androidx.compose.runtime.remember
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
-import com.buildin1.phantom_p2p.engine.FakeEngineClient
+import com.buildin1.phantom_p2p.engine.JniEngineClient
 import com.buildin1.phantom_p2p.ui.RootScreen
 import com.buildin1.phantom_p2p.vpn.PhantomVpnService
 import com.buildin1.phantom_p2p.ui.Tab
@@ -36,9 +36,15 @@ class MainActivity : ComponentActivity() {
     private val viewModel: PhantomViewModel by viewModels {
         viewModelFactory {
             initializer {
+                val app = applicationContext as PhantomApp
                 PhantomViewModel(
-                    // TODO(FFI)：换成真引擎。接口不变，只换这一行。
-                    engine = FakeEngineClient(MainScope()),
+                    engine = JniEngineClient(
+                        scope = MainScope(),
+                        signalUrl = BuildConfig.OFFICIAL_SIGNAL_SERVER,
+                        logDir = app.logDirectory().absolutePath,
+                        dataDir = app.dataDirectory().absolutePath,
+                        devMode = BuildConfig.DEV_TOOLS,
+                    ),
                     prefs = PhantomPreferences(applicationContext),
                 )
             }

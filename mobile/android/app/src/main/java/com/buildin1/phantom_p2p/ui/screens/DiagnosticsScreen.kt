@@ -20,7 +20,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
-import com.buildin1.phantom_p2p.engine.FakeEngineClient
+import com.buildin1.phantom_p2p.ui.PreviewData
 import com.buildin1.phantom_p2p.engine.LinkStats
 import com.buildin1.phantom_p2p.engine.NetworkProfile
 import com.buildin1.phantom_p2p.ui.components.CardLabel
@@ -163,8 +163,8 @@ private fun Chevron() {
 @Composable
 private fun DiagnosticsPreview() = PhantomPreview {
     DiagnosticsScreen(
-        stats = FakeEngineClient.PREVIEW_STATS,
-        profile = FakeEngineClient.SAMPLE_PROFILE,
+        stats = PreviewData.stats,
+        profile = PreviewData.profile,
         logSizeText = "4 个分片 · 6.2 MB",
         onReprobe = {}, onOpenLogs = {}, onReportProblem = {},
     )
@@ -174,8 +174,8 @@ private fun DiagnosticsPreview() = PhantomPreview {
 @Composable
 private fun DiagnosticsDarkPreview() = PhantomPreview(dark = true) {
     DiagnosticsScreen(
-        stats = FakeEngineClient.PREVIEW_STATS,
-        profile = FakeEngineClient.SAMPLE_PROFILE,
+        stats = PreviewData.stats,
+        profile = PreviewData.profile,
         logSizeText = "4 个分片 · 6.2 MB",
         onReprobe = {}, onOpenLogs = {}, onReportProblem = {},
     )

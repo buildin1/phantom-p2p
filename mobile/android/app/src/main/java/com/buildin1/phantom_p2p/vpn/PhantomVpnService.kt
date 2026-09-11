@@ -13,6 +13,7 @@ import android.util.Log
 import com.buildin1.phantom_p2p.BuildConfig
 import com.buildin1.phantom_p2p.MainActivity
 import com.buildin1.phantom_p2p.R
+import com.buildin1.phantom_p2p.engine.PhantomEngine
 
 /**
  * 虚拟网卡宿主。
@@ -47,6 +48,8 @@ class PhantomVpnService : VpnService() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        // 引擎要建网卡、要保护 socket，都得回调到这个 Service 实例上。
+        PhantomEngine.attachService(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -70,15 +73,21 @@ class PhantomVpnService : VpnService() {
     /**
      * 建立虚拟网卡并把 fd 交出去。
      *
-     * 调用方是引擎层：房间的子网与本机虚拟 IP 由服务端分配，必须等那一步完成
-     * 才能建网卡，所以不能在 [onStartCommand] 里做。
+     * 由 Rust 引擎经 JNI 回调进来（见 `PhantomEngine.onEstablishTun`）：
+     * 房间的子网与本机虚拟 IP 由服务端分配，必须等那一步完成才能建网卡，
+     * 所以不能在 [onStartCommand] 里做。
      *
-     * @return 已 detach 的裸 fd，失败时 -1。所有权转移给调用方（最终是 Rust）。
+     * **这个方法不在主线程上**——调用它的是 Rust 的 tokio worker。
+     * `establish()` 本身没有主线程要求。
+     *
+     * @return 已 detach 的裸 fd，失败时 -1。所有权转移给 Rust，
+     *         这边不再持有、也不能关闭它。
      */
     fun establishTunnel(
         localVirtualIp: String,
         subnetPrefixLength: Int,
         routes: List<Route>,
+        mtu: Int = BuildConfig.TUN_MTU,
     ): Int {
         teardownTunOnly()
 
@@ -87,9 +96,10 @@ class PhantomVpnService : VpnService() {
             .addAddress(localVirtualIp, subnetPrefixLength)
             // MTU 必须与 core 的 TUN_MTU 一致。QUIC datagram 的可用载荷实测是
             // 1162 字节，设成 1500 会让每个满载包都超出上限，表现为稳定丢包。
-            .setMtu(BuildConfig.TUN_MTU)
+            .setMtu(mtu)
             .setBlocking(false)
 
+        // 路由必须在 establish 之前给全 —— Builder 一旦 establish 就无法追加。
         routes.forEach { builder.addRoute(it.address, it.prefixLength) }
 
         // 让本应用自己的流量绕开这条隧道，否则信令与打洞的包会灌回自己，
@@ -131,12 +141,16 @@ class PhantomVpnService : VpnService() {
      */
     override fun onRevoke() {
         Log.w(TAG, "VPN 授权被撤销")
+        // 先停引擎再拆自己：引擎还在往 fd 上写包的话，
+        // 关掉 fd 会让它读到 EBADF 而不是一个干净的关闭信号。
+        PhantomEngine.nativeShutdown()
         teardown()
         stopSelf()
         super.onRevoke()
     }
 
     override fun onDestroy() {
+        PhantomEngine.attachService(null)
         teardown()
         super.onDestroy()
     }
