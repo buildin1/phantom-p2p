@@ -28,6 +28,7 @@ pub fn ensure_rustls_crypto_provider() -> Result<(), String> {
     }
 }
 
+pub mod app_update;
 pub mod config;
 pub mod crypto;
 pub mod ice;

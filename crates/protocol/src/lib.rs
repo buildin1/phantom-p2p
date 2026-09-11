@@ -508,6 +508,24 @@ pub enum ClientMessage {
     #[serde(rename = "join_room")]
     JoinRoom { room_code: String },
 
+    /// 索要当前房间的邀请令牌（仅 host 可操作）。
+    ///
+    /// 令牌由服务端签发，客户端不参与生成 —— 安全性来自随机数与服务端状态，
+    /// 不来自算法保密。房间已有令牌时原样返回，不会每次都换一个。
+    #[serde(rename = "request_invite_token")]
+    RequestInviteToken,
+
+    /// 作废当前邀请令牌并重新签发一个（仅 host 可操作）。
+    ///
+    /// 用于"二维码截图发错群了"这类场景：旧令牌立即失效。
+    #[serde(rename = "revoke_invite_token")]
+    RevokeInviteToken,
+
+    /// 用邀请令牌加入房间。等价于 [`ClientMessage::JoinRoom`]，
+    /// 只是不需要人去念那 6 位房间码。
+    #[serde(rename = "join_by_token")]
+    JoinByToken { token: String },
+
     /// 离开当前房间
     #[serde(rename = "leave_room")]
     LeaveRoom,
@@ -527,6 +545,17 @@ pub enum ClientMessage {
         protocol_version: u32,
         /// 客户端展示版本（如 "2.7.7"），仅用于遥测与提示
         client_version: String,
+        /// 客户端平台：`android` / `windows` / `macos` / `linux`。
+        ///
+        /// 服务端据此决定给不给、给哪个平台的更新包（见
+        /// [`ServerMessage::AppUpdate`]）。版本策略全在服务端，改策略不用发版。
+        ///
+        /// `#[serde(default)]` 是必需的：老客户端发的 Auth 里没有这个键，
+        /// 缺了它新服务端会**反序列化失败**，而 Auth 失败等于全量客户端被锁在门外。
+        /// 这是整套协议里唯一一条出错就是全网事故的消息，见
+        /// `test_auth_forward_backward_compat`。
+        #[serde(default)]
+        client_platform: String,
     },
 
     /// 请求中继（打洞失败后）
@@ -643,11 +672,36 @@ pub enum ServerMessage {
     #[serde(rename = "join_failed")]
     JoinFailed { reason: String },
 
+    /// 房间的邀请令牌。
+    ///
+    /// 令牌**跟随房间生命周期**：房间在就有效，房间关了就作废，没有独立过期时间。
+    /// 可复用 —— 房主发一张二维码到群里，所有人都能用它进来。
+    #[serde(rename = "invite_token")]
+    InviteToken { token: String, room_code: String },
+
+    /// 用令牌加入失败（令牌不存在、已被作废、或房间已关闭）。
+    ///
+    /// 与 [`ServerMessage::JoinFailed`] 分开是为了让界面能说人话：
+    /// "这个邀请码已失效" 比 "加入房间失败" 有用。
+    #[serde(rename = "invite_token_invalid")]
+    InviteTokenInvalid { reason: String },
+
     /// 有新的 guest 加入（通知 host）
     #[serde(rename = "peer_joined")]
     PeerJoined {
         peer_session_id: String,
         guest_count: usize,
+        /// 这个 guest 的虚拟 IP。
+        ///
+        /// 服务端一直知道（就是它分配的、写在 guest 的 `JoinOk` 里），
+        /// 只是从没告诉过 host —— 于是房主端的成员列表里对端 IP 只能显示 "—"。
+        ///
+        /// `#[serde(default)]` 不是可选的装饰：老服务端发来的 `peer_joined`
+        /// 里没有这个键，缺了它新客户端会直接反序列化失败。加字段在这套协议里
+        /// 之所以安全，靠的就是「发送端多的键被忽略 + 接收端缺的键有默认值」
+        /// 这一对，两边都要。见 `test_peer_joined_forward_backward_compat`。
+        #[serde(default)]
+        virtual_ip: String,
     },
 
     /// 有 guest 离开（通知 host）
@@ -748,6 +802,32 @@ pub enum ServerMessage {
     /// 请求客户端上传完整日志包（排障用，走独立 HTTP POST）
     #[serde(rename = "request_log_upload")]
     RequestLogUpload { upload_url: String, reason: String },
+
+    /// 云端下发的版本通告。
+    ///
+    /// 服务端在鉴权后按 `Auth.client_version` 判断要不要发、发什么 ——
+    /// **版本策略全在服务端，调整策略不需要发客户端**。老客户端不认识这条消息，
+    /// 收到后只会 `warn!` 一行（见 `signal/client.rs` 的未知消息分支），
+    /// 所以新增它不需要动 [`PROTOCOL_VERSION`]。
+    #[serde(rename = "app_update")]
+    AppUpdate {
+        /// android / windows / macos / linux
+        platform: String,
+        /// 最新版本号，如 "3.3.0"
+        latest_version: String,
+        /// 低于此版本即视为已失效，必须更新
+        min_supported: String,
+        download_url: String,
+        /// 安装包的 SHA-256（小写十六进制）。
+        ///
+        /// **不是可选项。** 没有校验的自动安装等于把设备交给任何能劫持下载的人。
+        /// 客户端必须在落盘后、唤起安装前校验，不匹配就删包并报错。
+        sha256: String,
+        /// 更新说明，直接展示给用户
+        notes: String,
+        /// 是否强制更新（客户端版本低于 `min_supported` 时服务端置 true）
+        mandatory: bool,
+    },
 }
 
 // ============================================================
@@ -1181,6 +1261,7 @@ mod tests {
         let msg = ServerMessage::PeerJoined {
             peer_session_id: "sess_guest_001".to_string(),
             guest_count: 3,
+            virtual_ip: "10.66.0.2".to_string(),
         };
         let bytes = serialize(&msg).unwrap();
         let decoded: ServerMessage = deserialize(&bytes).unwrap();
@@ -1188,9 +1269,207 @@ mod tests {
             ServerMessage::PeerJoined {
                 peer_session_id,
                 guest_count,
+                virtual_ip,
             } => {
                 assert_eq!(peer_session_id, "sess_guest_001");
                 assert_eq!(guest_count, 3);
+                assert_eq!(virtual_ip, "10.66.0.2");
+            }
+            _ => panic!("消息类型不匹配"),
+        }
+    }
+
+    /// 给已有消息加字段到底安不安全 —— 这个测试就是答案，不是假设。
+    ///
+    /// 服务端对协议版本做的是**严格相等**判断，不等就直接拒绝连接。所以
+    /// `PROTOCOL_VERSION` 一旦升到 4，新服务端上线那一刻全量老客户端断档。
+    /// 既然不能升版本，给 `PeerJoined` 加 `virtual_ip` 就必须在**不改版本号**
+    /// 的前提下双向兼容。两个方向都要成立：
+    ///
+    /// - **新服务端 → 老客户端**：多出来的键必须被忽略（serde 默认行为，
+    ///   前提是没有 `deny_unknown_fields`，且 `to_vec_named` 按键名编码）
+    /// - **老服务端 → 新客户端**：缺失的键必须有默认值（`#[serde(default)]`）
+    ///
+    /// 这里用一个"老版本"结构体模拟对端，跨版本解码双向验证。
+    #[test]
+    fn test_peer_joined_forward_backward_compat() {
+        /// 老客户端眼里的 PeerJoined —— 没有 virtual_ip。
+        #[derive(Serialize, Deserialize)]
+        #[serde(tag = "cmd")]
+        enum LegacyServerMessage {
+            #[serde(rename = "peer_joined")]
+            PeerJoined {
+                peer_session_id: String,
+                guest_count: usize,
+            },
+        }
+
+        // 方向一：新服务端发带 virtual_ip 的消息，老客户端必须能解出来。
+        let modern = ServerMessage::PeerJoined {
+            peer_session_id: "sess_guest_001".to_string(),
+            guest_count: 1,
+            virtual_ip: "10.66.0.2".to_string(),
+        };
+        let bytes = serialize(&modern).unwrap();
+        // 老客户端必须能忽略未知字段
+        let legacy: LegacyServerMessage = deserialize(&bytes).unwrap();
+        let LegacyServerMessage::PeerJoined {
+            peer_session_id,
+            guest_count,
+        } = legacy;
+        assert_eq!(peer_session_id, "sess_guest_001");
+        assert_eq!(guest_count, 1);
+
+        // 方向二：老服务端发不带 virtual_ip 的消息，新客户端必须能解出来，
+        // 且 virtual_ip 落到空串而不是报错。
+        let legacy_msg = LegacyServerMessage::PeerJoined {
+            peer_session_id: "sess_guest_002".to_string(),
+            guest_count: 2,
+        };
+        let bytes = serialize(&legacy_msg).unwrap();
+        // 新客户端必须容忍缺失字段（靠 #[serde(default)]）
+        let decoded: ServerMessage = deserialize(&bytes).unwrap();
+        match decoded {
+            ServerMessage::PeerJoined {
+                peer_session_id,
+                guest_count,
+                virtual_ip,
+            } => {
+                assert_eq!(peer_session_id, "sess_guest_002");
+                assert_eq!(guest_count, 2);
+                assert_eq!(virtual_ip, "", "缺失时必须是默认值");
+            }
+            _ => panic!("消息类型不匹配"),
+        }
+    }
+
+    /// 新增**消息类型**（而不是新增字段）是另一条路，这里验证它确实可解。
+    ///
+    /// 未知消息类型在两端都只会 `warn!` 一行、连接继续，所以新增变体天然安全。
+    #[test]
+    fn test_invite_token_messages_roundtrip() {
+        for msg in [
+            ClientMessage::RequestInviteToken,
+            ClientMessage::RevokeInviteToken,
+            ClientMessage::JoinByToken {
+                token: "7QFK3M2XJ9WD4NBV6RTZ".to_string(),
+            },
+        ] {
+            let bytes = serialize(&msg).unwrap();
+            let _: ClientMessage = deserialize(&bytes).unwrap();
+        }
+
+        let msg = ServerMessage::InviteToken {
+            token: "7QFK3M2XJ9WD4NBV6RTZ".to_string(),
+            room_code: "AB3K9M".to_string(),
+        };
+        let bytes = serialize(&msg).unwrap();
+        match deserialize::<ServerMessage>(&bytes).unwrap() {
+            ServerMessage::InviteToken { token, room_code } => {
+                assert_eq!(token, "7QFK3M2XJ9WD4NBV6RTZ");
+                assert_eq!(room_code, "AB3K9M");
+            }
+            _ => panic!("消息类型不匹配"),
+        }
+
+        let msg = ServerMessage::InviteTokenInvalid {
+            reason: "邀请已失效".to_string(),
+        };
+        let bytes = serialize(&msg).unwrap();
+        match deserialize::<ServerMessage>(&bytes).unwrap() {
+            ServerMessage::InviteTokenInvalid { reason } => {
+                assert_eq!(reason, "邀请已失效");
+            }
+            _ => panic!("消息类型不匹配"),
+        }
+    }
+
+    /// `Auth` 是整套协议里唯一一条出错就是全网事故的消息 —— 它失败，客户端
+    /// 连不上，没有任何降级路径。所以给它加字段必须当场证明双向兼容，而不是
+    /// 靠"serde 应该会忽略未知字段"这种记忆。
+    #[test]
+    fn test_auth_forward_backward_compat() {
+        /// 老客户端 / 老服务端眼里的 Auth —— 没有 client_platform。
+        #[derive(Serialize, Deserialize)]
+        #[serde(tag = "cmd")]
+        enum LegacyClientMessage {
+            #[serde(rename = "auth")]
+            Auth {
+                #[serde(with = "serde_bytes_array_32")]
+                public_key: [u8; 32],
+                #[serde(with = "serde_bytes_array_64")]
+                signature: [u8; 64],
+                protocol_version: u32,
+                client_version: String,
+            },
+        }
+
+        // 方向一：新客户端 → 老服务端。多出来的键必须被忽略。
+        let modern = ClientMessage::Auth {
+            public_key: [7u8; 32],
+            signature: [9u8; 64],
+            protocol_version: PROTOCOL_VERSION,
+            client_version: "3.3.0".to_string(),
+            client_platform: "android".to_string(),
+        };
+        let bytes = serialize(&modern).unwrap();
+        // 老服务端必须能忽略未知字段，否则新客户端全部连不上
+        let legacy: LegacyClientMessage = deserialize(&bytes).unwrap();
+        let LegacyClientMessage::Auth {
+            protocol_version,
+            client_version,
+            ..
+        } = legacy;
+        assert_eq!(protocol_version, PROTOCOL_VERSION);
+        assert_eq!(client_version, "3.3.0");
+
+        // 方向二：老客户端 → 新服务端。缺失的键必须落到默认值。
+        let legacy_msg = LegacyClientMessage::Auth {
+            public_key: [7u8; 32],
+            signature: [9u8; 64],
+            protocol_version: PROTOCOL_VERSION,
+            client_version: "3.2.2".to_string(),
+        };
+        let bytes = serialize(&legacy_msg).unwrap();
+        // 新服务端必须容忍缺失字段，否则老客户端全部被锁在门外
+        let decoded: ClientMessage = deserialize(&bytes).unwrap();
+        match decoded {
+            ClientMessage::Auth {
+                client_version,
+                client_platform,
+                ..
+            } => {
+                assert_eq!(client_version, "3.2.2");
+                assert_eq!(client_platform, "", "缺失时必须是默认值");
+            }
+            _ => panic!("消息类型不匹配"),
+        }
+    }
+
+    #[test]
+    fn test_app_update_roundtrip() {
+        let msg = ServerMessage::AppUpdate {
+            platform: "android".to_string(),
+            latest_version: "3.3.0".to_string(),
+            min_supported: "3.2.0".to_string(),
+            download_url: "https://example.invalid/phantom-3.3.0.apk".to_string(),
+            sha256: "a".repeat(64),
+            notes: "修复房间码输入".to_string(),
+            mandatory: true,
+        };
+        let bytes = serialize(&msg).unwrap();
+        match deserialize::<ServerMessage>(&bytes).unwrap() {
+            ServerMessage::AppUpdate {
+                platform,
+                latest_version,
+                sha256,
+                mandatory,
+                ..
+            } => {
+                assert_eq!(platform, "android");
+                assert_eq!(latest_version, "3.3.0");
+                assert_eq!(sha256.len(), 64);
+                assert!(mandatory);
             }
             _ => panic!("消息类型不匹配"),
         }

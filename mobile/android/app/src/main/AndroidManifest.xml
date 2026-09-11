@@ -21,6 +21,21 @@
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
+    <!--
+        扫码。相机只在扫码页用，运行时申请，拒绝了不影响其他功能。
+        required=false：没有摄像头的设备照样能装，只是扫不了码。
+    -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera.any" android:required="false" />
+
+    <!--
+        应用内更新。此应用不上架 Google Play（国内用不了），
+        所以不受 Play 的自更新政策限制。
+        Android 8+ 用户还要在系统里单独授权「允许安装未知应用」，
+        第一次会跳系统设置页，这一步绕不过去。
+    -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
     <application
         android:name=".PhantomApp"
         android:allowBackup="false"
@@ -43,12 +58,21 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
-            <!-- phantom://room/7K2M9Q —— 分享链接直接落到加入房间 -->
+            <!--
+                phantom://room/7K2M9Q —— 房间码分享链接
+                phantom://j/<20位令牌> —— 二维码里的邀请链接
+
+                用自定义 scheme 而不是 https：走 https 要自建 web 落地页、
+                配 App Links 校验文件（assetlinks.json），还会把信令域名印在
+                每一张二维码上。代价是没装本应用的人扫了没反应——这是自定义
+                scheme 的固有取舍。系统相机扫到时通常会提示「用 Phantom 打开」。
+            -->
             <intent-filter android:autoVerify="false">
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="phantom" android:host="room" />
+                <data android:scheme="phantom" android:host="j" />
             </intent-filter>
         </activity>
 
@@ -71,6 +95,14 @@
 
         <receiver
             android:name=".vpn.TunnelActionReceiver"
+            android:exported="false" />
+
+        <!--
+            应用内更新的安装结果回调。exported=false：只有系统的
+            PackageInstaller 会通过我们自己给出的 PendingIntent 触发它。
+        -->
+        <receiver
+            android:name=".update.UpdateInstallReceiver"
             android:exported="false" />
 
     </application>

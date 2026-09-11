@@ -8,6 +8,7 @@
 //! 4. 全部使用默认值
 
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tracing::{error, info, warn};
 
@@ -28,6 +29,29 @@ pub struct ServerConfig {
     pub stun: StunConfig,
     #[serde(default)]
     pub log_upload: LogUploadConfig,
+    /// 各平台的版本通告。键是平台名（android / windows / macos / linux）。
+    #[serde(default)]
+    pub app_update: HashMap<String, AppUpdateEntry>,
+}
+
+/// 一个平台的版本通告。
+///
+/// **版本策略全在这里，改策略只要改配置重载服务端，不用发客户端。**
+/// 这正是"云端下发"要的形态。
+#[derive(Debug, Clone, Deserialize)]
+pub struct AppUpdateEntry {
+    /// 最新版本号，如 "3.3.0"
+    pub latest_version: String,
+    /// 低于此版本即视为已失效，弹「当前版本已失效，请及时更新」
+    pub min_supported: String,
+    pub download_url: String,
+    /// 安装包的 SHA-256（小写十六进制，64 位）。
+    ///
+    /// **没有它就不下发。** 客户端会在安装前校验，配错了等于这条通告作废；
+    /// 而没有校验的自动安装等于把用户设备交给任何能劫持下载的人。
+    pub sha256: String,
+    #[serde(default)]
+    pub notes: String,
 }
 
 /// 日志包接收服务配置。
@@ -205,6 +229,9 @@ impl Default for ServerConfig {
             admin: AdminConfig::default(),
             stun: StunConfig::default(),
             log_upload: LogUploadConfig::default(),
+            // 默认为空：没配就什么都不下发。绝不能默认指向某个 URL ——
+            // 一个配错的更新源会把所有客户端引到错误的包上。
+            app_update: HashMap::new(),
         }
     }
 }

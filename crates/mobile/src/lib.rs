@@ -300,8 +300,11 @@ pub extern "system" fn Java_com_buildin1_phantom_1p2p_engine_PhantomEngine_nativ
 ) {
     let url = jstring_to_string(&mut env, &url);
     let Some(rt) = engine() else { return };
+    // 序号在这里同步领取，不能挪进 spawn —— 它代表的是用户的操作顺序，
+    // 而 spawn 出去的任务执行顺序是不保证的。见 SessionRuntime::lifecycle_seq。
+    let seq = SessionRuntime::next_lifecycle_seq();
     TOKIO.spawn(async move {
-        rt.connect_signal(url).await;
+        rt.connect_signal(url, seq).await;
     });
 }
 
@@ -334,6 +337,38 @@ pub extern "system" fn Java_com_buildin1_phantom_1p2p_engine_PhantomEngine_nativ
     });
 }
 
+/// 索要邀请令牌。结果通过 `signal:invite_token` 事件回来。
+#[no_mangle]
+pub extern "system" fn Java_com_buildin1_phantom_1p2p_engine_PhantomEngine_nativeRequestInviteToken(
+    _env: JNIEnv,
+    _class: JObject,
+    refresh: jboolean,
+) {
+    let refresh = refresh != 0;
+    let Some(rt) = engine() else { return };
+    TOKIO.spawn(async move {
+        if let Err(e) = rt.request_invite_token(refresh).await {
+            tracing::error!("[引擎] 索要邀请令牌失败: {}", e);
+        }
+    });
+}
+
+/// 用邀请令牌加入房间（扫码 / 点链接进来的路径）。
+#[no_mangle]
+pub extern "system" fn Java_com_buildin1_phantom_1p2p_engine_PhantomEngine_nativeJoinByToken(
+    mut env: JNIEnv,
+    _class: JObject,
+    token: JString,
+) {
+    let token = jstring_to_string(&mut env, &token);
+    let Some(rt) = engine() else { return };
+    TOKIO.spawn(async move {
+        if let Err(e) = rt.join_by_token(token).await {
+            tracing::error!("[引擎] 令牌入房失败: {}", e);
+        }
+    });
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_buildin1_phantom_1p2p_engine_PhantomEngine_nativeLeaveRoom(
     _env: JNIEnv,
@@ -351,12 +386,17 @@ pub extern "system" fn Java_com_buildin1_phantom_1p2p_engine_PhantomEngine_nativ
     _class: JObject,
 ) {
     let Some(rt) = engine() else { return };
+    let seq = SessionRuntime::next_lifecycle_seq();
     TOKIO.spawn(async move {
-        rt.disconnect().await;
+        rt.disconnect(seq).await;
     });
 }
 
-/// 跑一次网络环境探测。结果通过 `net:profile` 事件回来。
+/// 跑一次完整网络诊断。
+///
+/// 进度走 `net:progress`，结果走 `net:diagnostics`，失败走 `net:failed`。
+/// 失败**必须**回传界面：以前只在这里 `warn!` 一行，用户点「重新检测」
+/// 看到的就是"什么都没发生"。
 #[no_mangle]
 pub extern "system" fn Java_com_buildin1_phantom_1p2p_engine_PhantomEngine_nativeProbeNetwork(
     _env: JNIEnv,
@@ -366,6 +406,7 @@ pub extern "system" fn Java_com_buildin1_phantom_1p2p_engine_PhantomEngine_nativ
     TOKIO.spawn(async move {
         if let Err(e) = rt.probe_network().await {
             tracing::warn!("[诊断] 网络探测失败: {}", e);
+            rt.emit_probe_failure(&e);
         }
     });
 }
@@ -431,8 +472,9 @@ pub extern "system" fn Java_com_buildin1_phantom_1p2p_engine_PhantomEngine_nativ
     let Some(rt) = ENGINE.lock().take() else {
         return;
     };
+    let seq = SessionRuntime::next_lifecycle_seq();
     TOKIO.block_on(async move {
-        rt.disconnect().await;
+        rt.disconnect(seq).await;
     });
     tracing::info!("[引擎] 已关停");
 }

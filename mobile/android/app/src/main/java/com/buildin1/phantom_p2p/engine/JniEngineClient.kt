@@ -1,6 +1,7 @@
 package com.buildin1.phantom_p2p.engine
 
 import android.util.Log
+import com.buildin1.phantom_p2p.update.AppUpdateInfo
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -45,6 +46,22 @@ class JniEngineClient(
     private val _networkProfile = MutableStateFlow<NetworkProfile?>(null)
     override val networkProfile: StateFlow<NetworkProfile?> = _networkProfile.asStateFlow()
 
+    private val _inviteToken = MutableStateFlow<InviteToken?>(null)
+    override val inviteToken: StateFlow<InviteToken?> = _inviteToken.asStateFlow()
+
+    private val _diagnostics = MutableStateFlow<NetworkDiagnostics?>(null)
+    override val diagnostics: StateFlow<NetworkDiagnostics?> = _diagnostics.asStateFlow()
+
+    private val _diagnosticsProgress = MutableStateFlow<DiagnosticsProgress?>(null)
+    override val diagnosticsProgress: StateFlow<DiagnosticsProgress?> =
+        _diagnosticsProgress.asStateFlow()
+
+    private val _diagnosticsError = MutableStateFlow<String?>(null)
+    override val diagnosticsError: StateFlow<String?> = _diagnosticsError.asStateFlow()
+
+    private val _appUpdate = MutableStateFlow<AppUpdateInfo?>(null)
+    override val appUpdate: StateFlow<AppUpdateInfo?> = _appUpdate.asStateFlow()
+
     /** 建房/入房的应答要等信令回来，用它把异步事件接回 suspend 调用。 */
     private val pendingRoomCode = MutableStateFlow<String?>(null)
 
@@ -77,7 +94,18 @@ class JniEngineClient(
         if (!collecting) {
             collecting = true
             scope.launch {
-                PhantomEngine.events.collect { event -> handle(event) }
+                // 每条事件单独兜异常。
+                //
+                // 不兜的话，`handle()` 抛一次 —— 一个 optString 拿到非字符串、
+                // 一个枚举没覆盖到 —— 整个收集协程就死了，此后**所有**事件
+                // 都不再处理：signal:auth_ok 收不到、awaitAuthenticated 永远
+                // 超时、界面永远停在「连接服务器」，只能杀进程。
+                // 一条事件处理失败是小事，收集器停摆是致命的。
+                PhantomEngine.events.collect { event ->
+                    runCatching { handle(event) }.onFailure {
+                        Log.e(TAG, "处理事件 ${event.name} 失败: ${event.payload}", it)
+                    }
+                }
             }
             startStatsPolling()
         }
@@ -106,9 +134,17 @@ class JniEngineClient(
      */
     private suspend fun awaitAuthenticated(): Boolean {
         if (authenticated.value) return true
-        return withTimeoutOrNull(SIGNAL_TIMEOUT_MS) {
+        val ok = withTimeoutOrNull(SIGNAL_TIMEOUT_MS) {
             authenticated.first { it }
-        } ?: false
+        } != null
+        if (!ok) {
+            // 等超时说明这一轮信令没建起来。必须把 signalStarted 解锁，
+            // 否则下次 start() 会以为"已经连过了"而跳过 nativeConnectSignal，
+            // 于是永远等一个不会再来的 auth_ok —— 用户只能杀后台重开。
+            Log.w(TAG, "等待信令鉴权超时，解锁 signalStarted 以便下次重连")
+            signalStarted = false
+        }
+        return ok
     }
 
     override suspend fun createRoom(): Result<String> {
@@ -157,6 +193,30 @@ class JniEngineClient(
         return Result.success(Unit)
     }
 
+    override suspend fun joinByToken(token: String): Result<Unit> {
+        if (!start()) return Result.failure(IllegalStateException("引擎未就绪"))
+        isHost = false
+        // 房间码要等服务端在 join_ok 里告诉我们 —— 令牌解析是服务端的事。
+        this.roomCode = null
+        connectingSince = System.currentTimeMillis()
+
+        _state.value = ConnectionState.Connecting("", PunchPhase.ConnectingSignal, 0)
+        if (!awaitAuthenticated()) {
+            _state.value = ConnectionState.Failed(null, FailureReason.SignalUnavailable)
+            return Result.failure(IllegalStateException("连接服务器超时"))
+        }
+
+        _state.value = ConnectionState.Connecting("", PunchPhase.Probing, elapsed())
+        PhantomEngine.nativeJoinByToken(token)
+        return Result.success(Unit)
+    }
+
+    override suspend fun requestInviteToken(refresh: Boolean) {
+        if (!authenticated.value) return
+        if (refresh) _inviteToken.value = null
+        PhantomEngine.nativeRequestInviteToken(refresh)
+    }
+
     override suspend fun leaveRoom() {
         PhantomEngine.nativeLeaveRoom()
         resetRoom()
@@ -177,9 +237,19 @@ class JniEngineClient(
     }
 
     override suspend fun probeNetwork() {
-        if (!start()) return
-        // 真跑一次 STUN 探测，结果通过 net:profile 事件回来。
-        // 需要信令已连接：STUN 地址由服务端下发，客户端不内置任何地址。
+        if (!start()) {
+            // 引擎都没起来就别装作在检测。以前这里直接 return，界面毫无反应。
+            _diagnosticsError.value = "引擎未就绪，请重启应用后再试"
+            return
+        }
+        // 已经在跑就不要再叠一次：三轮 STUN 采样要十几秒，重复触发会让
+        // 两次进度事件互相覆盖，进度条来回跳。
+        if (_diagnosticsProgress.value != null) return
+
+        _diagnosticsError.value = null
+        // 先手动置一个 0%，让动画立刻起来 —— 等第一个 net:progress 事件从
+        // Rust 回来要一小会儿，那段空窗期正是用户觉得"点了没反应"的地方。
+        _diagnosticsProgress.value = DiagnosticsProgress(0, "准备检测", 15)
         PhantomEngine.nativeProbeNetwork()
     }
 
@@ -201,6 +271,8 @@ class JniEngineClient(
 
             "signal:auth_failed" -> {
                 authenticated.value = false
+                // 同 awaitAuthenticated 里的理由：不解锁就再也不会重连。
+                signalStarted = false
                 _state.value = ConnectionState.Failed(roomCode, FailureReason.SignalUnavailable)
             }
 
@@ -214,6 +286,9 @@ class JniEngineClient(
                 _state.value = ConnectionState.Connecting(
                     code, PunchPhase.EstablishingTunnel, elapsed()
                 )
+                // 建完房立刻要一张邀请，用户进房间页时二维码已经是现成的 ——
+                // 点开二维码才去要，就要先看一秒空白。
+                PhantomEngine.nativeRequestInviteToken(false)
                 rebuildMembers()
             }
 
@@ -239,13 +314,35 @@ class JniEngineClient(
 
             "signal:peer_joined" -> {
                 val id = json?.optString("peer_session_id").orEmpty()
-                if (id.isNotEmpty()) knownPeers.add(id)
+                if (id.isNotEmpty()) {
+                    knownPeers.add(id)
+                    // 对端虚拟 IP 现在由服务端在 peer_joined 里带过来了。
+                    // 老服务端不带这个字段，取到空串 —— 成员列表退回显示 "—"，
+                    // 与改动前一致，不会因此出错。
+                    val ip = json.optString("virtual_ip").orEmpty()
+                    if (ip.isNotEmpty()) peerVirtualIps[id] = ip
+                }
                 rebuildMembers()
             }
 
             "signal:peer_left" -> {
-                knownPeers.remove(json?.optString("peer_session_id"))
+                val id = json?.optString("peer_session_id")
+                knownPeers.remove(id)
+                peerVirtualIps.remove(id)
                 rebuildMembers()
+            }
+
+            "signal:invite_token" -> {
+                val token = json?.optString("token").orEmpty()
+                val code = json?.optString("room_code").orEmpty()
+                if (token.isNotEmpty()) {
+                    _inviteToken.value = InviteToken(token = token, roomCode = code)
+                }
+            }
+
+            "signal:invite_token_invalid" -> {
+                _inviteToken.value = null
+                _state.value = ConnectionState.Failed(roomCode, FailureReason.RoomGone)
             }
 
             "punch:phase" -> handlePunchPhase(event.payload)
@@ -305,7 +402,10 @@ class JniEngineClient(
             }
 
             "signal:status" -> {
-                val signalState = json?.optString("state").orEmpty()
+                // 必须读 state_key，不能读 state。
+                // state 是 core 的 Display 输出，是给人看的中文（"未连接"/"已连接"），
+                // 拿它去比 "disconnected" 永远不相等 —— 断线检测曾经整个是死的。
+                val signalState = json?.optString("state_key").orEmpty()
                 if (signalState.equals("disconnected", ignoreCase = true)) {
                     // 连接断了鉴权就作废。不清这个标记的话，重连之后
                     // awaitAuthenticated 会立刻放行，而命令仍然发不出去。
@@ -333,6 +433,54 @@ class JniEngineClient(
                         mtu = json.optInt("mtu", TUN_MTU),
                     )
                 }
+            }
+
+            "net:progress" -> {
+                val percent = json?.optInt("progress", 0) ?: 0
+                _diagnosticsProgress.value = DiagnosticsProgress(
+                    percent = percent.coerceIn(0, 100),
+                    stage = json?.optString("stage").orEmpty(),
+                    etaSeconds = json?.optInt("eta_seconds", 0) ?: 0,
+                )
+            }
+
+            "net:diagnostics" -> {
+                if (json != null) {
+                    _diagnostics.value = parseDiagnostics(json)
+                    _diagnosticsError.value = null
+                }
+                // 结果到手，进度条收工。放在这里而不是等 100% 那条进度事件：
+                // 事件是 DROP_OLDEST 的共享流，最后那条理论上可能被挤掉，
+                // 而结果事件一定在结果到达时才发。
+                _diagnosticsProgress.value = null
+            }
+
+            "net:failed" -> {
+                _diagnosticsProgress.value = null
+                _diagnosticsError.value = json?.optString("reason")
+                    ?.takeIf { it.isNotEmpty() } ?: "检测失败"
+            }
+
+            "signal:app_update" -> {
+                if (json == null) return
+                val url = json.optString("download_url")
+                val sha = json.optString("sha256")
+                // 校验值不合法就当这条通告不存在。没有 sha256 的自动安装
+                // 等于把设备交给任何能劫持下载的人 —— 宁可不提示更新。
+                val shaLooksValid = sha.length == 64 && sha.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' }
+                if (url.isEmpty() || !shaLooksValid) {
+                    Log.w(TAG, "版本通告缺少合法的下载地址或 sha256，忽略")
+                    return
+                }
+                _appUpdate.value = AppUpdateInfo(
+                    platform = json.optString("platform"),
+                    latestVersion = json.optString("latest_version"),
+                    minSupported = json.optString("min_supported"),
+                    downloadUrl = url,
+                    sha256 = sha,
+                    notes = json.optString("notes"),
+                    mandatory = json.optBoolean("mandatory", false),
+                )
             }
 
             "log:uploaded", "log:upload_failed" -> {
@@ -432,6 +580,53 @@ class JniEngineClient(
 
     private val knownPeers = linkedSetOf<String>()
 
+    /** session_id -> 对端虚拟 IP。服务端在 `peer_joined` 里下发。 */
+    private val peerVirtualIps = mutableMapOf<String, String>()
+
+    /**
+     * 把 `net:diagnostics` 的载荷翻成 [NetworkDiagnostics]。
+     *
+     * 字段名与 PC 端 `NetworkInfo` 的序列化名一一对应，改一边必须改另一边。
+     */
+    private fun parseDiagnostics(json: JSONObject): NetworkDiagnostics {
+        val details = json.optJSONArray("stun_details")
+        val stunDetails = buildList {
+            for (i in 0 until (details?.length() ?: 0)) {
+                val item = details?.optJSONObject(i) ?: continue
+                add(
+                    StunDetail(
+                        server = item.optString("server"),
+                        mapping = item.optString("mapping"),
+                        rttMillis = item.optInt("rtt_ms", 0),
+                        socket = item.optString("socket"),
+                        round = item.optInt("round", 0),
+                    )
+                )
+            }
+        }
+        return NetworkDiagnostics(
+            natType = json.optString("nat_type"),
+            natTypeKey = json.optString("nat_type_key"),
+            natDifficulty = json.optString("nat_difficulty"),
+            externalIp = json.optString("external_ip"),
+            externalPort = json.optInt("external_port", 0),
+            upnp = json.optBoolean("upnp", false),
+            upnpPort = json.optInt("upnp_port", 0),
+            ipv6 = json.optBoolean("ipv6", false),
+            ipv6Addr = json.optString("ipv6_addr"),
+            localIp = json.optString("local_ip"),
+            localPort = json.optInt("local_port", 0),
+            stunDetails = stunDetails,
+            portPattern = json.optString("port_pattern"),
+            mappingBehavior = json.optString("mapping_behavior"),
+            filteringBehavior = json.optString("filtering_behavior"),
+            confidence = json.optString("confidence"),
+            rounds = json.optInt("diagnostics_rounds", 0),
+            networkPriority = json.optString("network_priority"),
+            mtu = json.optInt("mtu", TUN_MTU),
+        )
+    }
+
     private fun rebuildMembers(transport: Transport? = null) {
         if (roomCode == null) {
             _members.value = emptyList()
@@ -464,7 +659,8 @@ class JniEngineClient(
             list += RoomMember(
                 id = id,
                 displayName = "队友 ${index + 1}",
-                virtualIp = "—",
+                // 服务端在 peer_joined 里带了虚拟 IP；老服务端不带，退回 "—"。
+                virtualIp = peerVirtualIps[id]?.takeIf { it.isNotEmpty() } ?: "—",
                 isHost = false,
                 isSelf = false,
                 latencyMillis = null,
@@ -477,6 +673,9 @@ class JniEngineClient(
     private fun resetRoom() {
         roomCode = null
         knownPeers.clear()
+        peerVirtualIps.clear()
+        // 令牌跟随房间：房间没了，手上这张邀请也就作废了。
+        _inviteToken.value = null
         selfVirtualIp = ""
         hostVirtualIp = ""
         latencyHistory.clear()

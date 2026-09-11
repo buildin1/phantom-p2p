@@ -55,6 +55,26 @@ impl std::fmt::Display for ConnectionState {
     }
 }
 
+/// 本端平台标识，随 `Auth` 上报。
+///
+/// 服务端据此决定给不给、给哪个平台的更新包 —— 版本策略全在服务端，
+/// 调整策略不需要发客户端。
+///
+/// 编译期常量，不是运行时探测：一个包只会在一个平台上跑。
+pub const fn client_platform() -> &'static str {
+    if cfg!(target_os = "android") {
+        "android"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        "unknown"
+    }
+}
+
 // ============================================================
 // 信令客户端
 // ============================================================
@@ -297,6 +317,7 @@ impl SignalClient {
                                                                 signature: sig,
                                                                 protocol_version: PROTOCOL_VERSION,
                                                                 client_version: env!("CARGO_PKG_VERSION").to_string(),
+                                                                client_platform: client_platform().to_string(),
                                                             };
                                                             match phantom_protocol::serialize(&auth_msg) {
                                                                 Ok(bytes) => {

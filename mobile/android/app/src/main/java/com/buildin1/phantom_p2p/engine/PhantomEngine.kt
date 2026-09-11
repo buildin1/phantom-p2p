@@ -129,6 +129,12 @@ object PhantomEngine {
     external fun nativeConnectSignal(url: String)
     external fun nativeCreateRoom()
     external fun nativeJoinRoom(roomCode: String)
+
+    /** 索要邀请令牌；`refresh` 为 true 时先作废旧的。结果走 `signal:invite_token`。 */
+    external fun nativeRequestInviteToken(refresh: Boolean)
+
+    /** 用邀请令牌加入房间（扫码 / 深链进来的路径）。 */
+    external fun nativeJoinByToken(token: String)
     external fun nativeLeaveRoom()
     external fun nativeDisconnect()
     external fun nativeProbeNetwork()

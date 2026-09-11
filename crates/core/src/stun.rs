@@ -618,6 +618,16 @@ pub async fn query_dual_async() -> DualStunResult {
             }
         };
 
+        // 这两个 socket 也必须过保护钩子。
+        //
+        // Android 上隧道一旦建立就接管本进程全部出站流量，未保护的 socket
+        // 发出的 STUN 请求会被自己的隧道吞掉，诊断永远返回 Unknown。
+        // 同文件的 detect_filtering_behavior_async 一直有这一步，这里漏了。
+        //
+        // 桌面端没有注册钩子，protect 是空操作、恒返回 true，行为不变。
+        crate::socket_guard::protect(&sock_a);
+        crate::socket_guard::protect(&sock_b);
+
         let local_port_a = sock_a.local_addr().map(|a| a.port()).unwrap_or(0);
         let local_port_b = sock_b.local_addr().map(|a| a.port()).unwrap_or(0);
 

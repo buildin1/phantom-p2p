@@ -59,6 +59,7 @@ fun ConnectScreen(
     onJoin: () -> Unit,
     onCreateRoom: () -> Unit,
     onPickRecent: (String) -> Unit,
+    onScan: () -> Unit,
     onCancel: () -> Unit,
     onDisconnect: () -> Unit,
     onRetry: () -> Unit,
@@ -96,6 +97,7 @@ fun ConnectScreen(
                 onJoin = onJoin,
                 onCreateRoom = onCreateRoom,
                 onPickRecent = onPickRecent,
+                onScan = onScan,
             )
 
             is ConnectionState.Connecting -> ConnectingBody(
@@ -130,6 +132,7 @@ private fun IdleBody(
     onJoin: () -> Unit,
     onCreateRoom: () -> Unit,
     onPickRecent: (String) -> Unit,
+    onScan: () -> Unit,
 ) {
     PhantomCard {
         CardLabel("房间码")
@@ -139,6 +142,11 @@ private fun IdleBody(
             enabled = draftCode.length == 6,
             onClick = onJoin,
         )
+        // 扫码放在房间码下面而不是单独一张卡：它是"不用敲房间码"的同一件事的
+        // 另一条路径，分开会让人以为是另一种加入方式。
+        TextButton(onClick = onScan, modifier = Modifier.fillMaxWidth()) {
+            Text("扫描二维码加入", color = PhantomTheme.colors.ember)
+        }
     }
 
     if (recentRooms.isNotEmpty()) {
@@ -308,7 +316,7 @@ private fun ConnectIdlePreview() = PhantomPreview {
         members = emptyList(),
         draftCode = "7K2M",
         recentRooms = previewRecent,
-        onDraftChange = {}, onJoin = {}, onCreateRoom = {}, onPickRecent = {},
+        onDraftChange = {}, onJoin = {}, onCreateRoom = {}, onPickRecent = {}, onScan = {},
         onCancel = {}, onDisconnect = {}, onRetry = {},
     )
 }
@@ -322,7 +330,7 @@ private fun ConnectBusyPreview() = PhantomPreview {
         members = emptyList(),
         draftCode = "7K2M9Q",
         recentRooms = previewRecent,
-        onDraftChange = {}, onJoin = {}, onCreateRoom = {}, onPickRecent = {},
+        onDraftChange = {}, onJoin = {}, onCreateRoom = {}, onPickRecent = {}, onScan = {},
         onCancel = {}, onDisconnect = {}, onRetry = {},
     )
 }
@@ -339,7 +347,7 @@ private fun ConnectLivePreview() = PhantomPreview(dark = true) {
             RoomMember("qi", "阿祈", "10.66.0.3", false, false, 28, Transport.Quic),
         ),
         draftCode = "", recentRooms = emptyList(),
-        onDraftChange = {}, onJoin = {}, onCreateRoom = {}, onPickRecent = {},
+        onDraftChange = {}, onJoin = {}, onCreateRoom = {}, onPickRecent = {}, onScan = {},
         onCancel = {}, onDisconnect = {}, onRetry = {},
     )
 }

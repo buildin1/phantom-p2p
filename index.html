@@ -858,6 +858,44 @@
       border-color: rgba(242, 169, 74, 0.45);
     }
 
+    /* 版本更新弹层 */
+    .update-notes {
+      white-space: pre-wrap;
+      opacity: 0.72;
+      font-size: 13px;
+    }
+
+    .update-progress {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 12px;
+      font-size: 12px;
+      opacity: 0.8;
+    }
+
+    .update-bar {
+      flex: 1;
+      height: 6px;
+      border-radius: 3px;
+      background: rgba(255, 255, 255, 0.12);
+      overflow: hidden;
+    }
+
+    .update-bar-fill {
+      height: 100%;
+      width: 0;
+      border-radius: 3px;
+      background: var(--accent, #d2601a);
+      /* 进度是跳变下发的，补间一下才读得出"在推进"而不是"卡了又跳" */
+      transition: width 200ms ease-out;
+    }
+
+    .update-error {
+      color: #f2734a;
+      font-size: 13px;
+    }
+
     .confirm-dialog .risk-ack {
       display: flex;
       align-items: flex-start;
@@ -2120,6 +2158,28 @@
       <div class="actions">
         <button class="btn sub" id="confirmCancelBtn">取消</button>
         <button class="btn danger" id="confirmAcceptBtn">确认</button>
+      </div>
+    </section>
+  </div>
+  <!--
+    版本更新弹层。内容由 main.js 的 showAppUpdate() 填充。
+    强制更新时「以后再说」会被隐藏，见那里的说明。
+  -->
+  <div class="modal-layer" id="appUpdateModal" hidden>
+    <section class="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="appUpdateTitle" aria-describedby="appUpdateMessage">
+      <div>
+        <h3 id="appUpdateTitle">有新版本可用</h3>
+        <p id="appUpdateMessage"></p>
+        <p id="appUpdateNotes" class="update-notes"></p>
+        <div class="update-progress" id="appUpdateProgressRow" hidden>
+          <div class="update-bar"><div class="update-bar-fill" id="appUpdateBarFill"></div></div>
+          <span id="appUpdateProgressText">正在下载…</span>
+        </div>
+        <p id="appUpdateError" class="update-error" hidden></p>
+      </div>
+      <div class="actions">
+        <button class="btn sub" id="appUpdateLaterBtn">以后再说</button>
+        <button class="btn" id="appUpdateNowBtn">立即更新</button>
       </div>
     </section>
   </div>

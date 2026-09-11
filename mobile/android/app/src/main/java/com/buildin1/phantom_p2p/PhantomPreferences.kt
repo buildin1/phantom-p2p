@@ -1,5 +1,7 @@
 package com.buildin1.phantom_p2p
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.net.VpnService
 import android.os.Build
@@ -19,6 +21,24 @@ import java.util.concurrent.TimeUnit
 class PhantomPreferences(private val context: Context) {
 
     private val sp = context.getSharedPreferences("phantom", Context.MODE_PRIVATE)
+
+    /**
+     * 写入系统剪贴板。
+     *
+     * 放在这里而不是界面层：复制房间码/邀请链接是 ViewModel 的动作，
+     * 而 ViewModel 不该直接持有 Context —— 它已经通过本类拿到了。
+     *
+     * Android 13+ 系统自己会弹一个复制成功的浮层，应用再弹一次 Snackbar
+     * 就是重复反馈，所以调用方要据此决定要不要提示。
+     */
+    fun copyToClipboard(label: String, text: String) {
+        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+        clipboard?.setPrimaryClip(ClipData.newPlainText(label, text))
+    }
+
+    /** 系统是否会自己给出复制成功的视觉反馈（Android 13 起会）。 */
+    val systemShowsCopyFeedback: Boolean
+        get() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
 
     val rememberRoomCode: Boolean get() = sp.getBoolean(KEY_REMEMBER_ROOM, true)
     val autoConnect: Boolean get() = sp.getBoolean(KEY_AUTO_CONNECT, false)

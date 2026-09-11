@@ -74,6 +74,87 @@ async fn report_problem(
         .await
 }
 
+/// 下载并校验安装包，然后唤起系统安装器。
+///
+/// # 为什么不用 `tauri-plugin-updater`
+///
+/// 官方插件更完整（差分更新、签名校验），但它要求另建一套更新签名密钥、
+/// 配 CI secrets、再架一个 `latest.json` 端点。这里的版本通告已经由信令
+/// 服务端下发（见 `ServerMessage::AppUpdate`），策略也已经在服务端配置里，
+/// 再引入一套并行的发布基建只会多一个要同步的地方。
+///
+/// # 校验是硬性的
+///
+/// sha256 不匹配时 `download_and_verify` 会删掉半成品并返回错误，
+/// **绝不会走到唤起安装那一步**。没有校验的自动安装等于把用户机器
+/// 交给任何能劫持下载的人。
+///
+/// # 正在运行的 exe 不能被覆盖
+///
+/// 所以这里唤起的是 **NSIS/MSI 安装器**，由它去替换文件并重启应用，
+/// 而不是自己动手复制。这也是 Windows 上唯一可靠的做法。
+#[tauri::command]
+async fn download_app_update(
+    app: AppHandle,
+    download_url: String,
+    sha256: String,
+    version: String,
+) -> Result<String, String> {
+    let dir = std::env::temp_dir().join("phantom-update");
+    // 文件名带上版本号：同时留着两个版本的包时不会互相覆盖，
+    // 排障时也一眼看得出装的是哪个。
+    let name = if cfg!(windows) {
+        format!("phantom-p2p-{}-setup.exe", version)
+    } else {
+        format!("phantom-p2p-{}", version)
+    };
+    let dest = dir.join(name);
+
+    let app_for_progress = app.clone();
+    let path = tokio::task::spawn_blocking(move || {
+        let mut last_percent = u64::MAX;
+        let mut progress = |written: u64, total: u64| {
+            // 只在整数百分比变化时才发事件。不做这个节流的话，64KiB 一个
+            // 回调会在几秒内打出上千条事件，前端光是处理它们就会掉帧。
+            let percent = if total > 0 { written * 100 / total } else { 0 };
+            if percent != last_percent {
+                last_percent = percent;
+                let _ = app_for_progress.emit(
+                    "update:progress",
+                    serde_json::json!({
+                        "percent": percent,
+                        "bytes": written,
+                        "total": total,
+                    }),
+                );
+            }
+        };
+        phantom_core::app_update::download_and_verify(&download_url, &dest, &sha256, &mut progress)
+    })
+    .await
+    .map_err(|e| format!("下载任务失败: {}", e))??;
+
+    let path_string = path.to_string_lossy().to_string();
+    tracing::info!("[更新] 安装包就绪: {}", path_string);
+
+    // 只在 Windows 上自动唤起：那里产出的是 NSIS 安装器，双击即可完成替换。
+    //
+    // macOS 的 .dmg 与 Linux 的 .AppImage/.deb 没有统一的"静默安装"入口，
+    // 各发行版差异也大。与其猜一个多半会失败的命令，不如把路径给出来让
+    // 用户自己装 —— 装不上却假装装了是更糟的结果。
+    #[cfg(windows)]
+    {
+        match std::process::Command::new(&path).spawn() {
+            Ok(_) => tracing::info!("[更新] 已唤起安装器"),
+            Err(e) => {
+                return Err(format!("唤起安装器失败: {}，包在 {}", e, path_string));
+            }
+        }
+    }
+
+    Ok(path_string)
+}
+
 /// 打洞会话的键：Guest 端只有一个对端（Host），Host 端按 Guest 区分
 fn punch_session_key(is_host: bool, peer_session_id: &str) -> String {
     if is_host {
@@ -479,6 +560,9 @@ async fn connect_signal(
                     ServerMessage::PunchPlan { .. } => "signal:punch_plan",
                     ServerMessage::PunchStart { .. } => "signal:punch_start",
                     ServerMessage::RequestLogUpload { .. } => "signal:request_log_upload",
+                    ServerMessage::InviteToken { .. } => "signal:invite_token",
+                    ServerMessage::InviteTokenInvalid { .. } => "signal:invite_token_invalid",
+                    ServerMessage::AppUpdate { .. } => "signal:app_update",
                 };
 
                 if let Ok(json_value) = serde_json::to_value(&server_msg) {
@@ -1860,6 +1944,7 @@ pub fn run(dev_mode: bool) {
             get_tunnel_stats,
             reset_tunnel_stats,
             report_problem,
+            download_app_update,
             config::load_config,
             config::save_config,
             config::get_config_path,

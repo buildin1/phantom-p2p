@@ -23,6 +23,10 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.SolidColor
@@ -30,11 +34,13 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.buildin1.phantom_p2p.engine.ConnectionState
+import com.buildin1.phantom_p2p.engine.InviteToken
 import com.buildin1.phantom_p2p.engine.PunchPhase
 import com.buildin1.phantom_p2p.engine.RoomMember
 import com.buildin1.phantom_p2p.engine.Transport
 import com.buildin1.phantom_p2p.engine.roomCode
 import com.buildin1.phantom_p2p.ui.components.CardLabel
+import com.buildin1.phantom_p2p.ui.components.InviteCard
 import com.buildin1.phantom_p2p.ui.components.MemberRow
 import com.buildin1.phantom_p2p.ui.components.PhantomCard
 import com.buildin1.phantom_p2p.ui.components.PreparingBanner
@@ -64,8 +70,11 @@ fun RoomScreen(
     mtu: Int,
     members: List<RoomMember>,
     isHost: Boolean,
+    inviteToken: InviteToken?,
     onCopyCode: () -> Unit,
     onShowQr: () -> Unit,
+    onCopyInvite: () -> Unit,
+    onRefreshInvite: () -> Unit,
     onLeave: () -> Unit,
     modifier: Modifier = Modifier,
     contentPadding: PaddingValues = PaddingValues(0.dp),
@@ -78,6 +87,9 @@ fun RoomScreen(
 
     val preparing = state is ConnectionState.Connecting
     val failed = state is ConnectionState.Failed
+
+    // 二维码展开与否是纯展示状态，没必要上抬到 ViewModel。
+    var showInvite by rememberSaveable { mutableStateOf(false) }
 
     Column(
         modifier = modifier
@@ -115,8 +127,33 @@ fun RoomScreen(
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 TonalAction("复制", Modifier.weight(1f), onCopyCode)
-                TonalAction("二维码", Modifier.weight(1f), onShowQr)
+                // 只有房主能拿邀请令牌（服务端限制：guest 拿到就能无限拉人进
+                // 别人的房间），所以 guest 这里不给二维码入口。
+                if (isHost) {
+                    TonalAction(
+                        text = if (showInvite) "收起二维码" else "二维码",
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        showInvite = !showInvite
+                        // 展开时才去要令牌。房主建房时已经预先要过一次，
+                        // 这里是兜底：那次要是掉了（比如信令刚好在重连），
+                        // 用户点开还能补上，而不是对着"正在生成"一直等。
+                        if (showInvite && inviteToken == null) onShowQr()
+                    }
+                }
             }
+        }
+
+        AnimatedVisibility(
+            visible = isHost && showInvite,
+            enter = fadeIn(tween(200)) + expandVertically(tween(240)),
+            exit = fadeOut(tween(140)) + shrinkVertically(tween(200)),
+        ) {
+            InviteCard(
+                token = inviteToken,
+                onRefresh = onRefreshInvite,
+                onCopy = onCopyInvite,
+            )
         }
 
         if (failed) {
@@ -238,7 +275,8 @@ private fun RoomPreparingPreview() = PhantomPreview {
         mtu = 1160,
         members = emptyList(),
         isHost = true,
-        onCopyCode = {}, onShowQr = {}, onLeave = {},
+        inviteToken = InviteToken("7QFK3M2XJ9WD4NBV6RTZ", "7K2M9Q"),
+        onCopyCode = {}, onShowQr = {}, onCopyInvite = {}, onRefreshInvite = {}, onLeave = {},
     )
 }
 
@@ -251,7 +289,8 @@ private fun RoomLivePreview() = PhantomPreview {
         mtu = 1160,
         members = previewMembers,
         isHost = false,
-        onCopyCode = {}, onShowQr = {}, onLeave = {},
+        inviteToken = InviteToken("7QFK3M2XJ9WD4NBV6RTZ", "7K2M9Q"),
+        onCopyCode = {}, onShowQr = {}, onCopyInvite = {}, onRefreshInvite = {}, onLeave = {},
     )
 }
 
@@ -261,6 +300,7 @@ private fun RoomEmptyPreview() = PhantomPreview(dark = true) {
     RoomScreen(
         state = ConnectionState.Idle,
         subnet = "", mtu = 1160, members = emptyList(), isHost = false,
-        onCopyCode = {}, onShowQr = {}, onLeave = {},
+        inviteToken = InviteToken("7QFK3M2XJ9WD4NBV6RTZ", "7K2M9Q"),
+        onCopyCode = {}, onShowQr = {}, onCopyInvite = {}, onRefreshInvite = {}, onLeave = {},
     )
 }

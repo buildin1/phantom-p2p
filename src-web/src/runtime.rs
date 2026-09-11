@@ -1159,6 +1159,9 @@ fn server_event_name(message: &ServerMessage) -> &'static str {
         ServerMessage::PunchPlan { .. } => "signal:punch_plan",
         ServerMessage::PunchStart { .. } => "signal:punch_start",
         ServerMessage::RequestLogUpload { .. } => "signal:request_log_upload",
+        ServerMessage::InviteToken { .. } => "signal:invite_token",
+        ServerMessage::InviteTokenInvalid { .. } => "signal:invite_token_invalid",
+        ServerMessage::AppUpdate { .. } => "signal:app_update",
     }
 }
 

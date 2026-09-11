@@ -5,8 +5,10 @@ import androidx.lifecycle.viewModelScope
 import com.buildin1.phantom_p2p.engine.ConnectionState
 import com.buildin1.phantom_p2p.engine.EngineClient
 import com.buildin1.phantom_p2p.engine.RecentRoom
+import com.buildin1.phantom_p2p.engine.roomCode
 import com.buildin1.phantom_p2p.ui.Tab
 import com.buildin1.phantom_p2p.ui.screens.SettingsUiState
+import com.buildin1.phantom_p2p.update.AppUpdater
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -22,12 +24,44 @@ import kotlinx.coroutines.launch
 class PhantomViewModel(
     val engine: EngineClient,
     private val prefs: PhantomPreferences,
+    private val updater: AppUpdater,
 ) : ViewModel() {
 
     val connectionState: StateFlow<ConnectionState> = engine.state
     val members = engine.members
     val linkStats = engine.linkStats
     val networkProfile = engine.networkProfile
+    val inviteToken = engine.inviteToken
+    val diagnostics = engine.diagnostics
+    val diagnosticsProgress = engine.diagnosticsProgress
+    val diagnosticsError = engine.diagnosticsError
+
+    /** 待处理的版本通告。为 null 时界面不显示任何更新相关内容。 */
+    val pendingUpdate = updater.pending
+
+    /** 下载 / 校验 / 安装的进行状态。 */
+    val updateState = updater.state
+
+    init {
+        // 云端下发的通告转交给更新器。经过这一跳而不是界面直接读引擎，
+        // 是因为"忽略了哪一条"属于更新器的状态，不该散在界面里。
+        viewModelScope.launch {
+            engine.appUpdate.collect { info -> if (info != null) updater.offer(info) }
+        }
+    }
+
+    /** 系统是否已允许本应用安装 APK。false 时要先去系统设置页授权。 */
+    fun canInstallUpdate(): Boolean = updater.canInstallPackages()
+
+    /** 「允许安装未知应用」的系统设置页 Intent；Android 8 以下为 null。 */
+    fun unknownSourcesIntent() = updater.unknownSourcesSettingsIntent()
+
+    fun startUpdate() {
+        val info = updater.pending.value ?: return
+        viewModelScope.launch { updater.download(info) }
+    }
+
+    fun dismissUpdate() = updater.dismiss()
 
     private val _tab = MutableStateFlow(Tab.Connect)
     val tab: StateFlow<Tab> = _tab.asStateFlow()
@@ -85,7 +119,48 @@ class PhantomViewModel(
         }
     }
 
-    fun copyRoomCode() { _toast.value = "已复制房间码" }
+    /**
+     * 复制房间码。
+     *
+     * 之前这里只弹了一句「已复制房间码」，**并没有真的往剪贴板写** ——
+     * 用户去粘贴才发现是空的。提示必须跟在真实动作后面。
+     */
+    fun copyRoomCode() {
+        val code = connectionState.value.roomCode ?: return
+        prefs.copyToClipboard("Phantom 房间码", code)
+        // Android 13 起系统自带复制浮层，再弹一次就是重复。
+        if (!prefs.systemShowsCopyFeedback) _toast.value = "已复制房间码"
+    }
+
+    /** 复制邀请链接（二维码里的那串）。 */
+    fun copyInviteLink() {
+        val token = engine.inviteToken.value ?: return
+        prefs.copyToClipboard("Phantom 邀请链接", token.uri)
+        if (!prefs.systemShowsCopyFeedback) _toast.value = "已复制邀请链接"
+    }
+
+    /** 索要邀请令牌；房主点开二维码时调用。 */
+    fun requestInvite() = viewModelScope.launch { engine.requestInviteToken(refresh = false) }
+
+    /** 作废当前邀请并重新签发 —— 二维码发错群了的补救。 */
+    fun refreshInvite() = viewModelScope.launch {
+        engine.requestInviteToken(refresh = true)
+        _toast.value = "旧邀请已失效，正在生成新的"
+    }
+
+    /**
+     * 扫码或深链接拿到令牌后加入房间。
+     *
+     * 与 [join] 是同一件事的两条入口：令牌只是房间码的另一种载体，
+     * 解析在服务端完成，客户端不做任何解码。
+     */
+    fun joinByToken(token: String) {
+        viewModelScope.launch {
+            engine.joinByToken(token).onFailure {
+                _toast.value = "邀请无效或已失效"
+            }
+        }
+    }
     fun consumeToast() { _toast.value = null }
 
     fun setRememberRoomCode(value: Boolean) = updateSettings { prefs.setRememberRoomCode(value) }

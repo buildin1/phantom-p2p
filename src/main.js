@@ -1454,6 +1454,14 @@ async function leaveGuestRoom() {
 function bindActions() {
   $("confirmCancelBtn")?.addEventListener("click", () => closeConfirmDialog(false));
   $("confirmAcceptBtn")?.addEventListener("click", () => closeConfirmDialog(true));
+
+  $("appUpdateNowBtn")?.addEventListener("click", startAppUpdate);
+  $("appUpdateLaterBtn")?.addEventListener("click", () => {
+    // 强制更新不可忽略。按钮本来就被隐藏了，这里是第二道闸。
+    if (pendingUpdate?.mandatory || updateBusy) return;
+    pendingUpdate = null;
+    closeAppUpdateModal();
+  });
   $("confirmModal")?.addEventListener("click", (event) => {
     if (event.target === event.currentTarget) closeConfirmDialog(false);
   });
@@ -1607,7 +1615,132 @@ function bindActions() {
   });
 }
 
+// ---------------------------------------------------------------------------
+// 版本更新
+//
+// 通告由信令服务端在鉴权后按平台与版本下发（ServerMessage::AppUpdate），
+// 版本策略全在服务端配置里 —— 调整策略不需要发客户端。
+// ---------------------------------------------------------------------------
+
+let pendingUpdate = null;
+let updateBusy = false;
+
+function closeAppUpdateModal() {
+  const modal = $("appUpdateModal");
+  if (!modal || modal.hidden) return;
+  modal.classList.remove("open");
+  setTimeout(() => {
+    modal.hidden = true;
+  }, 160);
+}
+
+function showAppUpdate(info) {
+  const modal = $("appUpdateModal");
+  if (!modal) return;
+  pendingUpdate = info;
+
+  setText("appUpdateTitle", info.mandatory ? "当前版本已失效" : "有新版本可用");
+  setText(
+    "appUpdateMessage",
+    info.mandatory
+      ? "请及时更新，旧版本已无法继续使用。"
+      : `最新版本 ${info.latest_version}`
+  );
+
+  const notes = $("appUpdateNotes");
+  if (notes) {
+    notes.textContent = info.notes || "";
+    notes.hidden = !info.notes;
+  }
+
+  // 强制更新不给「以后再说」。除此之外强制与非强制完全一样 ——
+  // 不用不同的措辞去吓唬人。
+  const later = $("appUpdateLaterBtn");
+  if (later) later.hidden = Boolean(info.mandatory);
+
+  const errorEl = $("appUpdateError");
+  if (errorEl) errorEl.hidden = true;
+  const progressRow = $("appUpdateProgressRow");
+  if (progressRow) progressRow.hidden = true;
+
+  modal.hidden = false;
+  requestAnimationFrame(() => modal.classList.add("open"));
+}
+
+async function startAppUpdate() {
+  if (!pendingUpdate || updateBusy) return;
+  updateBusy = true;
+
+  const button = $("appUpdateNowBtn");
+  const later = $("appUpdateLaterBtn");
+  const errorEl = $("appUpdateError");
+  const progressRow = $("appUpdateProgressRow");
+
+  if (button) {
+    button.disabled = true;
+    button.textContent = "下载中…";
+  }
+  // 下载期间不让关：关掉之后用户就再也看不到进度，也不知道什么时候能装。
+  if (later) later.hidden = true;
+  if (errorEl) errorEl.hidden = true;
+  if (progressRow) progressRow.hidden = false;
+
+  try {
+    await invoke("download_app_update", {
+      downloadUrl: pendingUpdate.download_url,
+      sha256: pendingUpdate.sha256,
+      version: pendingUpdate.latest_version,
+    });
+    setText("appUpdateProgressText", "已唤起安装程序");
+    addLog("安装包校验通过，已唤起安装程序", "INFO", "system");
+  } catch (error) {
+    // 校验失败不是"重试一下就好"：要么包被改过，要么发布信息配错了。
+    // 两种情况都不能装，所以这里只报错，不自动重试。
+    const message = String(error);
+    if (errorEl) {
+      errorEl.textContent = message;
+      errorEl.hidden = false;
+    }
+    if (progressRow) progressRow.hidden = true;
+    if (later) later.hidden = Boolean(pendingUpdate.mandatory);
+    addLog(`更新失败: ${message}`, "ERROR", "system");
+  } finally {
+    updateBusy = false;
+    if (button) {
+      button.disabled = false;
+      button.textContent = "重试";
+    }
+  }
+}
+
 async function setupEventListeners() {
+  await listen("signal:app_update", (event) => {
+    const payload = event.payload || {};
+    // 没有合法 sha256 就当这条通告不存在。没有校验的自动安装等于把机器
+    // 交给任何能劫持下载的人 —— 宁可不提示更新。
+    const sha = String(payload.sha256 || "");
+    if (!payload.download_url || !/^[0-9a-fA-F]{64}$/.test(sha)) {
+      addLog("收到的版本通告缺少合法校验值，已忽略", "WARN", "system");
+      return;
+    }
+    showAppUpdate(payload);
+  });
+
+  await listen("update:progress", (event) => {
+    const payload = event.payload || {};
+    const percent = Number(payload.percent || 0);
+    const fill = $("appUpdateBarFill");
+    if (fill) fill.style.width = `${Math.max(0, Math.min(100, percent))}%`;
+    const total = Number(payload.total || 0);
+    const bytes = Number(payload.bytes || 0);
+    const mb = (value) => `${(value / 1024 / 1024).toFixed(1)} MB`;
+    setText(
+      "appUpdateProgressText",
+      // 服务器没给 Content-Length 时只报已下载量，不要编一个假的百分比。
+      total > 0 ? `${percent}% · ${mb(bytes)} / ${mb(total)}` : mb(bytes)
+    );
+  });
+
   await listen("diag:progress", (event) => {
     const payload = event.payload || {};
     setDiagProgress(

@@ -86,6 +86,18 @@ pub struct SessionRuntime {
     config: RwLock<ClientConfig>,
     /// 隧道是否已经在跑。用于判断 VpnService 该不该继续持有前台通知。
     tunnel_live: AtomicBool,
+    /// 已生效的信令生命周期指令序号。
+    ///
+    /// JNI 的 `nativeConnectSignal` / `nativeDisconnect` 都是 `TOKIO.spawn`
+    /// 的**无序**投递：Kotlin 先断后连，到了 tokio 上完全可能反过来执行。
+    /// 一旦反过来，`disconnect` 会把刚建好的连接循环 abort 掉、并把内部的
+    /// `running` 置回 false —— 信令从此再也连不上，而 Kotlin 那边
+    /// `signalStarted` 已经锁成 true 不会重连，用户只能杀进程。
+    /// 这就是「加入房间后再建房卡在连接服务器」的成因。
+    ///
+    /// 序号在 JNI 函数里**同步**领取，因此严格反映用户的操作顺序；
+    /// 执行时序号小的直接丢弃，后发的指令永远赢。
+    lifecycle_seq: Mutex<u64>,
 }
 
 impl SessionRuntime {
@@ -109,6 +121,7 @@ impl SessionRuntime {
             state: Mutex::new(RuntimeState::default()),
             config: RwLock::new(config),
             tunnel_live: AtomicBool::new(false),
+            lifecycle_seq: Mutex::new(0),
         }))
     }
 
@@ -116,8 +129,35 @@ impl SessionRuntime {
     // 生命周期
     // -----------------------------------------------------------------------
 
-    pub async fn connect_signal(self: &Arc<Self>, signal_url: String) {
+    /// 领取一个信令生命周期指令的序号。
+    ///
+    /// **必须在 JNI 函数里同步调用**，而不是在 spawn 出去的 future 里 ——
+    /// 序号的意义就是「用户的操作顺序」，进了异步任务就失去这个意义了。
+    pub fn next_lifecycle_seq() -> u64 {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        SEQ.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// 判断这条生命周期指令是否还该执行，并占住锁直到调用方处理完。
+    ///
+    /// 返回 `None` 表示已经有更晚发出的指令生效了，这条是陈旧的，直接丢弃。
+    async fn claim_lifecycle(&self, seq: u64) -> Option<tokio::sync::MutexGuard<'_, u64>> {
+        let mut last = self.lifecycle_seq.lock().await;
+        if seq < *last {
+            tracing::info!("[信令] 丢弃过期指令 #{}，当前 #{}", seq, *last);
+            return None;
+        }
+        *last = seq;
+        Some(last)
+    }
+
+    pub async fn connect_signal(self: &Arc<Self>, signal_url: String, seq: u64) {
+        let Some(_lifecycle) = self.claim_lifecycle(seq).await else {
+            return;
+        };
         self.signal.connect(signal_url).await;
+        // 事件泵只起一次：`event_tx` 在 SignalClient 构造时就建好、此后
+        // 每次重连都复用同一个发送端，所以这个接收循环跨重连一直有效。
         if let Some(mut receiver) = self.signal.take_event_rx().await {
             let runtime = self.clone();
             tokio::spawn(async move {
@@ -146,6 +186,29 @@ impl SessionRuntime {
             .await
     }
 
+    /// 索要当前房间的邀请令牌。结果由 `signal:invite_token` 事件回来。
+    ///
+    /// `refresh` 为 true 时先作废旧令牌再签发（房主主动刷新邀请码）。
+    pub async fn request_invite_token(&self, refresh: bool) -> Result<(), String> {
+        let message = if refresh {
+            ClientMessage::RevokeInviteToken
+        } else {
+            ClientMessage::RequestInviteToken
+        };
+        self.signal.send(message).await
+    }
+
+    /// 用邀请令牌加入房间。
+    ///
+    /// 令牌只是房间码的另一种载体，服务端解析出房间码后走的是同一条加入流程，
+    /// 所以这里的本地准备工作与 [`Self::join_room`] 必须完全一致。
+    pub async fn join_by_token(&self, token: String) -> Result<(), String> {
+        phantom_core::logging::begin_session("token");
+        self.reset_room().await;
+        self.stats.set_host_mode(false);
+        self.signal.send(ClientMessage::JoinByToken { token }).await
+    }
+
     pub async fn leave_room(&self) -> Result<(), String> {
         let is_host = self.state.lock().await.is_host;
         let message = if is_host {
@@ -158,7 +221,10 @@ impl SessionRuntime {
         result
     }
 
-    pub async fn disconnect(&self) {
+    pub async fn disconnect(&self, seq: u64) {
+        let Some(_lifecycle) = self.claim_lifecycle(seq).await else {
+            return;
+        };
         self.reset_room().await;
         self.signal.disconnect().await;
     }
@@ -189,10 +255,16 @@ impl SessionRuntime {
     }
 
     async fn emit_status(&self) {
+        let state = self.signal.get_state().await;
         self.emit(
             "signal:status",
             json!({
-                "state": self.signal.get_state().await.to_string(),
+                // state 是给人看的（core 的 Display 输出中文），
+                // state_key 才是给代码判断用的。
+                // 界面曾经拿 state 去比 "disconnected"，永远不相等，
+                // 断线检测整个是死的 —— 判断一律走 state_key。
+                "state": state.to_string(),
+                "state_key": connection_state_key(&state),
                 "session_id": self.signal.get_session_id().await,
                 "room_code": self.signal.get_room_code().await,
             }),
@@ -598,26 +670,131 @@ impl SessionRuntime {
         );
     }
 
-    /// 独立跑一次网络环境探测，供诊断页的「重新检测」用。
+    /// 把诊断失败回传界面。见 `nativeProbeNetwork` 的说明。
+    pub fn emit_probe_failure(&self, reason: &str) {
+        self.emit("net:failed", json!({ "reason": reason }));
+    }
+
+    /// 独立跑一次完整的网络诊断，供诊断页的「重新检测」用。
     ///
-    /// 需要信令已连接：STUN 地址由服务端下发，客户端不内置任何地址——
-    /// 拿空列表探测只会得到 class=Unknown，等于什么都没测。
+    /// # 与打洞前那次探测的区别
+    ///
+    /// 打洞前跑的是 `punch::Session::probe`：只要拿到够用的 NAT 画像就收手，
+    /// 越快越好。这里要的是**给人看的完整报告** —— 与 PC 端 `get_network_info`
+    /// 同一套数据模型（三轮多 STUN 采样 + 过滤行为探测 + UPnP + IPv6 + 本机网卡），
+    /// 用的也是 core 里的同几个函数，所以两端结论一致、PC 代码一行不用动。
+    ///
+    /// # 进度事件
+    ///
+    /// 每一步都发 `net:progress`。之前这里从头到尾没有任何回传，用户点了
+    /// 「重新检测」界面毫无反应 —— 以为按钮坏了，其实是在跑，只是没人告诉他。
+    /// 失败也要发：**错误必须回到界面**，只在 Rust 侧 warn 一行等于没报。
     pub async fn probe_network(&self) -> Result<(), String> {
-        let stun = self.stun_servers().await;
-        if stun.is_empty() {
-            return Err("尚未取到 STUN 配置，先连上服务器再检测".into());
+        const DIAG_ROUNDS: usize = 3;
+
+        let emit_progress = |progress: u8, stage: &str, eta_seconds: u8| {
+            self.emit(
+                "net:progress",
+                json!({
+                    "progress": progress,
+                    "stage": stage,
+                    "eta_seconds": eta_seconds,
+                }),
+            );
+        };
+
+        emit_progress(4, "初始化诊断环境", 15);
+
+        let mut rounds = Vec::with_capacity(DIAG_ROUNDS);
+        for idx in 0..DIAG_ROUNDS {
+            emit_progress(
+                10 + (idx as u8 * 20),
+                &format!("多 STUN 映射采样 第 {}/{} 轮", idx + 1, DIAG_ROUNDS),
+                ((DIAG_ROUNDS - idx) * 4 + 3) as u8,
+            );
+            rounds.push(phantom_core::stun::query_dual_async().await);
         }
-        let identity = self.signal.identity();
-        let rtt = self.signal.signal_rtt_ms();
 
-        let profile = tokio::task::spawn_blocking(move || {
-            let mut session = punch::Session::new();
-            session.probe(&stun, rtt, &identity).map(|(p, _)| p)
-        })
-        .await
-        .map_err(|e| e.to_string())??;
+        emit_progress(72, "过滤行为探测（IP/端口限制）", 5);
+        let filtering = phantom_core::stun::detect_filtering_behavior_async().await;
 
-        self.emit_profile(&profile);
+        let analysis = phantom_core::nat::analyze_multi_round(
+            &rounds,
+            filtering.behavior.key(),
+            &format!("{} @ {}", filtering.detail, filtering.server),
+        );
+
+        let mut merged_a = Vec::new();
+        let mut merged_b = Vec::new();
+        let mut stun_details: Vec<Value> = Vec::new();
+        for (round_index, round) in rounds.iter().enumerate() {
+            merged_a.extend(round.mappings_a.clone());
+            merged_b.extend(round.mappings_b.clone());
+            // A / B 两个 socket 分开列出来：它们的映射端口是否一致，正是
+            // 「端点无关 vs 端点相关」的直接证据，合并了就看不出来了。
+            for (socket, samples) in [("A", &round.samples_a), ("B", &round.samples_b)] {
+                for sample in samples {
+                    stun_details.push(json!({
+                        "server": sample.server,
+                        "mapping": format!("{}:{}", sample.mapping.ip, sample.mapping.port),
+                        "rtt_ms": sample.rtt_ms,
+                        "socket": socket,
+                        "round": round_index + 1,
+                    }));
+                }
+            }
+        }
+
+        let primary = if merged_a.is_empty() {
+            &merged_b
+        } else {
+            &merged_a
+        };
+        let (external_ip, external_port) = primary
+            .first()
+            .map(|m| (m.ip.clone(), m.port))
+            .unwrap_or_else(|| ("0.0.0.0".to_string(), 0));
+        let local_port = rounds.first().map(|r| r.local_port_a).unwrap_or(0);
+
+        emit_progress(86, "UPnP / IPv6 / 本机网卡检测", 2);
+        let (upnp, local_net) = tokio::join!(
+            phantom_core::network::detect_upnp(),
+            tokio::task::spawn_blocking(phantom_core::network::detect_local_network),
+        );
+        let local_net = local_net.unwrap_or_else(|_| phantom_core::network::LocalNetworkInfo {
+            local_ip: "127.0.0.1".to_string(),
+            ipv6_available: false,
+            ipv6_addr: String::new(),
+        });
+
+        emit_progress(95, "汇总 NAT 诊断结果", 1);
+
+        self.emit(
+            "net:diagnostics",
+            json!({
+                "nat_type": analysis.nat_type.display_name(),
+                "nat_type_key": analysis.nat_type.type_key(),
+                "nat_difficulty": analysis.nat_type.difficulty(),
+                "mapping_behavior": analysis.mapping_behavior,
+                "filtering_behavior": analysis.filtering_behavior,
+                "confidence": analysis.confidence,
+                "port_pattern": analysis.port_pattern,
+                "external_ip": external_ip,
+                "external_port": external_port,
+                "upnp": upnp.available,
+                "upnp_port": upnp.external_port,
+                "ipv6": local_net.ipv6_available,
+                "ipv6_addr": local_net.ipv6_addr,
+                "local_ip": local_net.local_ip,
+                "local_port": local_port,
+                "stun_details": stun_details,
+                "diagnostics_rounds": DIAG_ROUNDS,
+                "network_priority": if local_net.ipv6_available { "ipv6" } else { "ipv4" },
+                "mtu": tun_bridge::TUN_MTU,
+            }),
+        );
+
+        emit_progress(100, "诊断完成", 0);
         Ok(())
     }
 
@@ -1103,6 +1280,21 @@ fn should_start_host_relay(active_token: Option<&str>, requested: &str, alive: b
     }
 }
 
+/// 信令状态的机器可读键。
+///
+/// core 的 `Display` 输出是中文展示文案（"未连接"/"已连接"…），PC 直接拿去显示。
+/// 移动端界面需要的是稳定的判断依据，不能拿展示文案做比较 —— 所以在这里翻一次，
+/// 而不是去动 core 的 `Display`（那会改到正在发版的桌面端）。
+fn connection_state_key(state: &signal::client::ConnectionState) -> &'static str {
+    use signal::client::ConnectionState;
+    match state {
+        ConnectionState::Disconnected => "disconnected",
+        ConnectionState::Connecting => "connecting",
+        ConnectionState::Connected => "connected",
+        ConnectionState::Reconnecting(_) => "reconnecting",
+    }
+}
+
 fn server_event_name(message: &ServerMessage) -> &'static str {
     match message {
         ServerMessage::Welcome { .. } => "signal:welcome",
@@ -1125,6 +1317,9 @@ fn server_event_name(message: &ServerMessage) -> &'static str {
         ServerMessage::PunchPlan { .. } => "signal:punch_plan",
         ServerMessage::PunchStart { .. } => "signal:punch_start",
         ServerMessage::RequestLogUpload { .. } => "signal:request_log_upload",
+        ServerMessage::InviteToken { .. } => "signal:invite_token",
+        ServerMessage::InviteTokenInvalid { .. } => "signal:invite_token_invalid",
+        ServerMessage::AppUpdate { .. } => "signal:app_update",
     }
 }
 

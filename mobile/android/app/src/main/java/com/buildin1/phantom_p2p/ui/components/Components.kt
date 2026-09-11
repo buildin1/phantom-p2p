@@ -27,6 +27,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -42,10 +43,12 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
@@ -244,14 +247,28 @@ fun RoomCodeInput(
     val focusRequester = remember { FocusRequester() }
     var focused by remember { mutableStateOf(false) }
 
+    // 必须用 TextFieldValue 重载，不能用 String 重载。
+    // String 重载由 Compose 内部维护光标：onValueChange 一旦做变换（这里的 filter + take），
+    // 回灌的字符串与用户的编辑动作对不上时，光标会被重置到位置 0。
+    // 光标在 0，退格前面没字符可删 —— 于是「房间码删不掉，必须重启应用」。
+    // 自己持有 TextFieldValue 并把 selection 钉在末尾，光标就永远是对的。
+    var field by remember { mutableStateOf(TextFieldValue(code, TextRange(code.length))) }
+    // 外部改了 code（清空、扫码回填）时同步进来；自己编辑引起的回流已经相等，不会重建，
+    // 所以不会打断输入。放在副作用里而不是组合体内，避免组合期写状态。
+    LaunchedEffect(code) {
+        if (field.text != code) field = TextFieldValue(code, TextRange(code.length))
+    }
+
     Box(modifier.fillMaxWidth()) {
         // 真正接键盘的输入框藏在后面。六个格子只是它的显示层 ——
         // 这样粘贴、逐位删改、系统的验证码自动填充全部落在同一个控件上。
         BasicTextField(
-            value = code,
+            value = field,
             onValueChange = { raw ->
                 // 房间码只有大写字母与数字，长度封顶 6。
-                onCodeChange(raw.uppercase().filter(Char::isLetterOrDigit).take(6))
+                val sanitized = raw.text.uppercase().filter(Char::isLetterOrDigit).take(6)
+                field = TextFieldValue(sanitized, TextRange(sanitized.length))
+                if (sanitized != code) onCodeChange(sanitized)
             },
             keyboardOptions = KeyboardOptions(
                 capitalization = KeyboardCapitalization.Characters,

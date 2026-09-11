@@ -2,7 +2,9 @@ package com.buildin1.phantom_p2p.ui
 
 import com.buildin1.phantom_p2p.engine.LinkStats
 import com.buildin1.phantom_p2p.engine.NatClass
+import com.buildin1.phantom_p2p.engine.NetworkDiagnostics
 import com.buildin1.phantom_p2p.engine.NetworkProfile
+import com.buildin1.phantom_p2p.engine.StunDetail
 
 /**
  * `@Preview` 用的静态样本。
@@ -30,6 +32,32 @@ object PreviewData {
         natClass = NatClass.PortRestrictedCone,
         mappingStable = true,
         ipv6Available = true,
+        mtu = 1160,
+    )
+
+    val diagnostics = NetworkDiagnostics(
+        natType = "端口受限锥型",
+        natTypeKey = "port_restricted_cone",
+        natDifficulty = "中等 · 需要同步打洞",
+        externalIp = "113.87.64.21",
+        externalPort = 51820,
+        upnp = false,
+        upnpPort = 0,
+        ipv6 = true,
+        ipv6Addr = "2409:8a55:1b2c::9f1",
+        localIp = "192.168.1.37",
+        localPort = 51820,
+        stunDetails = listOf(
+            StunDetail("stun.dcalling.de", "113.87.64.21:51820", 38, "A", 1),
+            StunDetail("stun.skydrone.aero", "113.87.64.21:51820", 52, "A", 1),
+            StunDetail("stun.dcalling.de", "113.87.64.21:51821", 41, "B", 1),
+        ),
+        portPattern = "端口一致",
+        mappingBehavior = "端点无关映射",
+        filteringBehavior = "地址与端口限制",
+        confidence = "高",
+        rounds = 3,
+        networkPriority = "ipv6",
         mtu = 1160,
     )
 }

@@ -194,6 +194,20 @@ struct AppState {
     rooms: HashMap<String, Room>,
     /// 已用房间码（防冲突）
     used_codes: HashSet<String>,
+    /// 邀请令牌 -> 房间码。
+    ///
+    /// 令牌跟随房间生命周期：房间关闭时在 `do_close_room_inner` 里一并清掉，
+    /// 没有独立过期时间。可复用 —— 房主把二维码发到群里，所有人都能用它进来。
+    ///
+    /// 为什么要有它，而不是直接把 6 位房间码印进二维码：房间码只有 30 bit
+    /// （32 个字符选 6 位 ≈ 10.7 亿），是可枚举的。令牌 20 位同字符集 = 100 bit，
+    /// 爆破这条路直接堵死。房间码保留给"念给旁边的人听"这种令牌替代不了的场景。
+    invite_tokens: HashMap<String, String>,
+    /// 房间码 -> 当前邀请令牌。
+    ///
+    /// 反向索引，用来实现"再要一次给同一个"和"作废旧的再发新的"：
+    /// 没有它就只能遍历 `invite_tokens` 找。
+    room_invite_token: HashMap<String, String>,
     /// 会话自增序号
     next_session_seq: u64,
     /// 子网自增计数器（10.0.1, 10.0.2, ...）
@@ -237,6 +251,8 @@ impl AppState {
             sessions: HashMap::new(),
             rooms: HashMap::new(),
             used_codes: HashSet::new(),
+            invite_tokens: HashMap::new(),
+            room_invite_token: HashMap::new(),
             next_session_seq: 1,
             subnet_counter: 0,
             rate_limit_create: HashMap::new(),
@@ -271,6 +287,57 @@ impl AppState {
             if self.used_codes.insert(code.clone()) {
                 return code;
             }
+        }
+    }
+
+    /// 签发一个邀请令牌并绑定到房间。房间已有令牌时原样返回，不重新生成。
+    ///
+    /// 唯一性靠 `HashMap::entry` 占坑判断，和 `generate_room_code` 一样是
+    /// **强制唯一**而不是概率唯一 —— 撞了就重摇。`rand::thread_rng()` 在
+    /// rand 0.8 里是 ChaCha CSPRNG，随机源本身没问题。
+    ///
+    /// 长度 20、字符集 32 个 → 100 bit。这是令牌相对房间码的全部意义所在：
+    /// 唯一 ≠ 不可猜，6 位房间码唯一但可枚举。
+    fn issue_invite_token(&mut self, room_code: &str) -> String {
+        if let Some(existing) = self.room_invite_token.get(room_code) {
+            return existing.clone();
+        }
+        const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+        const TOKEN_LEN: usize = 20;
+        loop {
+            let mut rng = rand::thread_rng();
+            let token: String = (0..TOKEN_LEN)
+                .map(|_| {
+                    let idx = rng.gen_range(0..CHARSET.len());
+                    CHARSET[idx] as char
+                })
+                .collect();
+            // 占坑成功才算数；已存在就重摇。
+            if let std::collections::hash_map::Entry::Vacant(slot) =
+                self.invite_tokens.entry(token.clone())
+            {
+                slot.insert(room_code.to_string());
+                self.room_invite_token
+                    .insert(room_code.to_string(), token.clone());
+                return token;
+            }
+        }
+    }
+
+    /// 作废房间当前的邀请令牌。返回被作废的那个（没有就是 None）。
+    fn revoke_invite_token(&mut self, room_code: &str) -> Option<String> {
+        let token = self.room_invite_token.remove(room_code)?;
+        self.invite_tokens.remove(&token);
+        Some(token)
+    }
+
+    /// 令牌 -> 房间码。令牌不存在、或指向的房间已经没了，都返回 None。
+    fn resolve_invite_token(&self, token: &str) -> Option<String> {
+        let room_code = self.invite_tokens.get(token)?;
+        if self.rooms.contains_key(room_code) {
+            Some(room_code.clone())
+        } else {
+            None
         }
     }
 }
@@ -483,6 +550,7 @@ async fn handle_client_message(session_id: &str, msg: ClientMessage, state: &Sha
             signature,
             protocol_version,
             client_version,
+            client_platform,
         } => {
             // 协议不做向后兼容：版本不符直接拒绝并要求升级，
             // 而不是让后续消息以各种诡异的反序列化失败告终。
@@ -512,6 +580,8 @@ async fn handle_client_message(session_id: &str, msg: ClientMessage, state: &Sha
                 client_version
             );
             handle_auth(session_id, public_key, signature, state).await;
+            // 鉴权之后再发版本通告：没通过鉴权的连接不值得告诉它任何东西。
+            maybe_send_app_update(session_id, &client_platform, &client_version, state).await;
         }
 
         // 以下操作需要认证
@@ -544,6 +614,15 @@ async fn handle_client_message(session_id: &str, msg: ClientMessage, state: &Sha
                 }
                 ClientMessage::JoinRoom { room_code } => {
                     handle_join_room(session_id, &room_code, state).await;
+                }
+                ClientMessage::RequestInviteToken => {
+                    handle_request_invite_token(session_id, false, state).await;
+                }
+                ClientMessage::RevokeInviteToken => {
+                    handle_request_invite_token(session_id, true, state).await;
+                }
+                ClientMessage::JoinByToken { token } => {
+                    handle_join_by_token(session_id, &token, state).await;
                 }
                 ClientMessage::LeaveRoom => {
                     handle_leave_room(session_id, state).await;
@@ -1054,6 +1133,20 @@ fn hot_reconfigure_host_ip(
             room.guests.iter().cloned().collect::<Vec<_>>(),
         )
     };
+    // 重发 PeerJoined 要带上每个 guest 的虚拟 IP，但 sessions 在下面是可变借用，
+    // 没法在同一个作用域里再读别的 session —— 先把 IP 收集出来。
+    let guest_ips: Vec<(String, String)> = guests
+        .iter()
+        .map(|guest_id| {
+            let ip = st
+                .sessions
+                .get(guest_id)
+                .and_then(|s| s.virtual_ip.clone())
+                .unwrap_or_default();
+            (guest_id.clone(), ip)
+        })
+        .collect();
+
     if let Some(host) = st.sessions.get_mut(session_id) {
         host.virtual_ip = Some(new_host_ip.to_string());
         let _ = host.sender.send(ServerMessage::RoomCreated {
@@ -1061,10 +1154,11 @@ fn hot_reconfigure_host_ip(
             subnet: subnet.clone(),
             virtual_ip: new_host_ip.to_string(),
         });
-        for (index, guest_id) in guests.iter().enumerate() {
+        for (index, (guest_id, guest_ip)) in guest_ips.iter().enumerate() {
             let _ = host.sender.send(ServerMessage::PeerJoined {
                 peer_session_id: guest_id.clone(),
                 guest_count: index + 1,
+                virtual_ip: guest_ip.clone(),
             });
         }
     }
@@ -1887,6 +1981,163 @@ async fn handle_host_ready(session_id: &str, state: &SharedState) {
     }
 }
 
+/// 把 "3.2.10" 这样的版本号解析成可比较的三元组。
+///
+/// 必须按数字逐段比，不能按字符串比：字符串序下 "3.2.10" < "3.2.9"，
+/// 于是刚发的 3.2.10 会被判成比 3.2.9 旧、反过来提示用户"降级"。
+/// 解析不出来就返回 None，调用方据此保守处理（不下发）。
+fn parse_version(raw: &str) -> Option<(u32, u32, u32)> {
+    // 去掉 "-dev" / "-debug" 这类后缀，只看数字部分。
+    let core = raw.trim().split(['-', '+']).next()?;
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().unwrap_or("0").parse().ok()?;
+    let patch = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor, patch))
+}
+
+/// 按平台与版本下发版本通告。
+///
+/// 三条规则：
+/// 1. 该平台没配 `[app_update.<platform>]` → 什么都不发
+/// 2. 客户端已经是最新或更新 → 什么都不发（老客户端连那行 warn 都不会触发）
+/// 3. 客户端低于 `min_supported` → `mandatory = true`，界面弹「当前版本已失效」
+///
+/// **版本策略全在服务端配置里，调整策略不需要发客户端。**
+async fn maybe_send_app_update(
+    session_id: &str,
+    client_platform: &str,
+    client_version: &str,
+    state: &SharedState,
+) {
+    if client_platform.is_empty() {
+        // 老客户端不上报平台。它也不认识 AppUpdate 这条消息，发了是白发。
+        return;
+    }
+
+    let st = state.lock().await;
+    let Some(entry) = st.config.app_update.get(client_platform) else {
+        return;
+    };
+
+    // sha256 配错等于这条通告作废：客户端会拒绝安装校验不过的包，
+    // 与其让用户下载完再失败，不如这里就不发。
+    if entry.sha256.len() != 64 || !entry.sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        warn!(
+            "[版本] {} 的 sha256 不是 64 位十六进制，跳过下发",
+            client_platform
+        );
+        return;
+    }
+
+    let Some(current) = parse_version(client_version) else {
+        warn!("[版本] 无法解析客户端版本 {}，跳过下发", client_version);
+        return;
+    };
+    let Some(latest) = parse_version(&entry.latest_version) else {
+        warn!(
+            "[版本] 配置里的 latest_version {} 无法解析，跳过下发",
+            entry.latest_version
+        );
+        return;
+    };
+
+    if current >= latest {
+        return;
+    }
+
+    let mandatory = parse_version(&entry.min_supported)
+        .map(|min| current < min)
+        .unwrap_or(false);
+
+    if let Some(session) = st.sessions.get(session_id) {
+        info!(
+            "[版本] 向 {} ({} {}) 下发更新通告 → {}{}",
+            session_id,
+            client_platform,
+            client_version,
+            entry.latest_version,
+            if mandatory { " [强制]" } else { "" }
+        );
+        let _ = session.sender.send(ServerMessage::AppUpdate {
+            platform: client_platform.to_string(),
+            latest_version: entry.latest_version.clone(),
+            min_supported: entry.min_supported.clone(),
+            download_url: entry.download_url.clone(),
+            sha256: entry.sha256.clone(),
+            notes: entry.notes.clone(),
+            mandatory,
+        });
+    }
+}
+
+/// 签发 / 重发邀请令牌。`revoke_first` 为 true 时先作废旧的（房主主动刷新）。
+///
+/// 只有房主能要令牌。不是洁癖：guest 拿到令牌就能无限拉人进别人的房间。
+async fn handle_request_invite_token(session_id: &str, revoke_first: bool, state: &SharedState) {
+    let mut st = state.lock().await;
+
+    let Some(session) = st.sessions.get(session_id) else {
+        return;
+    };
+    let sender = session.sender.clone();
+    let (room_code, is_host) = (session.room_code.clone(), session.role == Some(Role::Host));
+
+    let Some(room_code) = room_code else {
+        let _ = sender.send(ServerMessage::Error {
+            message: "尚未在房间中".to_string(),
+        });
+        return;
+    };
+    if !is_host {
+        let _ = sender.send(ServerMessage::Error {
+            message: "只有房主可以生成邀请".to_string(),
+        });
+        return;
+    }
+
+    if revoke_first {
+        if let Some(old) = st.revoke_invite_token(&room_code) {
+            // 只记前 4 位。日志会被上传上来排障，完整令牌等于房间钥匙。
+            // 切片用 get 不用索引：令牌恒为 20 位，但服务端不该为一条日志崩。
+            info!("[邀请] 房间 {} 作废旧令牌 {}…", room_code, prefix4(&old));
+        }
+    }
+
+    let token = st.issue_invite_token(&room_code);
+    info!("[邀请] 房间 {} 已签发令牌 {}…", room_code, prefix4(&token));
+    let _ = sender.send(ServerMessage::InviteToken { token, room_code });
+}
+
+/// 取前 4 个字符用于日志。令牌本身不进日志 —— 它等于房间钥匙。
+fn prefix4(value: &str) -> &str {
+    value.get(..4).unwrap_or(value)
+}
+
+/// 用邀请令牌加入房间。解析出房间码之后，与 [`handle_join_room`] 完全同路 ——
+/// 令牌只是房间码的另一种载体，不是另一套加入流程。
+async fn handle_join_by_token(session_id: &str, token: &str, state: &SharedState) {
+    let normalized = token.trim().to_uppercase();
+    let resolved = {
+        let st = state.lock().await;
+        st.resolve_invite_token(&normalized)
+    };
+
+    match resolved {
+        Some(room_code) => handle_join_room(session_id, &room_code, state).await,
+        None => {
+            let st = state.lock().await;
+            if let Some(session) = st.sessions.get(session_id) {
+                // 与 JoinFailed 分开，界面才能说"这个邀请已失效"而不是
+                // 含糊的"加入房间失败"。
+                let _ = session.sender.send(ServerMessage::InviteTokenInvalid {
+                    reason: "邀请已失效或房间已关闭".to_string(),
+                });
+            }
+        }
+    }
+}
+
 async fn handle_join_room(session_id: &str, room_code: &str, state: &SharedState) {
     let mut st = state.lock().await;
 
@@ -1993,6 +2244,9 @@ async fn handle_join_room(session_id: &str, room_code: &str, state: &SharedState
         let _ = host_session.sender.send(ServerMessage::PeerJoined {
             peer_session_id: session_id.to_string(),
             guest_count,
+            // 这个 IP 就是上面刚分给 guest 的那个。服务端一直知道，
+            // 只是以前没告诉 host —— 房主端的成员列表因此只能显示 "—"。
+            virtual_ip: guest_virtual_ip.clone(),
         });
     } else {
         warn!(
@@ -2142,6 +2396,11 @@ fn release_room_relay_token_if_needed(
 
 /// 内部关闭房间逻辑
 fn do_close_room_inner(host_session_id: &str, room_code: &str, reason: &str, st: &mut AppState) {
+    // 邀请令牌跟随房间生命周期：房间没了，令牌立刻作废。
+    // 漏掉这一步的后果不是"多占点内存"，是**令牌会一直指向一个不存在的房间**，
+    // 而且房间码会被后续房间复用 —— 旧二维码就能进新房间。
+    st.revoke_invite_token(room_code);
+
     if let Some(room) = st.rooms.remove(room_code) {
         release_room_relay_token_if_needed(&room.state, st.relay_registry.clone(), room_code);
 
