@@ -84,8 +84,13 @@ jobs:
       - run: npm run build
       - run: npm run version:check
       - run: cargo fmt --all -- --check
-      - run: cargo check --locked --workspace --exclude phantom-p2p
-      - run: cargo test --locked --workspace --exclude phantom-p2p
+      # 两个排除项，理由不同：
+      #   phantom-p2p    Tauri crate 要 GUI 依赖，交给下面各平台的构建任务
+      #   phantom-mobile 只为 Android 存在，引用的 android_provide_tun_fd 等
+      #                  在别的 target 上是 cfg 掉的，在 Linux runner 上编不过。
+      #                  它由 android-dev.yml 里的 cargo-ndk 真正验证。
+      - run: cargo check --locked --workspace --exclude phantom-p2p --exclude phantom-mobile
+      - run: cargo test --locked --workspace --exclude phantom-p2p --exclude phantom-mobile
 
   windows-x64:
     name: Windows x64
