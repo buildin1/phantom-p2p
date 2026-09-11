@@ -319,7 +319,7 @@ class JniEngineClient(
                     // 对端虚拟 IP 现在由服务端在 peer_joined 里带过来了。
                     // 老服务端不带这个字段，取到空串 —— 成员列表退回显示 "—"，
                     // 与改动前一致，不会因此出错。
-                    val ip = json.optString("virtual_ip").orEmpty()
+                    val ip = json?.optString("virtual_ip").orEmpty()
                     if (ip.isNotEmpty()) peerVirtualIps[id] = ip
                 }
                 rebuildMembers()
