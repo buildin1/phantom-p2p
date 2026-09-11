@@ -392,7 +392,8 @@ fun PhaseList(
                 Text(
                     text = when {
                         now -> "进行中"
-                        done -> "%.1fs".format(APPROX_STEP_SECONDS[index])
+                        done -> APPROX_STEP_SECONDS.getOrNull(index)
+                            ?.let { "%.1fs".format(it) } ?: "已完成"
                         else -> "—"
                     },
                     style = MonoNumber.copy(fontSize = 11.5.sp),
@@ -410,7 +411,7 @@ fun PhaseList(
  * FFI 落地时把它换成 `PunchPhase -> 实测毫秒` 的映射，别让这几个数字一直假下去——
  * 它们是用户判断「该等还是该退」的唯一依据。
  */
-private val APPROX_STEP_SECONDS = listOf(0.4, 0.9, 1.1, 0.5)
+private val APPROX_STEP_SECONDS = listOf(0.9, 0.4, 0.9, 1.1, 0.5)
 
 // ---------------------------------------------------------------------------
 // 成员行

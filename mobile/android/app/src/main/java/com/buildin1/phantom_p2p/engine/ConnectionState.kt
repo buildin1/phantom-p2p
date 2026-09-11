@@ -20,9 +20,22 @@ sealed interface ConnectionState {
     ) : ConnectionState
 
     /** 已接通。 */
+    /**
+     * 已接通。
+     *
+     * [transport] 为 null 表示**房间已就绪但还没有队友** —— 房主建完房、
+     * 虚拟网卡已经起来、服务端也开了房，只是没人进来，所以还谈不上「用哪种
+     * 传输」。这不是中间状态：对房主来说这一刻该做的事（把房间码发出去）
+     * 已经可以做了。
+     *
+     * 之前把这一态漏掉，导致房主建完房永远停在「正在准备房间」——因为界面
+     * 只认 `tunnel:started`，而那个事件要等对端接通才会发。
+     *
+     * 多 guest 时传输方式本来就是逐对端的，所以这里可空在语义上也更诚实。
+     */
     data class Connected(
         val roomCode: String,
-        val transport: Transport,
+        val transport: Transport?,
         val localVirtualIp: String,
         val peerVirtualIp: String,
         val connectedSinceMillis: Long,
@@ -40,6 +53,14 @@ sealed interface ConnectionState {
  * 界面上说「正在接通」，不说「打洞」「ICE」「候选」这些词。
  */
 enum class PunchPhase {
+    /**
+     * 正在连接信令服务器并完成鉴权。
+     *
+     * 这一段此前被错标成「探测网络环境」，而那时连服务器都还没连上 ——
+     * 首次建房卡住时用户看到的就是这个假阶段。
+     */
+    ConnectingSignal,
+
     /** 探测本机网络环境（NAT 画像、STUN 映射）。 */
     Probing,
 
@@ -56,6 +77,7 @@ enum class PunchPhase {
     /** 界面文案。刻意说人话——用户不需要知道 ICE 是什么。 */
     val displayLabel: String
         get() = when (this) {
+            ConnectingSignal -> "连接服务器"
             Probing -> "探测网络环境"
             WaitingPeer -> "与对端交换线路"
             Punching -> "正在接通"
@@ -146,7 +168,9 @@ val ConnectionState.displayTitle: String
     get() = when (this) {
         is ConnectionState.Idle -> "线路空闲"
         is ConnectionState.Connecting -> phase.displayLabel
-        is ConnectionState.Connected -> transport.displayLabel
+        // 没有传输方式 = 房间开着但还没人进来。对房主来说这是正常的稳定态，
+        // 不是"还在连"，所以文案要说清楚现在等的是人，不是网络。
+        is ConnectionState.Connected -> transport?.displayLabel ?: "房间已就绪"
         is ConnectionState.Failed -> reason.displayTitle
     }
 

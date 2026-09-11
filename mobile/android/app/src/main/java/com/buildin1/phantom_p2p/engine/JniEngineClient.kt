@@ -48,8 +48,12 @@ class JniEngineClient(
     /** 建房/入房的应答要等信令回来，用它把异步事件接回 suspend 调用。 */
     private val pendingRoomCode = MutableStateFlow<String?>(null)
 
+    /** 信令是否已完成鉴权。房间类命令必须等它为 true 才能发。 */
+    private val authenticated = MutableStateFlow(false)
+
     private var statsJob: Job? = null
-    private var started = false
+    private var collecting = false
+    private var signalStarted = false
 
     /** 最近一次的房间上下文，重试和成员构造要用。 */
     private var roomCode: String? = null
@@ -63,18 +67,25 @@ class JniEngineClient(
      * 启动引擎并开始消费事件。幂等——VpnService 可能被系统重启多次。
      */
     fun start(): Boolean {
-        if (started) return true
         if (!PhantomEngine.init(logDir, dataDir, devMode)) {
             _state.value = ConnectionState.Failed(null, FailureReason.Unknown)
             return false
         }
-        started = true
 
-        scope.launch {
-            PhantomEngine.events.collect { event -> handle(event) }
+        // 事件收集只能起一次 —— 起两遍每条事件都会被归约两次。
+        // 它跟信令连接是两件事：断开重连时信令要重建，收集器不用。
+        if (!collecting) {
+            collecting = true
+            scope.launch {
+                PhantomEngine.events.collect { event -> handle(event) }
+            }
+            startStatsPolling()
         }
-        PhantomEngine.nativeConnectSignal(signalUrl)
-        startStatsPolling()
+
+        if (!signalStarted) {
+            signalStarted = true
+            PhantomEngine.nativeConnectSignal(signalUrl)
+        }
         return true
     }
 
@@ -82,12 +93,38 @@ class JniEngineClient(
     // EngineClient
     // -----------------------------------------------------------------------
 
+    /**
+     * 等到信令鉴权完成。
+     *
+     * **这是首次建房失败的根因所在。** `start()` 里的 `nativeConnectSignal`
+     * 是异步的：建 WebSocket、收 AuthChallenge、签名回传、服务端验签，
+     * 实测要一个往返（约 1 秒）。在那之前任何 CreateRoom / JoinRoom 发出去
+     * 都会在 Rust 侧 `signal.send()` 处失败，而那个错误只写了日志、没有回到
+     * 界面 —— 于是界面一直转到 15 秒超时，用户看到的是"卡在探测网络环境"。
+     *
+     * 服务端日志能直接印证：第一次的 CreateRoom 根本没抵达。
+     */
+    private suspend fun awaitAuthenticated(): Boolean {
+        if (authenticated.value) return true
+        return withTimeoutOrNull(SIGNAL_TIMEOUT_MS) {
+            authenticated.first { it }
+        } ?: false
+    }
+
     override suspend fun createRoom(): Result<String> {
         if (!start()) return Result.failure(IllegalStateException("引擎未就绪"))
         pendingRoomCode.value = null
         isHost = true
         connectingSince = System.currentTimeMillis()
-        _state.value = ConnectionState.Connecting("", PunchPhase.Probing, 0)
+
+        // 阶段文案要诚实：这时候还在连服务器，不是在探测网络。
+        _state.value = ConnectionState.Connecting("", PunchPhase.ConnectingSignal, 0)
+        if (!awaitAuthenticated()) {
+            _state.value = ConnectionState.Failed(null, FailureReason.SignalUnavailable)
+            return Result.failure(IllegalStateException("连接服务器超时"))
+        }
+
+        _state.value = ConnectionState.Connecting("", PunchPhase.Probing, elapsed())
         PhantomEngine.nativeCreateRoom()
 
         // 服务端分配房间码要一个往返。等不到就当失败——界面此时正显示
@@ -108,7 +145,14 @@ class JniEngineClient(
         isHost = false
         this.roomCode = roomCode
         connectingSince = System.currentTimeMillis()
-        _state.value = ConnectionState.Connecting(roomCode, PunchPhase.Probing, 0)
+
+        _state.value = ConnectionState.Connecting(roomCode, PunchPhase.ConnectingSignal, 0)
+        if (!awaitAuthenticated()) {
+            _state.value = ConnectionState.Failed(roomCode, FailureReason.SignalUnavailable)
+            return Result.failure(IllegalStateException("连接服务器超时"))
+        }
+
+        _state.value = ConnectionState.Connecting(roomCode, PunchPhase.Probing, elapsed())
         PhantomEngine.nativeJoinRoom(roomCode)
         return Result.success(Unit)
     }
@@ -120,6 +164,10 @@ class JniEngineClient(
 
     override suspend fun disconnect() {
         PhantomEngine.nativeDisconnect()
+        // 信令也断了，鉴权随之失效。下次 start() 必须重新连 ——
+        // 不复位的话后续建房会一直等一个永远不会再来的 auth_ok。
+        signalStarted = false
+        authenticated.value = false
         resetRoom()
     }
 
@@ -149,6 +197,13 @@ class JniEngineClient(
         val json = runCatching { JSONObject(event.payload) }.getOrNull()
 
         when (event.name) {
+            "signal:auth_ok" -> authenticated.value = true
+
+            "signal:auth_failed" -> {
+                authenticated.value = false
+                _state.value = ConnectionState.Failed(roomCode, FailureReason.SignalUnavailable)
+            }
+
             "signal:room_created" -> {
                 val code = json?.optString("room_code").orEmpty()
                 roomCode = code
@@ -224,6 +279,24 @@ class JniEngineClient(
                 hostVirtualIp = json?.optString("host_ip").orEmpty().ifEmpty { hostVirtualIp }
                 _networkProfile.value = (_networkProfile.value ?: defaultProfile())
                     .copy(mtu = TUN_MTU)
+
+                // 房主的虚拟网卡起来 = 房间真的开了，此刻就该进稳定态。
+                //
+                // 之前只认 tunnel:started，而那个事件要等对端接通才发 ——
+                // 房主建完房没人进来就永远停在「正在准备房间」。服务端那边
+                // 房间其实早就开了（收到了 HostReady），纯粹是界面没跟上。
+                //
+                // Guest 不走这条：它的 tun:ready 紧跟着 tunnel:started，
+                // 让后者带上真实的传输方式即可。
+                if (isHost && _state.value !is ConnectionState.Connected) {
+                    _state.value = ConnectionState.Connected(
+                        roomCode = roomCode.orEmpty(),
+                        transport = null, // 还没有队友，谈不上用哪种传输
+                        localVirtualIp = selfVirtualIp,
+                        peerVirtualIp = selfVirtualIp,
+                        connectedSinceMillis = System.currentTimeMillis(),
+                    )
+                }
                 rebuildMembers()
             }
 
@@ -233,11 +306,15 @@ class JniEngineClient(
 
             "signal:status" -> {
                 val signalState = json?.optString("state").orEmpty()
-                if (signalState.equals("disconnected", ignoreCase = true) &&
-                    _state.value is ConnectionState.Connecting
-                ) {
-                    _state.value =
-                        ConnectionState.Failed(roomCode, FailureReason.SignalUnavailable)
+                if (signalState.equals("disconnected", ignoreCase = true)) {
+                    // 连接断了鉴权就作废。不清这个标记的话，重连之后
+                    // awaitAuthenticated 会立刻放行，而命令仍然发不出去。
+                    authenticated.value = false
+                    signalStarted = false
+                    if (_state.value is ConnectionState.Connecting) {
+                        _state.value =
+                            ConnectionState.Failed(roomCode, FailureReason.SignalUnavailable)
+                    }
                 }
             }
 
