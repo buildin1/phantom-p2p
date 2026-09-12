@@ -1,0 +1,116 @@
+Phantom P2P — Additional Terms under Section 7 of the GNU AGPL v3
+=================================================================
+
+These terms supplement the GNU Affero General Public License, version 3
+(the "License"), reproduced in the accompanying LICENSE file. Where this
+document grants an additional permission, that permission supplements the
+License. In all other respects the License governs.
+
+The English text is authoritative. 中文为便利翻译，冲突时以英文为准。
+
+
+-------------------------------------------------------------------------
+1. ADDITIONAL PERMISSION — Combining with specific proprietary components
+-------------------------------------------------------------------------
+
+As an additional permission under section 7 of the License, you are given
+permission to convey the Program, or a work based on the Program, linked or
+combined with, and to distribute it together with, the following components,
+notwithstanding the conditions the License would otherwise impose on such a
+combined work:
+
+  (a) "wintun.dll" as published by WireGuard LLC at <https://www.wintun.net/>
+      and licensed under the "Prebuilt Binaries License" reproduced in
+      build/wintun-LICENSE.txt, provided the component is used solely through
+      its documented public API (the "Permitted API" defined therein); and
+
+  (b) "WebView2Loader.dll" and the Microsoft Edge WebView2 Runtime, as
+      distributed by Microsoft Corporation under Microsoft's applicable
+      redistribution terms.
+
+This permission extends only to the components named above, only in the
+unmodified form published by their respective vendors, and to no other
+proprietary component. If you modify the Program, you may at your option
+remove this additional permission from your version.
+
+  中文说明：本程序在 Windows 上依赖 wintun.dll 建立虚拟网卡、依赖
+  WebView2Loader.dll 渲染界面。这两个是专有二进制，与 AGPL 关于"组合作品"
+  的条件存在冲突，若不作例外，本程序将无法合法分发。本条依据 AGPL 第 7 条
+  授予该例外。例外仅限上述两个组件、且仅限厂商发布的未修改版本。
+
+
+-------------------------------------------------------------------------
+2. ADDITIONAL REQUIREMENT — Preservation of attribution  [§ 7(b)]
+-------------------------------------------------------------------------
+
+You must preserve, in the Program's source code and in the Appropriate Legal
+Notices displayed by any work containing it, all copyright notices and author
+attributions present in the original, including the identification of
+"YuzuNyaa" as the original author of Phantom P2P.
+
+  中文说明：不得移除源码与界面法律声明中的版权与作者署名。
+
+
+-------------------------------------------------------------------------
+3. ADDITIONAL REQUIREMENT — Marking of modified versions  [§ 7(c)]
+-------------------------------------------------------------------------
+
+If you convey a modified version of the Program, you must mark it in
+reasonable ways as different from the original version, and you must not
+misrepresent its origin. In particular, a modified version must not be
+presented in a way that suggests it is the original Phantom P2P or that it
+is endorsed by the original author.
+
+  中文说明：分发修改版必须以合理方式标明它不同于原版，不得让人误以为它
+  就是原版或经过原作者认可。
+
+
+-------------------------------------------------------------------------
+4. ADDITIONAL REQUIREMENT — No trademark rights granted  [§ 7(e)]
+-------------------------------------------------------------------------
+
+This License does not grant any rights under trademark law to use the names
+"Phantom P2P", "幻梦P2P", or any associated logo, icon, or product identity
+of the original author. A modified version conveyed under the License must
+use a different name and product identity.
+
+For the avoidance of doubt, this section restricts only the use of names and
+marks. It does not restrict, and must not be read to restrict, any right to
+copy, modify, or convey the Program granted by the License.
+
+  中文说明：许可证不授予商标权。分发修改版必须改用不同的名称与产品标识。
+  本条只限制名称与标识的使用，不限制许可证授予的复制、修改、分发权利。
+
+
+-------------------------------------------------------------------------
+5. THIRD-PARTY COMPONENTS
+-------------------------------------------------------------------------
+
+The components listed in section 1 remain the property of their respective
+owners and are governed by their own license terms, not by the License:
+
+  - wintun.dll  — WireGuard LLC, "Prebuilt Binaries License"
+                  (build/wintun-LICENSE.txt). Wintun™ is a trademark of
+                  Jason A. Donenfeld. Redistributed unmodified, used only
+                  through the Permitted API.
+  - WebView2Loader.dll — Microsoft Corporation, Microsoft's redistribution
+                  terms for the Edge WebView2 Runtime.
+
+Rust and Kotlin dependencies are predominantly MIT and Apache-2.0 licensed,
+both of which are compatible with AGPL-3.0.
+
+
+-------------------------------------------------------------------------
+6. EFFECTIVE DATE AND PRIOR RELEASES
+-------------------------------------------------------------------------
+
+Phantom P2P was previously distributed under the MIT License. The change to
+AGPL-3.0 applies from the commit that introduced this file onward.
+
+Releases made before that commit remain available under the MIT License, and
+the rights granted by MIT for those releases are irrevocable. This change
+does not, and cannot, retroactively withdraw them.
+
+  中文说明：本项目此前采用 MIT 许可证。AGPL-3.0 自引入本文件的那次提交起
+  生效。在此之前发布的版本仍受 MIT 约束，且 MIT 已授予的权利不可撤销——
+  本次变更不能、也不试图追溯收回它们。
