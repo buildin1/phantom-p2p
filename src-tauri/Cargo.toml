@@ -3,6 +3,7 @@ name = "phantom-p2p"
 version = "3.2.0"
 description = "幻梦P2P - 游戏联机隧道"
 edition = "2021"
+license = "AGPL-3.0-or-later"
 
 [lib]
 name = "phantom_p2p_lib"

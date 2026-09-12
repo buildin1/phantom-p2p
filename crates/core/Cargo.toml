@@ -2,6 +2,7 @@
 name = "phantom-core"
 version = "3.2.0"
 edition = "2021"
+license = "AGPL-3.0-or-later"
 
 [lib]
 name = "phantom_core"

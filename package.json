@@ -2,6 +2,7 @@
   "name": "phantom-p2p",
   "private": true,
   "version": "3.2.0",
+  "license": "AGPL-3.0-or-later",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
