@@ -2,6 +2,7 @@
 name = "phantom-mobile"
 version = "3.1.1"
 edition = "2021"
+license = "AGPL-3.0-or-later"
 
 [lib]
 name = "phantom_mobile"

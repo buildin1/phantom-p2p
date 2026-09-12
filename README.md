@@ -12,7 +12,7 @@
 | 桌面端 | Windows / macOS / Linux（Tauri） |
 | 无头端 | Linux headless + WebUI |
 | 安卓端 | **3.0 未适配，暂不可用** |
-| 许可证 | MIT |
+| 许可证 | AGPL-3.0（附 §7 附加条款） |
 
 ---
 
@@ -776,4 +776,26 @@ phantom-p2p/
 
 ## 许可证
 
-[MIT](LICENSE) © 2026 YuzuNyaa
+**[AGPL-3.0](LICENSE)** © 2026 YuzuNyaa，附 [§7 附加条款](LICENSE.ADDITIONAL)。
+
+选 AGPL 而不是 GPL，是因为本项目包含**信令服务端**：GPL 只在分发二进制时触发，
+把改过的服务端跑成网络服务不算分发，源码就可以不公开。AGPL 第 13 条补上了这个缺口。
+
+这意味着：
+
+- **可以**自由使用、修改、自建服务端、商业使用
+- **分发**修改版的客户端二进制 → 必须以 AGPL-3.0 提供完整源码
+- 把修改版的**服务端跑成网络服务**给别人用 → 同样必须提供源码
+- 修改版必须**改名**，不得继续使用 "Phantom P2P" / "幻梦P2P" 及相关标识（§7(e)）
+- 纯私人使用、不对外分发也不对外提供服务的修改，不受上述约束
+
+### 第三方组件
+
+`wintun.dll`（WireGuard LLC）与 `WebView2Loader.dll`（Microsoft）是专有二进制，
+按各自条款分发，不受本项目许可证约束。`LICENSE.ADDITIONAL` 第 1 条依据 AGPL §7
+为与它们的组合分发授予了明确例外。wintun 的条款见 [build/wintun-LICENSE.txt](build/wintun-LICENSE.txt)。
+
+### 关于历史版本
+
+本项目此前采用 MIT。AGPL-3.0 **自引入 `LICENSE.ADDITIONAL` 的那次提交起生效**；
+在此之前发布的版本仍受 MIT 约束，MIT 已授予的权利不可撤销。
